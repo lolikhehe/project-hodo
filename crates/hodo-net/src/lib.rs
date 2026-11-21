@@ -46,11 +46,18 @@ pub fn load(url: &str) -> Result<Resource, FetchError> {
 }
 
 /// One shared HTTP client for all requests instead of rebuilding it each time.
+///
+/// ureq's `gzip` feature is enabled by default (we keep default features), so
+/// `Content-Encoding: gzip` responses are transparently decompressed before the
+/// body is read — no manual decompression is needed here. `max_redirects` is set
+/// explicitly; reaching the cap returns a `TooManyRedirects` error (mapped to
+/// `FetchError::Network`) instead of following a redirect loop forever.
 fn agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT.get_or_init(|| {
         ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(15)))
+            .max_redirects(5)
             .build()
             .into()
     })
@@ -66,8 +73,31 @@ fn is_html_content_type(content_type: &str) -> bool {
         .eq_ignore_ascii_case("text/html")
 }
 
-/// Decode UTF-8 without copying when the bytes are already valid.
+/// Sniff a byte prefix as HTML (HTML5 "text/html" rule): skip leading ASCII
+/// whitespace, then look for a case-insensitive `<!doctype html` or `<html`.
+/// Only the first 512 bytes are considered.
+pub(crate) fn looks_like_html(prefix: &[u8]) -> bool {
+    const WS: &[u8] = b" \t\n\r\x0c";
+    let prefix = &prefix[..prefix.len().min(512)];
+    let start = prefix
+        .iter()
+        .position(|b| !WS.contains(b))
+        .unwrap_or(prefix.len());
+    let tag = &prefix[start..];
+    starts_with_ascii_ci(tag, b"<!doctype html") || starts_with_ascii_ci(tag, b"<html")
+}
+
+fn starts_with_ascii_ci(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.len() >= needle.len()
+        && haystack[..needle.len()]
+            .iter()
+            .zip(needle)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+/// Decode UTF-8 without copying, stripping a leading UTF-8 BOM if present.
 fn decode_utf8(data: &[u8]) -> String {
+    let data = data.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(data);
     std::str::from_utf8(data)
         .map(|s| s.to_string())
         .unwrap_or_else(|_| String::from_utf8_lossy(data).into_owned())
@@ -83,20 +113,36 @@ fn load_http(url: &str) -> Result<Resource, FetchError> {
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string();
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty());
+
+    // Fail fast on a declared oversized body before streaming it. ureq strips
+    // Content-Length when it transparently decompresses gzip, so this guard only
+    // sees the uncompressed size; read_capped still caps the decompressed bytes.
+    let declared_len = res
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<usize>().ok());
+    if declared_len.is_some_and(|len| len > MAX_BYTES) {
+        return Err(FetchError::TooLarge);
+    }
 
     // Dropping the reader on TooLarge closes the connection without buffering the rest.
     let data = read_capped(res.body_mut().as_reader(), |e| {
         FetchError::Network(e.to_string())
     })?;
 
-    if is_html_content_type(&content_type) {
+    let is_html = match &content_type {
+        Some(ct) => is_html_content_type(ct),
+        None => looks_like_html(&data),
+    };
+    if is_html {
         Ok(Resource::Html(decode_utf8(&data)))
     } else {
         Ok(Resource::Other {
             data,
-            mime: content_type,
+            mime: content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
         })
     }
 }
@@ -160,8 +206,10 @@ mod tests {
     const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
 
     fn temp_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("hodo-net-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        // Unique per test: tests run in parallel and must not share a directory.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("hodo-net-test-{}-{n}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -227,6 +275,39 @@ mod tests {
     fn decode_utf8_handles_valid_and_invalid_bytes() {
         assert_eq!(decode_utf8(b"hodo"), "hodo");
         assert!(!decode_utf8(&[0xff, 0xfe]).is_empty());
+    }
+
+    #[test]
+    fn sniffs_html_prefix() {
+        assert!(looks_like_html(b"<!doctype html><html>"));
+        assert!(looks_like_html(b"<html lang=\"en\">"));
+        // leading whitespace (space/tab/newline/CR/form-feed) and mixed case
+        assert!(looks_like_html(b" \t\r\n\x0c<!DOCTYPE HTML>"));
+        assert!(looks_like_html(b"\n\n<Html>"));
+        // not HTML
+        assert!(!looks_like_html(b"just plain text"));
+        assert!(!looks_like_html(&[0x89, b'P', b'N', b'G', 0x00, 0x01]));
+        assert!(!looks_like_html(b""));
+        // a tag past the 512-byte sniff window is ignored
+        let mut far = vec![b' '; 512];
+        far.extend_from_slice(b"<html>");
+        assert!(!looks_like_html(&far));
+    }
+
+    #[test]
+    fn strips_utf8_bom_from_local_html() {
+        let dir = temp_dir();
+        let path = dir.join("bom.html");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(HTML.as_bytes());
+        fs::write(&path, &bytes).unwrap();
+
+        match load(path.to_string_lossy().as_ref()).unwrap() {
+            Resource::Html(s) => assert_eq!(s, HTML, "BOM should be stripped"),
+            other => panic!("expected Html, got {:?}", other),
+        }
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
