@@ -1,0 +1,56 @@
+body {
+  font-family: sans-serif;
+  color: #222222;
+  background: #fafafa;
+  margin: 24px;
+}
+
+h1 {
+  color: #1d5fa8;
+  font-size: 36px;
+  margin: 12px;
+}
+
+.intro {
+  color: #333333;
+  font-size: 18px;
+  margin: 12px;
+}
+
+.accent {
+  color: #a83232;
+  font-size: 16px;
+  margin: 12px;
+}
+
+.card {
+  border: 2px solid #1d5fa8;
+  background: #eef4fb;
+  padding: 16px;
+  margin: 12px;
+}
+
+.inner {
+  border: 1px dashed #a83232;
+  background: #fff3f3;
+  padding: 12px;
+  margin: 8px;
+  font-size: 14px;
+}
+
+.long {
+  color: #444444;
+  font-size: 16px;
+  margin: 12px;
+}
+
+ul {
+  font-size: 16px;
+  margin: 24px;
+}
+
+li {
+  color: #222222;
+  font-size: 16px;
+  margin: 4px;
+}

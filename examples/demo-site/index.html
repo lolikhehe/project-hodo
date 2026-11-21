@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>About hodo</title>
+  <link rel="stylesheet" href="style.css">
+  <style>
+    body {
+      font-family: sans-serif;
+      color: #222222;
+      background: #fafafa;
+      margin: 24px;
+    }
+
+    h1 {
+      color: #1d5fa8;
+      font-size: 36px;
+      margin: 12px;
+    }
+
+    .intro {
+      color: #333333;
+      font-size: 18px;
+      margin: 12px;
+    }
+
+    .accent {
+      color: #a83232;
+      font-size: 16px;
+      margin: 12px;
+    }
+
+    .card {
+      border: 2px solid #1d5fa8;
+      background: #eef4fb;
+      padding: 16px;
+      margin: 12px;
+    }
+
+    .inner {
+      border: 1px dashed #a83232;
+      background: #fff3f3;
+      padding: 12px;
+      margin: 8px;
+      font-size: 14px;
+    }
+
+    .long {
+      color: #444444;
+      font-size: 16px;
+      margin: 12px;
+    }
+
+    ul {
+      font-size: 16px;
+      margin: 24px;
+    }
+
+    li {
+      color: #222222;
+      font-size: 16px;
+      margin: 4px;
+    }
+  </style>
+</head>
+<body>
+  <h1>About hodo</h1>
+
+  <p class="intro">hodo is a small browser engine written in Rust, built one stage at a time.</p>
+  <p class="accent">It aims to be simple, fast, and easy to understand.</p>
+
+  <div class="card">
+    <p class="intro">The outer box has a solid blue border and a light blue background.</p>
+    <div class="inner">
+      The nested box has a dashed red border and a pale red background. Nesting boxes is how the
+      page is built up from simple pieces.
+    </div>
+  </div>
+
+  <p class="long">This paragraph is deliberately long so that the layout engine has to wrap it across
+    several lines inside the 1200 by 800 pixel viewport. It keeps going with more words, testing that
+    text measurement, line breaking, and vertical stacking all work together. When the line reaches
+    the right edge of the content area, the next word should move down to a fresh line, and the
+    following paragraphs and list should continue below without overlapping anything. A browser that
+    can do this correctly is well on its way to rendering real documents.</p>
+
+  <ul>
+    <li>HTML parsing into an arena DOM</li>
+    <li>CSS parsing, selector matching, and style resolution</li>
+    <li>Block-flow layout into a flat display list</li>
+    <li>Software rasterization into an RGBA frame buffer</li>
+  </ul>
+</body>
+</html>
