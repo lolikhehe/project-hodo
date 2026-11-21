@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 hodo-layout.workspace = true
 hodo-types.workspace = true
+tiny-skia = "0.12.0"
+fontdue = "0.9.5"
 
 [lints]
 workspace = true
