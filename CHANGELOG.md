@@ -29,6 +29,10 @@ The crate boundaries and public contracts are stable; all stage bodies are imple
 
 ### Fixed
 
+- Style cascade: the `border` shorthand now expands `<width> <style> <color>` tokens (in any order, including partial forms like `border: red`) into the border-width/color longhands in cascade order, so borders from author stylesheets actually rasterize. Non-solid styles currently degrade to solid.
+- Rasterizer: glyphs are now placed from a computed line baseline using fontdue per-glyph metrics, so periods and commas sit on the baseline and descenders hang below it instead of every glyph being top-aligned.
+- Headless screenshots: the rendered frame is composited over opaque white before PNG encoding, so screenshots no longer have transparent edge strips.
+- Layout: text inside `<li>` elements now receives a single `• ` bullet prefix in its Text item.
 - Extension host: `host_permissions` is now a separate `Manifest` field instead of being merged into `permissions`, so a host pattern like `"storage"` can no longer self-grant the storage API. Host-side permission gating has a regression test.
 - Style cascade: per-side `margin-*`, `padding-*` and `border-*-width` longhands are now applied; shorthands expand into longhands in cascade order so both shorthand-then-longhand and longhand-then-shorthand resolve by source order. Border widths are exposed per side via the new `ComputedStyle::border_widths` field.
 - API bridge: `browser.extension.*` (Gecko idiom) now maps to the canonical `runtime` namespace.
