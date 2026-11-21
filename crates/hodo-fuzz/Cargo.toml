@@ -1,0 +1,15 @@
+[package]
+name = "hodo-fuzz"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hodo-html.workspace = true
+hodo-css.workspace = true
+hodo-dom.workspace = true
+hodo-ext-manifest.workspace = true
+hodo-net.workspace = true
+
+[lints]
+workspace = true
