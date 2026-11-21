@@ -55,7 +55,15 @@ pub fn render(list: &DisplayList, size: Size) -> Vec<u8> {
                 color,
                 font_size,
                 ..
-            } => draw_text(&mut pixmap, rect.x, rect.y, text, *color, *font_size),
+            } => draw_text(
+                &mut pixmap,
+                rect.x,
+                rect.y,
+                rect.h,
+                text,
+                *color,
+                *font_size,
+            ),
         }
     }
 
@@ -97,12 +105,23 @@ fn blend_glyph(data: &mut [u8], w: i32, h: i32, x: i32, y: i32, cov: u8, color: 
     data[i + 3] = (sa + data[i + 3] as u32 * inv / 255).min(255) as u8;
 }
 
-fn draw_text(pixmap: &mut Pixmap, x: f32, y: f32, text: &str, color: Color, font_size: f32) {
+fn draw_text(
+    pixmap: &mut Pixmap,
+    x: f32,
+    y: f32,
+    h: f32,
+    text: &str,
+    color: Color,
+    font_size: f32,
+) {
     if !font_size.is_finite() || font_size <= 0.0 {
         return;
     }
     let w = pixmap.width() as i32;
-    let h = pixmap.height() as i32;
+    let height = pixmap.height() as i32;
+    // Layout emits Text rects at the line-box top with h = 1.2 * font_size,
+    // so the baseline sits at ~0.8 * font_size below the top.
+    let baseline = y + 0.8 * (h / 1.2);
 
     let Some(font) = font() else {
         // shortcut: no usable vendored font, re-run the font vendor step; gray rect placeholders
@@ -138,14 +157,18 @@ fn draw_text(pixmap: &mut Pixmap, x: f32, y: f32, text: &str, color: Color, font
         }
         let (metrics, coverage) = font.rasterize(ch, font_size);
         let origin_x = pen_x as i32 + metrics.xmin;
-        let origin_y = y as i32;
+        // fontdue's ymin is the glyph's lowest point in font units (Y-up,
+        // baseline at 0): ~0 for glyphs resting on the baseline, negative for
+        // descenders. Its bitmap is top-down, so the top row sits at
+        // baseline - height - ymin; this puts '.' on the baseline and 'g' below it.
+        let origin_y = (baseline - metrics.height as f32 - metrics.ymin as f32) as i32;
         for row in 0..metrics.height {
             for col in 0..metrics.width {
                 let cov = coverage[row * metrics.width + col];
                 blend_glyph(
                     data,
                     w,
-                    h,
+                    height,
                     origin_x + col as i32,
                     origin_y + row as i32,
                     cov,
@@ -233,6 +256,47 @@ mod tests {
         let buf = render(&list, Size { w: 200.0, h: 100.0 });
         let visible = (10..90).any(|x| (10..60).any(|y| pixel(&buf, x, y, 200)[3] > 0));
         assert!(visible, "expected a non-transparent pixel in the text band");
+    }
+
+    /// Average y (screen rows, larger = lower) of visible pixels in an x band.
+    fn avg_dark_y(buf: &[u8], w: usize, h: usize, x0: usize, x1: usize) -> Option<f64> {
+        let mut sum = 0.0;
+        let mut count = 0usize;
+        for y in 0..h {
+            for x in x0..x1 {
+                if buf[(y * w + x) * 4 + 3] > 0 {
+                    sum += y as f64;
+                    count += 1;
+                }
+            }
+        }
+        (count > 0).then_some(sum / count as f64)
+    }
+
+    #[test]
+    fn punctuation_sits_on_baseline_below_ascenders() {
+        let list = DisplayList {
+            items: vec![DisplayItem::Text {
+                rect: Rect {
+                    x: 10.0,
+                    y: 10.0,
+                    w: 100.0,
+                    h: 1.2 * 32.0,
+                },
+                text: "l.".into(),
+                color: Color::rgb(255, 255, 255),
+                font_size: 32.0,
+                weight: 400,
+            }],
+        };
+        let buf = render(&list, Size { w: 200.0, h: 100.0 });
+        // 'l' rasterizes around x=13..16; '.' around x=22..25 at 32px.
+        let ell = avg_dark_y(&buf, 200, 100, 10, 20).expect("'l' must rasterize");
+        let dot = avg_dark_y(&buf, 200, 100, 20, 40).expect("'.' must rasterize");
+        assert!(
+            dot > ell,
+            "the period must sit on the baseline below 'l': l={ell}, dot={dot}"
+        );
     }
 
     #[test]
