@@ -1,0 +1,8 @@
+{
+  "appName": {
+    "message": "i18n Demo"
+  },
+  "appDesc": {
+    "message": "Gecko-style i18n demo extension for the hodo browser"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Notify Demo",
+  "version": "1.0.0",
+  "description": "Chrome-style notifications demo extension for the hodo browser",
+  "permissions": ["notifications"],
+  "action": {
+    "default_title": "Notify Demo"
+  },
+  "background": {
+    "service_worker": "bg.js"
+  }
+}

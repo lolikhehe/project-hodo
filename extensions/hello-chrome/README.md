@@ -4,4 +4,4 @@ A Chrome-style (MV3) demo extension: background service worker that writes/reads
 
 hodo parses its manifest (MV3, chrome dialect) and dispatches storage/tabs APIs cross-compat.
 
-JS execution engine status: roadmap — not yet implemented.
+JS execution engine status: works via the hodo-js boa bridge (`run_background_scripts`).

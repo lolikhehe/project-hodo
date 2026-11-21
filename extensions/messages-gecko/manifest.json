@@ -1,0 +1,15 @@
+{
+  "manifest_version": 2,
+  "name": "Messages Demo",
+  "version": "1.0.0",
+  "description": "Gecko-style messaging demo extension for the hodo browser",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "messages@hodo.example"
+    }
+  },
+  "permissions": ["storage", "tabs"],
+  "background": {
+    "scripts": ["bg.js"]
+  }
+}

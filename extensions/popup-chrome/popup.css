@@ -1,0 +1,14 @@
+body {
+  font-family: sans-serif;
+  min-width: 200px;
+  margin: 12px;
+}
+h1 {
+  font-size: 16px;
+  margin: 0 0 8px;
+}
+p {
+  font-size: 12px;
+  margin: 0;
+  color: #444;
+}
