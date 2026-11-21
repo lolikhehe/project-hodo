@@ -14,6 +14,11 @@ hodo-layout.workspace = true
 hodo-render.workspace = true
 hodo-net.workspace = true
 hodo-ext-host.workspace = true
+hodo-ext-manifest.workspace = true
+hodo-ext-api.workspace = true
+winit = "0.30"
+softbuffer = "0.4.8"
+tiny-skia = "0.12.0"
 
 [lints]
 workspace = true
