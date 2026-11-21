@@ -165,6 +165,10 @@ fn cascade(
         for decl in m.3 {
             let property = decl.property.trim().to_ascii_lowercase();
             let value = decl.value.trim().to_string();
+            if property == "border" {
+                expand_border_shorthand(&value, &mut winning);
+                continue;
+            }
             let expanded = edge_longhand_keys(&property)
                 .and_then(|keys| edge_shorthand_parts(&value).map(|parts| (keys, parts)));
             if let Some((keys, parts)) = expanded {
@@ -281,6 +285,45 @@ fn edge_longhand_keys(property: &str) -> Option<[&'static str; 4]> {
         "padding" => Some(PADDING_KEYS),
         "border-width" => Some(BORDER_WIDTH_KEYS),
         _ => None,
+    }
+}
+
+/// Expand `border: <width> <style> <color>` (tokens in any order, partial forms
+/// allowed) into the same longhand keys the cascade already walks.
+fn expand_border_shorthand(value: &str, winning: &mut HashMap<String, String>) {
+    let mut width = None;
+    let mut color = None;
+    for token in value.split_whitespace() {
+        let lower = token.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "none"
+                | "hidden"
+                | "solid"
+                | "dashed"
+                | "dotted"
+                | "double"
+                | "groove"
+                | "ridge"
+                | "inset"
+                | "outset"
+        ) {
+            // shortcut: only solid borders rasterize, per-style patterns when a real border-style engine lands
+            continue;
+        }
+        if parse_color(token).is_some() {
+            color = Some(token);
+        } else if parse_length(token, 1.0).is_some() {
+            width = Some(token);
+        }
+    }
+    if let Some(width) = width {
+        for key in BORDER_WIDTH_KEYS {
+            winning.insert(key.to_string(), width.to_string());
+        }
+    }
+    if let Some(color) = color {
+        winning.insert("border-color".to_string(), color.to_string());
     }
 }
 
@@ -578,6 +621,92 @@ mod tests {
             (1.0, 9.0, 3.0, 4.0)
         );
         assert_eq!(s.border_width, 9.0);
+    }
+
+    #[test]
+    fn border_shorthand_sets_widths_and_color() {
+        let (dom, id) = one_element("div");
+        let sheets = [Stylesheet {
+            rules: vec![rule(tag("div"), &[("border", "2px solid #3366aa")])],
+        }];
+        let map = compute_styles(&dom, &sheets);
+        let s = map.get(id).unwrap();
+        assert_eq!(
+            (
+                s.border_widths.top,
+                s.border_widths.right,
+                s.border_widths.bottom,
+                s.border_widths.left
+            ),
+            (2.0, 2.0, 2.0, 2.0)
+        );
+        assert_eq!(s.border_width, 2.0);
+        assert_eq!(s.border_color, Color::rgb(0x33, 0x66, 0xaa));
+    }
+
+    #[test]
+    fn border_shorthand_color_only_leaves_widths_alone() {
+        let (dom, id) = one_element("div");
+        let sheets = [Stylesheet {
+            rules: vec![rule(
+                tag("div"),
+                &[("border-width", "3px"), ("border", "red")],
+            )],
+        }];
+        let map = compute_styles(&dom, &sheets);
+        let s = map.get(id).unwrap();
+        assert_eq!(s.border_widths.top, 3.0);
+        assert_eq!(s.border_width, 3.0);
+        assert_eq!(s.border_color, Color::rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn border_shorthand_and_longhands_follow_source_order() {
+        let (dom, id) = one_element("div");
+        let sheets = [Stylesheet {
+            rules: vec![
+                rule(tag("div"), &[("border", "2px solid #0000ff")]),
+                rule(
+                    tag("div"),
+                    &[("border-top-width", "9px"), ("border-color", "#ff0000")],
+                ),
+            ],
+        }];
+        let map = compute_styles(&dom, &sheets);
+        let s = map.get(id).unwrap();
+        assert_eq!(
+            (
+                s.border_widths.top,
+                s.border_widths.right,
+                s.border_widths.bottom,
+                s.border_widths.left
+            ),
+            (9.0, 2.0, 2.0, 2.0)
+        );
+        assert_eq!(s.border_color, Color::rgb(255, 0, 0));
+
+        // Reversed: the later shorthand overwrites both longhands.
+        let sheets = [Stylesheet {
+            rules: vec![
+                rule(
+                    tag("div"),
+                    &[("border-top-width", "9px"), ("border-color", "#ff0000")],
+                ),
+                rule(tag("div"), &[("border", "4px dashed #00ff00")]),
+            ],
+        }];
+        let map = compute_styles(&dom, &sheets);
+        let s = map.get(id).unwrap();
+        assert_eq!(
+            (
+                s.border_widths.top,
+                s.border_widths.right,
+                s.border_widths.bottom,
+                s.border_widths.left
+            ),
+            (4.0, 4.0, 4.0, 4.0)
+        );
+        assert_eq!(s.border_color, Color::rgb(0, 255, 0));
     }
 
     #[test]

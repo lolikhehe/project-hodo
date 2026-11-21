@@ -17,6 +17,8 @@ const FRAME_BYTES: usize = 1200 * 800 * 4;
 
 /// Background declared by `.card` in style.css.
 const CARD_BG: (u8, u8, u8) = (0xee, 0xf4, 0xfb);
+/// Border color declared by `.card` in style.css (`border: 2px solid #1d5fa8`).
+const CARD_BORDER: (u8, u8, u8) = (0x1d, 0x5f, 0xa8);
 
 fn demo_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/demo-site")
@@ -195,6 +197,40 @@ fn pipeline_renders_expected_frame() {
         })
     });
     assert!(matched, "no exact #eef4fb pixel inside card rect {card:?}");
+}
+
+#[test]
+fn card_border_color_lines_the_inside_edge() {
+    let (list, buffer) = render_demo();
+    let card = list
+        .items
+        .iter()
+        .find_map(|item| match item {
+            DisplayItem::Rect { rect, color, .. }
+                if (color.r, color.g, color.b) == CARD_BG && color.a == 255 =>
+            {
+                Some(*rect)
+            }
+            _ => None,
+        })
+        .expect(".card background rect (#eef4fb) missing from display list");
+    let (x0, y0, x1, y1) = pixel_bounds(&card, 1200, 800);
+    let band = 3usize;
+    let matched = (x0..x1).any(|x| {
+        (y0..y1).any(|y| {
+            let near_edge = x < x0 + band || x + band >= x1 || y < y0 + band || y + band >= y1;
+            if !near_edge {
+                return false;
+            }
+            let i = (y * 1200 + x) * 4;
+            [buffer[i], buffer[i + 1], buffer[i + 2], buffer[i + 3]]
+                == [CARD_BORDER.0, CARD_BORDER.1, CARD_BORDER.2, 255]
+        })
+    });
+    assert!(
+        matched,
+        "no exact #1d5fa8 border pixel in the 3px band just inside card rect {card:?}"
+    );
 }
 
 #[test]
