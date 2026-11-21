@@ -46,12 +46,22 @@ fn extension_titles() -> Vec<String> {
         .collect()
 }
 
+/// Prepare a headless frame for PNG encoding: composite over opaque white
+/// (like the GUI path) before premultiplying for tiny-skia.
+fn screenshot_frame(
+    display_list: &hodo_layout::DisplayList,
+    viewport: hodo_types::Size,
+) -> Vec<u8> {
+    let mut rgba = hodo_render::render(display_list, viewport);
+    app::composite_over_white(&mut rgba);
+    app::premultiply_rgba(&rgba)
+}
+
 /// Headless screenshot: run the page pipeline (no UI overlay), premultiply
 /// the straight-alpha frame for tiny-skia, encode and write the PNG.
 fn screenshot(url: &str, out: &str) {
     let (_, display_list) = app::load_page(url, app::DEFAULT_VIEWPORT);
-    let rgba = hodo_render::render(&display_list, app::DEFAULT_VIEWPORT);
-    let premultiplied = app::premultiply_rgba(&rgba);
+    let premultiplied = screenshot_frame(&display_list, app::DEFAULT_VIEWPORT);
     let size = tiny_skia::IntSize::from_wh(1200, 800).expect("fixed screenshot size is valid");
     let pixmap = tiny_skia::Pixmap::from_vec(premultiplied, size).expect("frame matches viewport");
     let png = pixmap.encode_png().expect("PNG encoding failed");
@@ -298,5 +308,24 @@ fn main() {
             eprintln!("usage: hodo-shell [--screenshot <url> <out.png>] [<url>]");
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn headless_frame_is_fully_opaque_white_where_unpainted() {
+        let frame = screenshot_frame(&hodo_layout::DisplayList::default(), app::DEFAULT_VIEWPORT);
+        assert_eq!(frame.len(), 1200 * 800 * 4);
+        assert!(
+            frame
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| p == &[255, 255, 255, 255]),
+            "unpainted headless pixels must be opaque white"
+        );
     }
 }
