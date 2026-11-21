@@ -85,6 +85,8 @@ struct Flow {
     line: Vec<Atom>,
     line_w: f32,
     pending_space: Option<f32>,
+    /// One bullet is emitted on this flow's first text line (list item).
+    bullet: bool,
 }
 
 impl Flow {
@@ -96,6 +98,7 @@ impl Flow {
             line: Vec::new(),
             line_w: 0.0,
             pending_space: None,
+            bullet: false,
         }
     }
 }
@@ -248,6 +251,13 @@ fn layout_block(ctx: &mut Ctx<'_>, style: &ComputedStyle, id: NodeId, avail: Ava
     }
 
     let mut flow = Flow::new(inner_left, inner_right, top);
+    if ctx
+        .dom
+        .tag(id)
+        .is_some_and(|tag| tag.eq_ignore_ascii_case("li"))
+    {
+        flow.bullet = true;
+    }
     layout_children(ctx, &mut flow, style, id);
     flush_line(&mut flow, ctx.list);
 
@@ -280,6 +290,11 @@ fn flush_line(flow: &mut Flow, list: &mut Vec<DisplayItem>) {
     let color = first.color;
     let weight = first.weight;
     let mut text = String::new();
+    if flow.bullet {
+        // shortcut: UA ::marker emulation, real markers when list-style engine lands
+        text.push_str("• ");
+        flow.bullet = false;
+    }
     let mut line_h = 0.0_f32;
     for atom in &flow.line {
         text.push_str(&atom.text);
@@ -622,5 +637,33 @@ mod tests {
 
         let list = layout(&dom, &styles, Size { w: 800.0, h: 600.0 });
         assert_eq!(texts(&list).len(), 1);
+    }
+
+    #[test]
+    fn li_text_gets_one_bullet_prefix() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let ul = elem(&mut dom, root, "ul");
+        let li = elem(&mut dom, ul, "li");
+        text(&mut dom, li, "first item");
+        let div = elem(&mut dom, root, "div");
+        text(&mut dom, div, "plain");
+
+        let styles = compute_styles(&dom, &[]);
+        let list = layout(&dom, &styles, Size { w: 800.0, h: 600.0 });
+        let lines = texts(&list);
+        assert!(
+            lines.contains(&"• first item"),
+            "li text must carry the bullet marker: {lines:?}"
+        );
+        assert!(
+            lines.contains(&"plain"),
+            "non-list text must stay unprefixed: {lines:?}"
+        );
+        assert_eq!(
+            lines.iter().filter(|s| s.starts_with('•')).count(),
+            1,
+            "only the list item's first line gets a bullet"
+        );
     }
 }
