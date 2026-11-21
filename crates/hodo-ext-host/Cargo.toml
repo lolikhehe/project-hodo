@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 hodo-ext-manifest.workspace = true
 hodo-ext-api.workspace = true
+hodo-js.workspace = true
 thiserror.workspace = true
 
 [lints]
