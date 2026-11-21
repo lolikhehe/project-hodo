@@ -9,5 +9,8 @@ hodo-types.workspace = true
 hodo-dom.workspace = true
 hodo-style.workspace = true
 
+[dev-dependencies]
+hodo-css.workspace = true
+
 [lints]
 workspace = true
