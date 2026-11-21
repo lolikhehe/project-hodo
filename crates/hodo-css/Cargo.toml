@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 hodo-dom.workspace = true
+cssparser = "0.38.0"
 
 [lints]
 workspace = true
