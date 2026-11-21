@@ -1,0 +1,13 @@
+[package]
+name = "hodo-layout"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hodo-types.workspace = true
+hodo-dom.workspace = true
+hodo-style.workspace = true
+
+[lints]
+workspace = true

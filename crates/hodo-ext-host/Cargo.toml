@@ -1,0 +1,13 @@
+[package]
+name = "hodo-ext-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hodo-ext-manifest.workspace = true
+hodo-ext-api.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "hodo-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hodo-types.workspace = true
+hodo-dom.workspace = true
+hodo-html.workspace = true
+hodo-css.workspace = true
+hodo-style.workspace = true
+hodo-layout.workspace = true
+hodo-render.workspace = true
+hodo-net.workspace = true
+hodo-ext-host.workspace = true
+
+[lints]
+workspace = true

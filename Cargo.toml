@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/hodo-types",
+  "crates/hodo-dom",
+  "crates/hodo-html",
+  "crates/hodo-css",
+  "crates/hodo-style",
+  "crates/hodo-layout",
+  "crates/hodo-render",
+  "crates/hodo-net",
+  "crates/hodo-ext-manifest",
+  "crates/hodo-ext-api",
+  "crates/hodo-ext-host",
+  "crates/hodo-shell",
+  "crates/hodo-tests",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+repository = "https://github.com/lolikhehe/project-hodo"
+
+[workspace.dependencies]
+hodo-types = { path = "crates/hodo-types", version = "0.1.0" }
+hodo-dom = { path = "crates/hodo-dom", version = "0.1.0" }
+hodo-html = { path = "crates/hodo-html", version = "0.1.0" }
+hodo-css = { path = "crates/hodo-css", version = "0.1.0" }
+hodo-style = { path = "crates/hodo-style", version = "0.1.0" }
+hodo-layout = { path = "crates/hodo-layout", version = "0.1.0" }
+hodo-render = { path = "crates/hodo-render", version = "0.1.0" }
+hodo-net = { path = "crates/hodo-net", version = "0.1.0" }
+hodo-ext-manifest = { path = "crates/hodo-ext-manifest", version = "0.1.0" }
+hodo-ext-api = { path = "crates/hodo-ext-api", version = "0.1.0" }
+hodo-ext-host = { path = "crates/hodo-ext-host", version = "0.1.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
