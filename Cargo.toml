@@ -15,6 +15,9 @@ members = [
   "crates/hodo-shell",
   "crates/hodo-tests",
   "crates/hodo-perf",
+  "crates/hodo-js",
+  "crates/hodo-fuzz",
+  "crates/hodo-cache",
 ]
 
 [workspace.package]
@@ -35,6 +38,7 @@ hodo-net = { path = "crates/hodo-net", version = "0.1.0" }
 hodo-ext-manifest = { path = "crates/hodo-ext-manifest", version = "0.1.0" }
 hodo-ext-api = { path = "crates/hodo-ext-api", version = "0.1.0" }
 hodo-ext-host = { path = "crates/hodo-ext-host", version = "0.1.0" }
+hodo-js = { path = "crates/hodo-js", version = "0.1.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
