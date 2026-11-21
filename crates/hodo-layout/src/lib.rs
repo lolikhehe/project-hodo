@@ -1,15 +1,23 @@
-//! Block-flow layout producing a flat display list.
+//! Block-flow + inline formatting layout producing a flat display list.
 //!
-//! MVP scope and documented limits:
-//! - Layout is a pure, pre-order walk of the DOM; it keeps no global state.
-//! - Block elements produce a background rect (when non-transparent) and,
-//!   optionally, four thin border rects. Nested blocks stack vertically.
-//! - Text is flowed into visual lines using approximate metrics:
-//!   char width = 0.6 * font_size, line height = 1.2 * font_size.
-//! - Inline elements do not create boxes: their text is folded into the
-//!   surrounding block's inline flow.
-//! - Vertical margins are summed, never collapsed.
-//! - Unknown/unlisted nodes are treated as transparent containers.
+//! Scope and documented shortcuts:
+//! - Geometry uses approximate metrics: char width = 0.6 * font_size, line
+//!   height = 1.2 * font_size. Real fontdue ascent/descent metrics in layout
+//!   are a follow-up (the renderer already advances glyphs with fontdue).
+//! - Inline formatting contexts produce real line boxes. An inline element
+//!   paints its background and border once per line fragment. Horizontal
+//!   margin/padding/border shift text within the line; vertical ones do not.
+//! - `white-space: normal` only; `<br>` forces a hard break and long words are
+//!   hard-broken in linear work (one bounded scan per emitted chunk).
+//! - One Text item per line (first-atom color/font/href wins) so link clicks
+//!   map to the line fragment that was clicked, not a whole-element box.
+//! - Deferred to the property-plumbing sweep (ComputedStyle is owned by the
+//!   hodo-style/selectors wave): `vertical-align`, `line-height`, `text-align`,
+//!   `text-indent`, `letter-spacing`, `word-spacing`, `overflow-wrap`,
+//!   non-normal `white-space`, `display: inline-block`, font fallback/synthesis,
+//!   text-decoration rasterization and bidi/complex scripts.
+//! - Vertical margins sum, never collapse. Unknown nodes are transparent
+//!   containers.
 
 use hodo_dom::{Dom, NodeId, NodeKind};
 use hodo_style::{ComputedStyle, Display, StyleMap};
@@ -42,8 +50,7 @@ pub struct DisplayList {
     pub items: Vec<DisplayItem>,
 }
 
-/// Block-flow layout. Approximate metrics: char width = 0.6 * font_size,
-/// line height = 1.2 * font_size.
+/// Lay out `dom` into a flat display list for a viewport of `size`.
 pub fn layout(dom: &Dom, styles: &StyleMap, viewport: Size) -> DisplayList {
     let mut list = Vec::new();
     {
@@ -74,14 +81,35 @@ struct Avail {
     width: f32,
 }
 
-/// One rendered word (or a single collapsed space) waiting to be placed.
+/// One rendered word, collapsed space, or inline-box inset spacer waiting to
+/// be placed on a line. `spacer` atoms carry geometry but no glyphs.
 struct Atom {
     text: String,
     font_size: f32,
     color: Color,
     weight: u16,
-    /// Nearest ancestor `<a href>` whose text this atom belongs to.
     href: Option<String>,
+    /// Absolute x where this atom starts.
+    x: f32,
+    /// Advance width contributed to the line.
+    w: f32,
+    /// Inline boxes containing this atom, outermost first (indices into
+    /// `Flow::boxes`). Empty for ordinary text.
+    boxes: Vec<usize>,
+    spacer: bool,
+}
+
+/// Paint state of one inline element inside a block's flow.
+struct InlineBox {
+    bg: Color,
+    border_color: Color,
+    border: Edges<f32>,
+    margin: Edges<f32>,
+    padding: Edges<f32>,
+    /// Already painted a fragment on an earlier line: suppress left border.
+    seen: bool,
+    /// Element is still open: suppress right border on this fragment.
+    active: bool,
 }
 
 /// Mutable inline-flow state for a single block's content area.
@@ -94,6 +122,10 @@ struct Flow {
     pending_space: Option<f32>,
     /// One bullet is emitted on this flow's first text line (list item).
     bullet: bool,
+    /// Every paintable inline element encountered in this flow.
+    boxes: Vec<InlineBox>,
+    /// Indices of boxes currently open, outermost first.
+    stack: Vec<usize>,
 }
 
 impl Flow {
@@ -106,8 +138,16 @@ impl Flow {
             line_w: 0.0,
             pending_space: None,
             bullet: false,
+            boxes: Vec::new(),
+            stack: Vec::new(),
         }
     }
+}
+
+/// True when the current line has at least one glyph-bearing atom. Spacer-only
+/// lines are not a wrap boundary and never produce a Text item.
+fn has_content(flow: &Flow) -> bool {
+    flow.line.iter().any(|a| !a.spacer)
 }
 
 /// Style used for text nodes that have no computed style of their own.
@@ -145,8 +185,30 @@ fn patch_rect(list: &mut [DisplayItem], idx: usize, f: impl FnOnce(&mut Rect)) {
     }
 }
 
-/// Walk a node's children in order, stacking blocks and flowing text.
-/// `link` is the nearest ancestor `<a>` href in scope for this subtree.
+fn push_atom(flow: &mut Flow, atom: Atom) {
+    flow.line.push(atom);
+}
+
+/// Whether a child participates as a block-level sibling for anonymous-block
+/// splitting. `<img>` is an atomic replaced element in this engine.
+fn is_block_level(ctx: &Ctx<'_>, id: NodeId) -> bool {
+    // Text nodes inherit their parent's computed `display`, so only elements
+    // may be classified as block-level siblings here.
+    matches!(ctx.dom.get(id).kind, NodeKind::Element { .. })
+        && (ctx
+            .styles
+            .get(id)
+            .is_some_and(|s| s.display == Display::Block)
+            || ctx
+                .dom
+                .tag(id)
+                .is_some_and(|tag| tag.eq_ignore_ascii_case("img")))
+}
+
+/// Walk a node's children in order. Mixed inline/block child lists are split
+/// into anonymous block boxes: each consecutive inline run gets its own flow,
+/// so it cannot share a line box across a block sibling. Pure lists keep the
+/// original single-flow behaviour.
 fn layout_children(
     ctx: &mut Ctx<'_>,
     flow: &mut Flow,
@@ -154,74 +216,221 @@ fn layout_children(
     parent: NodeId,
     link: Option<String>,
 ) {
-    let children: Vec<NodeId> = ctx.dom.children(parent).to_vec();
-    for child in children {
-        let s = ctx.styles.get(child).cloned();
-        if s.as_ref().is_some_and(|st| st.display == Display::None) {
-            continue;
-        }
-        let tag = ctx.dom.tag(child).unwrap_or("");
-        // An <a> without href does not replace an outer link already in scope.
-        let link = if tag.eq_ignore_ascii_case("a") {
-            ctx.dom
-                .attr(child, "href")
-                .map(str::to_string)
-                .or_else(|| link.clone())
-        } else {
-            link.clone()
-        };
-        match &ctx.dom.get(child).kind {
-            NodeKind::Text(t) => {
-                let st = s.as_ref().unwrap_or(fallback);
-                feed_text(flow, ctx.list, t, st, link);
-            }
-            NodeKind::Element { .. } => {
-                if tag.eq_ignore_ascii_case("img") {
-                    flush_line(flow, ctx.list);
-                    // shortcut: relative src resolution needs a base URL; the shell passes
-                    // absolute paths/URLs until layout grows a base-url parameter.
-                    if let Some(src) = ctx.dom.attr(child, "src") {
-                        let w = ctx
-                            .dom
-                            .attr(child, "width")
-                            .and_then(|v| v.parse::<f32>().ok())
-                            .unwrap_or(64.0);
-                        let h = ctx
-                            .dom
-                            .attr(child, "height")
-                            .and_then(|v| v.parse::<f32>().ok())
-                            .unwrap_or(64.0);
-                        ctx.list.push(DisplayItem::Image {
-                            rect: Rect {
-                                x: flow.left,
-                                y: flow.y,
-                                w,
-                                h,
-                            },
-                            path: src.to_string(),
-                        });
-                        flow.y += h;
-                    }
-                } else if s.as_ref().is_some_and(|st| st.display == Display::Block) {
-                    flush_line(flow, ctx.list);
-                    let avail = Avail {
-                        x: flow.left,
-                        y: flow.y,
-                        width: flow.right - flow.left,
-                    };
-                    let consumed = layout_block(ctx, s.as_ref().unwrap(), child, avail, link);
-                    // shortcut: vertical margins sum, no collapsing (MVP); upgrade when
-                    // CSS margin collapsing is required for spec fidelity.
-                    flow.y += consumed;
-                } else {
-                    // shortcut: inline elements create no box; their text joins this
-                    // block's flow. Upgrade for true inline box layout/vertical alignment.
-                    layout_children(ctx, flow, fallback, child, link);
+    let live: Vec<NodeId> = ctx
+        .dom
+        .children(parent)
+        .iter()
+        .copied()
+        .filter(|&child| {
+            !ctx.styles
+                .get(child)
+                .is_some_and(|s| s.display == Display::None)
+        })
+        .collect();
+
+    let has_block = live.iter().any(|&c| is_block_level(ctx, c));
+    let has_inline = live.iter().any(|&c| !is_block_level(ctx, c));
+
+    if has_block && has_inline {
+        // Anonymous block boxes: wrap consecutive inline runs.
+        let mut run: Vec<NodeId> = Vec::new();
+        let mut run_y = flow.y;
+        for &child in &live {
+            if is_block_level(ctx, child) {
+                if !run.is_empty() {
+                    layout_inline_run(ctx, flow, fallback, &run, link.clone(), run_y);
+                    run.clear();
                 }
+                layout_child(ctx, flow, fallback, child, link.clone());
+                run_y = flow.y;
+            } else {
+                run.push(child);
             }
-            NodeKind::Document => layout_children(ctx, flow, fallback, child, link),
+        }
+        if !run.is_empty() {
+            layout_inline_run(ctx, flow, fallback, &run, link, run_y);
+        }
+    } else {
+        for child in live {
+            layout_child(ctx, flow, fallback, child, link.clone());
         }
     }
+}
+
+/// Lay out one anonymous block box made from a consecutive inline run.
+fn layout_inline_run(
+    ctx: &mut Ctx<'_>,
+    flow: &mut Flow,
+    fallback: &ComputedStyle,
+    run: &[NodeId],
+    link: Option<String>,
+    y: f32,
+) {
+    let mut sub = Flow::new(flow.left, flow.right, y);
+    if flow.bullet {
+        sub.bullet = true;
+        flow.bullet = false;
+    }
+    for &child in run {
+        layout_child(ctx, &mut sub, fallback, child, link.clone());
+    }
+    flush_line(&mut sub, ctx.list);
+    flow.y = sub.y;
+}
+
+/// Lay out a single child into `flow`.
+fn layout_child(
+    ctx: &mut Ctx<'_>,
+    flow: &mut Flow,
+    fallback: &ComputedStyle,
+    child: NodeId,
+    link: Option<String>,
+) {
+    let s = ctx.styles.get(child).cloned();
+    if s.as_ref().is_some_and(|st| st.display == Display::None) {
+        return;
+    }
+    let tag = ctx.dom.tag(child).unwrap_or("");
+    // An <a> without href does not replace an outer link already in scope.
+    let link = if tag.eq_ignore_ascii_case("a") {
+        ctx.dom
+            .attr(child, "href")
+            .map(str::to_string)
+            .or_else(|| link.clone())
+    } else {
+        link
+    };
+
+    match &ctx.dom.get(child).kind {
+        NodeKind::Text(t) => {
+            let st = s.as_ref().unwrap_or(fallback);
+            let boxes = flow.stack.clone();
+            feed_text(flow, ctx.list, t, st, link, &boxes);
+        }
+        NodeKind::Element { .. } => {
+            if tag.eq_ignore_ascii_case("img") {
+                flush_line(flow, ctx.list);
+                // shortcut: relative src resolution needs a base URL; the shell passes
+                // absolute paths/URLs until layout grows a base-url parameter.
+                if let Some(src) = ctx.dom.attr(child, "src") {
+                    let w = ctx
+                        .dom
+                        .attr(child, "width")
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .unwrap_or(64.0);
+                    let h = ctx
+                        .dom
+                        .attr(child, "height")
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .unwrap_or(64.0);
+                    ctx.list.push(DisplayItem::Image {
+                        rect: Rect {
+                            x: flow.left,
+                            y: flow.y,
+                            w,
+                            h,
+                        },
+                        path: src.to_string(),
+                    });
+                    flow.y += h;
+                }
+            } else if tag.eq_ignore_ascii_case("br") {
+                // Hard line break. An empty line still occupies one line box.
+                if has_content(flow) {
+                    flush_line(flow, ctx.list);
+                } else {
+                    flow.y += 1.2 * s.as_ref().unwrap_or(fallback).font_size;
+                }
+            } else if s.as_ref().is_some_and(|st| st.display == Display::Block) {
+                flush_line(flow, ctx.list);
+                let avail = Avail {
+                    x: flow.left,
+                    y: flow.y,
+                    width: flow.right - flow.left,
+                };
+                let consumed = layout_block(ctx, s.as_ref().unwrap(), child, avail, link);
+                // shortcut: vertical margins sum, no collapsing (MVP); upgrade when
+                // CSS margin collapsing is required for spec fidelity.
+                flow.y += consumed;
+            } else {
+                let st = s.as_ref().unwrap_or(fallback);
+                let paintable =
+                    st.background.a > 0 || (st.border_color.a > 0 && st.border_width > 0.0);
+                if paintable {
+                    let bi = flow.boxes.len();
+                    flow.boxes.push(InlineBox {
+                        bg: st.background,
+                        border_color: st.border_color,
+                        border: st.border_widths,
+                        margin: st.margin,
+                        padding: st.padding,
+                        seen: false,
+                        active: true,
+                    });
+                    let mut boxes = flow.stack.clone();
+                    boxes.push(bi);
+                    let left = left_inset(&flow.boxes[bi]);
+                    if left > 0.0 {
+                        push_atom(
+                            flow,
+                            Atom {
+                                text: String::new(),
+                                font_size: st.font_size,
+                                color: st.color,
+                                weight: st.font_weight,
+                                href: None,
+                                x: flow.left + flow.line_w,
+                                w: left,
+                                boxes: boxes.clone(),
+                                spacer: true,
+                            },
+                        );
+                        flow.line_w += left;
+                    }
+                    flow.stack.push(bi);
+                }
+
+                layout_children(ctx, flow, fallback, child, link);
+
+                if paintable {
+                    // The right spacer still belongs to the box being closed.
+                    let boxes = flow.stack.clone();
+                    let bi = flow
+                        .stack
+                        .pop()
+                        .expect("paintable inline box must be on the stack");
+                    flow.boxes[bi].active = false;
+                    let right = right_inset(&flow.boxes[bi]);
+                    if right > 0.0 {
+                        push_atom(
+                            flow,
+                            Atom {
+                                text: String::new(),
+                                font_size: st.font_size,
+                                color: st.color,
+                                weight: st.font_weight,
+                                href: None,
+                                x: flow.left + flow.line_w,
+                                w: right,
+                                boxes,
+                                spacer: true,
+                            },
+                        );
+                        flow.line_w += right;
+                    }
+                }
+            }
+        }
+        NodeKind::Document => layout_children(ctx, flow, fallback, child, link),
+    }
+}
+
+fn left_inset(b: &InlineBox) -> f32 {
+    b.margin.left + b.border.left + b.padding.left
+}
+
+fn right_inset(b: &InlineBox) -> f32 {
+    b.padding.right + b.border.right + b.margin.right
 }
 
 /// Lay out one block box and return the total vertical space it consumes,
@@ -336,108 +545,223 @@ fn layout_block(
     m.top + box_h + m.bottom
 }
 
-/// Commit the current visual line as one Text item and advance the y cursor.
+/// Paint the per-line fragments of every inline box that contributed to the
+/// current line. A fragment's extent is the union of all atoms carrying that
+/// box (including its inset spacers), so nested boxes compose correctly.
+fn emit_fragments(flow: &mut Flow, list: &mut Vec<DisplayItem>, h: f32) {
+    let mut extents: Vec<(usize, f32, f32)> = Vec::new();
+    for atom in &flow.line {
+        for &bi in &atom.boxes {
+            if let Some(e) = extents.iter_mut().find(|e| e.0 == bi) {
+                e.1 = e.1.min(atom.x);
+                e.2 = e.2.max(atom.x + atom.w);
+            } else {
+                extents.push((bi, atom.x, atom.x + atom.w));
+            }
+        }
+    }
+
+    for (bi, x0, x1) in extents {
+        let (bg, border_color, border, seen, active) = {
+            let b = &flow.boxes[bi];
+            (b.bg, b.border_color, b.border, b.seen, b.active)
+        };
+        let first = !seen;
+        let last = !active;
+        let w = (x1 - x0).max(0.0);
+        let y = flow.y;
+        if bg.a > 0 {
+            push_rect(list, Rect { x: x0, y, w, h }, bg);
+        }
+        if border_color.a > 0 {
+            let bt = border.top;
+            let bb = border.bottom;
+            if bt > 0.0 {
+                push_rect(list, Rect { x: x0, y, w, h: bt }, border_color);
+            }
+            if bb > 0.0 {
+                push_rect(
+                    list,
+                    Rect {
+                        x: x0,
+                        y: y + h - bb,
+                        w,
+                        h: bb,
+                    },
+                    border_color,
+                );
+            }
+            // Left/right borders belong only to the first/last fragment.
+            if first && border.left > 0.0 {
+                push_rect(
+                    list,
+                    Rect {
+                        x: x0,
+                        y,
+                        w: border.left,
+                        h,
+                    },
+                    border_color,
+                );
+            }
+            if last && border.right > 0.0 {
+                push_rect(
+                    list,
+                    Rect {
+                        x: x0 + w - border.right,
+                        y,
+                        w: border.right,
+                        h,
+                    },
+                    border_color,
+                );
+            }
+        }
+        flow.boxes[bi].seen = true;
+    }
+}
+
+/// Commit the current visual line as Text (fragments first) and advance y.
 fn flush_line(flow: &mut Flow, list: &mut Vec<DisplayItem>) {
     if flow.line.is_empty() {
         return;
     }
-    let first = &flow.line[0];
-    let font_size = first.font_size;
-    let color = first.color;
-    let weight = first.weight;
+    let line_h = flow
+        .line
+        .iter()
+        .map(|a| 1.2 * a.font_size)
+        .fold(0.0_f32, f32::max);
+    emit_fragments(flow, list, line_h);
+
+    let mut text = String::new();
+    let mut first: Option<&Atom> = None;
+    for atom in &flow.line {
+        if atom.spacer {
+            continue;
+        }
+        if first.is_none() {
+            first = Some(atom);
+        }
+        text.push_str(&atom.text);
+    }
     // shortcut: a line mixing linked and plain atoms takes its link from the first
     // atom, matching the first-atom-wins style rule; upgrade for per-run hit boxes.
-    let href = first.href.clone();
-    let mut text = String::new();
-    if flow.bullet {
-        // shortcut: UA ::marker emulation, real markers when list-style engine lands
-        text.push_str("• ");
-        flow.bullet = false;
+    if let Some(f) = first {
+        if flow.bullet {
+            // shortcut: UA ::marker emulation, real markers when list-style engine lands
+            text.insert_str(0, "• ");
+            flow.bullet = false;
+        }
+        list.push(DisplayItem::Text {
+            rect: Rect {
+                // Start at the first glyph, past any leading inline-box inset.
+                x: f.x,
+                y: flow.y,
+                w: flow.line_w - (f.x - flow.left),
+                h: line_h,
+            },
+            text,
+            color: f.color,
+            font_size: f.font_size,
+            weight: f.weight,
+            href: f.href.clone(),
+        });
     }
-    let mut line_h = 0.0_f32;
-    for atom in &flow.line {
-        text.push_str(&atom.text);
-        line_h = line_h.max(1.2 * atom.font_size);
-    }
-    list.push(DisplayItem::Text {
-        rect: Rect {
-            x: flow.left,
-            y: flow.y,
-            w: flow.line_w,
-            h: line_h,
-        },
-        text,
-        color,
-        font_size,
-        weight,
-        href,
-    });
     flow.y += line_h;
     flow.line.clear();
     flow.line_w = 0.0;
     flow.pending_space = None;
 }
 
+/// Byte index just after the `n`-th character of `s` (or `s.len()` if shorter).
+fn char_boundary(s: &str, n: usize) -> usize {
+    s.char_indices().nth(n).map(|(i, _)| i).unwrap_or(s.len())
+}
+
 /// Place a word into the flow, wrapping at the content width. Words longer
-/// than a whole line are hard-broken into as many characters as fit.
+/// than a whole line are hard-broken. Each chunk scan is bounded by the chars
+/// actually emitted on that line, so total work is linear in the text length.
 fn place_word(flow: &mut Flow, list: &mut Vec<DisplayItem>, atom: Atom) {
     let cw = 0.6 * atom.font_size;
-    let max_w = flow.right - flow.left;
-    let mut word: &str = &atom.text;
-    loop {
-        if word.is_empty() {
-            break;
-        }
-        let word_w = word.chars().count() as f32 * cw;
+    let max_w = (flow.right - flow.left).max(0.0);
+    let total = atom.text.chars().count();
+    let mut remaining = total;
+    let mut word = atom.text.as_str();
+    let mut guard = 0usize;
+    while remaining > 0 {
+        guard += 1;
+        debug_assert!(
+            guard <= total.saturating_add(1),
+            "hard-break loop must stay linear in text length"
+        );
+        let word_w = remaining as f32 * cw;
         let space_w = flow.pending_space.unwrap_or(0.0);
-        if !flow.line.is_empty() && flow.line_w + space_w + word_w > max_w {
+        if has_content(flow) && flow.line_w + space_w + word_w > max_w {
             flush_line(flow, list);
             flow.pending_space = None;
             continue;
         }
         if word_w > max_w {
-            let n = ((max_w / cw).floor() as usize).max(1);
-            let mut end = 0;
-            for (count, (i, ch)) in word.char_indices().enumerate() {
-                if count == n {
-                    break;
-                }
-                end = i + ch.len_utf8();
-            }
+            // n >= 1 guarantees progress even when max_w < one character.
+            let n = ((max_w / cw).floor() as usize).clamp(1, remaining);
+            let end = char_boundary(word, n);
             let (chunk, rest) = word.split_at(end);
-            flow.line.push(Atom {
-                text: chunk.to_string(),
-                font_size: atom.font_size,
-                color: atom.color,
-                weight: atom.weight,
-                href: atom.href.clone(),
-            });
-            flow.line_w += chunk.chars().count() as f32 * cw;
-            flush_line(flow, list);
-            flow.pending_space = None;
-            word = rest;
-            continue;
-        }
-        if let Some(sw) = flow.pending_space {
-            if !flow.line.is_empty() {
-                flow.line.push(Atom {
-                    text: " ".to_string(),
+            let chunk_w = n as f32 * cw;
+            push_atom(
+                flow,
+                Atom {
+                    text: chunk.to_string(),
                     font_size: atom.font_size,
                     color: atom.color,
                     weight: atom.weight,
                     href: atom.href.clone(),
-                });
+                    x: flow.left + flow.line_w,
+                    w: chunk_w,
+                    boxes: atom.boxes.clone(),
+                    spacer: false,
+                },
+            );
+            flow.line_w += chunk_w;
+            flush_line(flow, list);
+            flow.pending_space = None;
+            remaining -= n;
+            word = rest;
+            continue;
+        }
+        if let Some(sw) = flow.pending_space {
+            if has_content(flow) {
+                push_atom(
+                    flow,
+                    Atom {
+                        text: " ".to_string(),
+                        font_size: atom.font_size,
+                        color: atom.color,
+                        weight: atom.weight,
+                        href: atom.href.clone(),
+                        x: flow.left + flow.line_w,
+                        w: sw,
+                        boxes: atom.boxes.clone(),
+                        spacer: false,
+                    },
+                );
                 flow.line_w += sw;
             }
         }
         flow.pending_space = None;
-        flow.line.push(Atom {
-            text: word.to_string(),
-            font_size: atom.font_size,
-            color: atom.color,
-            weight: atom.weight,
-            href: atom.href,
-        });
+        push_atom(
+            flow,
+            Atom {
+                text: word.to_string(),
+                font_size: atom.font_size,
+                color: atom.color,
+                weight: atom.weight,
+                href: atom.href,
+                x: flow.left + flow.line_w,
+                w: word_w,
+                boxes: atom.boxes.clone(),
+                spacer: false,
+            },
+        );
         flow.line_w += word_w;
         break;
     }
@@ -451,6 +775,7 @@ fn feed_text(
     text: &str,
     style: &ComputedStyle,
     href: Option<String>,
+    boxes: &[usize],
 ) {
     if text.chars().all(char::is_whitespace) {
         return;
@@ -458,12 +783,12 @@ fn feed_text(
     let fs = style.font_size;
     let color = style.color;
     let weight = style.font_weight;
-    if !flow.line.is_empty() && text.chars().next().is_some_and(char::is_whitespace) {
+    if has_content(flow) && text.chars().next().is_some_and(char::is_whitespace) {
         flow.pending_space = Some(0.6 * fs);
     }
     let mut first = true;
     for word in text.split_whitespace() {
-        if !first && !flow.line.is_empty() {
+        if !first && has_content(flow) {
             flow.pending_space = Some(0.6 * fs);
         }
         place_word(
@@ -475,6 +800,10 @@ fn feed_text(
                 color,
                 weight,
                 href: href.clone(),
+                x: 0.0,
+                w: 0.0,
+                boxes: boxes.to_vec(),
+                spacer: false,
             },
         );
         first = false;
@@ -547,6 +876,26 @@ mod tests {
             .iter()
             .filter_map(|it| match it {
                 DisplayItem::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn text_rects(list: &DisplayList) -> Vec<Rect> {
+        list.items
+            .iter()
+            .filter_map(|it| match it {
+                DisplayItem::Text { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn colored_rects(list: &DisplayList, color: Color) -> Vec<Rect> {
+        list.items
+            .iter()
+            .filter_map(|it| match it {
+                DisplayItem::Rect { rect, color: c, .. } if *c == color => Some(*rect),
                 _ => None,
             })
             .collect()
@@ -807,5 +1156,284 @@ mod tests {
             images[1].0.y >= images[0].0.y + images[0].0.h,
             "images stack in flow"
         );
+    }
+
+    // ---- M7.2: inline formatting context ---------------------------------
+
+    fn span_page(
+        word: &str,
+        viewport_w: f32,
+        decls: &[(&str, &str)],
+    ) -> (Dom, StyleMap, DisplayList) {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let d = elem(&mut dom, root, "div");
+        let span = elem(&mut dom, d, "span");
+        text(&mut dom, span, word);
+        let styles = styled(
+            &dom,
+            vec![
+                tag_rule("div", &[("font-size", "10px")]),
+                tag_rule("span", decls),
+            ],
+        );
+        let list = layout(
+            &dom,
+            &styles,
+            Size {
+                w: viewport_w,
+                h: 600.0,
+            },
+        );
+        (dom, styles, list)
+    }
+
+    #[test]
+    fn br_forces_a_new_line() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let d = elem(&mut dom, root, "div");
+        text(&mut dom, d, "before");
+        elem(&mut dom, d, "br");
+        text(&mut dom, d, "after");
+
+        let styles = compute_styles(&dom, &[]);
+        let list = layout(&dom, &styles, Size { w: 800.0, h: 600.0 });
+        assert_eq!(
+            texts(&list),
+            ["before", "after"],
+            "br must split the two text runs into separate lines"
+        );
+        let r = text_rects(&list);
+        assert_eq!(r.len(), 2);
+        assert!(
+            r[0].y + r[0].h <= r[1].y,
+            "br must push 'after' below 'before': {r:?}"
+        );
+    }
+
+    #[test]
+    fn long_word_hard_breaks_in_linear_time() {
+        // 10 chars per line at 10px font in a 60px column; 5k chars => 500 lines.
+        let word = "x".repeat(5_000);
+        let started = std::time::Instant::now();
+        let (_, _, list) = span_page(&word, 60.0, &[]);
+        let elapsed = started.elapsed();
+        let lines = texts(&list);
+        assert_eq!(
+            lines.len(),
+            500,
+            "each hard-broken line holds exactly 10 characters"
+        );
+        assert!(lines.iter().all(|l| l.len() == 10));
+        assert!(
+            elapsed.as_secs_f64() < 2.0,
+            "hard break must not be quadratic: took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn inline_span_background_fragments_across_two_lines() {
+        let word = "abcdefghijklmnopqrst"; // 20 chars -> 2 lines of 10
+        let (_, _, list) = span_page(word, 60.0, &[("background", "#0000ff")]);
+        let bg = Color::rgb(0, 0, 255);
+        let rects = colored_rects(&list, bg);
+        assert_eq!(
+            rects.len(),
+            2,
+            "one background rect per line fragment, got {rects:?}"
+        );
+        assert!(
+            rects[0].y + rects[0].h <= rects[1].y,
+            "fragments must occupy disjoint y ranges: {rects:?}"
+        );
+        assert!(rects
+            .iter()
+            .all(|r| (r.x - 0.0).abs() < 0.01 && (r.w - 60.0).abs() < 0.01));
+        assert_eq!(texts(&list).len(), 2, "per-line Text items survive");
+    }
+
+    #[test]
+    fn inline_fragment_borders_only_at_outer_edges() {
+        let word = "abcdefghijklmnopqrst";
+        let (_, _, list) = span_page(
+            word,
+            60.0,
+            &[("background", "#0000ff"), ("border", "2px solid #ff0000")],
+        );
+        let red = Color::rgb(255, 0, 0);
+        let blue = Color::rgb(0, 0, 255);
+        let bg = colored_rects(&list, blue);
+        let edges = colored_rects(&list, red);
+        assert_eq!(bg.len(), 2);
+        assert_eq!(
+            edges.len(),
+            6,
+            "top+bottom on both fragments, left on first, right on last: {edges:?}"
+        );
+
+        // First fragment: left edge present, right edge absent.
+        let first = bg[0];
+        let has_left = edges
+            .iter()
+            .any(|e| (e.x - first.x).abs() < 0.01 && (e.w - 2.0).abs() < 0.01 && e.y == first.y);
+        let has_right = edges.iter().any(|e| {
+            ((e.x + e.w) - (first.x + first.w)).abs() < 0.01
+                && (e.w - 2.0).abs() < 0.01
+                && e.y == first.y
+        });
+        assert!(has_left, "first fragment must paint its left border");
+        assert!(!has_right, "first fragment must not paint a right border");
+
+        // Last fragment: right edge present, left edge absent.
+        let last = bg[1];
+        let has_left = edges
+            .iter()
+            .any(|e| (e.x - last.x).abs() < 0.01 && (e.w - 2.0).abs() < 0.01 && e.y == last.y);
+        let has_right = edges.iter().any(|e| {
+            ((e.x + e.w) - (last.x + last.w)).abs() < 0.01
+                && (e.w - 2.0).abs() < 0.01
+                && e.y == last.y
+        });
+        assert!(!has_left, "last fragment must not paint a left border");
+        assert!(has_right, "last fragment must paint its right border");
+    }
+
+    #[test]
+    fn mixed_inline_and_block_split_into_anonymous_blocks() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let d = elem(&mut dom, root, "div");
+        text(&mut dom, d, "before");
+        let p = elem(&mut dom, d, "p");
+        text(&mut dom, p, "block");
+        text(&mut dom, d, "after");
+
+        let styles = styled(&dom, vec![tag_rule("p", &[("background", "#00ff00")])]);
+        let list = layout(&dom, &styles, Size { w: 400.0, h: 600.0 });
+        assert_eq!(
+            texts(&list),
+            ["before", "block", "after"],
+            "inline runs must be separate from the block child"
+        );
+        let tr = text_rects(&list);
+        let pbg = colored_rects(&list, Color::rgb(0, 255, 0));
+        assert_eq!(pbg.len(), 1, "the block child paints one background");
+        assert!(tr[0].y + tr[0].h <= pbg[0].y, "leading run above the block");
+        assert!(pbg[0].y <= tr[2].y, "trailing run below the block");
+    }
+
+    #[test]
+    fn inline_horizontal_insets_apply_vertical_do_not() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let span = elem(&mut dom, root, "span");
+        text(&mut dom, span, "hi");
+        let styles = styled(
+            &dom,
+            vec![tag_rule(
+                "span",
+                &[
+                    ("background", "#ff0000"),
+                    ("margin", "20px 5px"),
+                    ("padding", "10px 5px"),
+                ],
+            )],
+        );
+        let list = layout(&dom, &styles, Size { w: 400.0, h: 600.0 });
+        let tr = text_rects(&list);
+        assert_eq!(tr.len(), 1);
+        assert!(
+            (tr[0].x - 10.0).abs() < 0.01,
+            "5px margin + 5px padding shift text right: {:?}",
+            tr[0]
+        );
+        assert!(
+            (tr[0].y - 0.0).abs() < 0.01,
+            "vertical margin/padding must not move the line: {:?}",
+            tr[0]
+        );
+        assert!(
+            (tr[0].h - 19.2).abs() < 0.01,
+            "line height stays 1.2 * font-size: {:?}",
+            tr[0]
+        );
+        let bg = colored_rects(&list, Color::rgb(255, 0, 0));
+        assert_eq!(bg.len(), 1);
+        assert!(
+            bg[0].x <= tr[0].x && bg[0].y == tr[0].y && bg[0].h == tr[0].h,
+            "fragment spans the text plus horizontal insets: {:?}",
+            bg[0]
+        );
+    }
+
+    #[test]
+    fn wrapped_link_keeps_href_on_every_line_fragment() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let d = elem(&mut dom, root, "div");
+        let a = elem_with_attrs(&mut dom, d, "a", &[("href", "/go")]);
+        text(&mut dom, a, "abcdefghijklmnopqrst");
+        let styles = styled(
+            &dom,
+            vec![
+                tag_rule("div", &[("font-size", "10px")]),
+                tag_rule("a", &[("background", "#0000ff")]),
+            ],
+        );
+        let list = layout(&dom, &styles, Size { w: 60.0, h: 600.0 });
+        let hits: Vec<_> = list
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                DisplayItem::Text { href, .. } => Some(href.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            hits,
+            [Some("/go".to_string()), Some("/go".to_string())],
+            "both line fragments of a wrapped link must stay clickable"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_inline_elements_do_not_panic() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let d = elem(&mut dom, root, "div");
+        let mut cur = d;
+        for _ in 0..300 {
+            cur = elem(&mut dom, cur, "span");
+        }
+        text(&mut dom, cur, "deep");
+        let styles = compute_styles(&dom, &[]);
+        let list = layout(&dom, &styles, Size { w: 800.0, h: 600.0 });
+        assert!(
+            texts(&list).contains(&"deep"),
+            "deeply nested transparent inline elements must still flow their text"
+        );
+    }
+
+    #[test]
+    fn nested_inline_boxes_each_paint_a_fragment() {
+        let word = "abcdefghijklmnopqrst";
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let d = elem(&mut dom, root, "div");
+        let outer = elem(&mut dom, d, "span");
+        let inner = elem(&mut dom, outer, "em");
+        text(&mut dom, inner, word);
+        let styles = styled(
+            &dom,
+            vec![
+                tag_rule("div", &[("font-size", "10px")]),
+                tag_rule("span", &[("background", "#0000ff"), ("padding", "0 2px")]),
+                tag_rule("em", &[("background", "#00ff00")]),
+            ],
+        );
+        let list = layout(&dom, &styles, Size { w: 60.0, h: 600.0 });
+        assert_eq!(colored_rects(&list, Color::rgb(0, 0, 255)).len(), 2);
+        assert_eq!(colored_rects(&list, Color::rgb(0, 255, 0)).len(), 2);
     }
 }

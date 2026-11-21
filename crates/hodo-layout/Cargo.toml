@@ -11,6 +11,7 @@ hodo-style.workspace = true
 
 [dev-dependencies]
 hodo-css.workspace = true
+hodo-render.workspace = true
 
 [lints]
 workspace = true
