@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Tabs Demo Chrome",
+  "version": "1.0.0",
+  "description": "Chrome-style tabs demo extension for the hodo browser",
+  "permissions": ["tabs"],
+  "action": {
+    "default_title": "Open hodo GitHub"
+  },
+  "background": {
+    "service_worker": "bg.js"
+  }
+}

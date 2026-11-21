@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Hello Chrome",
+  "version": "1.0.0",
+  "description": "Chrome-style demo extension for the hodo browser",
+  "permissions": ["storage", "tabs"],
+  "action": {
+    "default_title": "Hello (Chrome)"
+  },
+  "background": {
+    "service_worker": "bg.js"
+  }
+}

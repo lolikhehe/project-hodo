@@ -1,0 +1,18 @@
+{
+  "manifest_version": 2,
+  "name": "Storage Demo Gecko",
+  "version": "1.0.0",
+  "description": "Gecko-style storage demo extension for the hodo browser",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "storage-demo@hodo.example"
+    }
+  },
+  "permissions": ["storage"],
+  "browser_action": {
+    "default_title": "Storage demo"
+  },
+  "background": {
+    "scripts": ["bg.js"]
+  }
+}

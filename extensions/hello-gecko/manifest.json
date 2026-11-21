@@ -1,0 +1,19 @@
+{
+  "manifest_version": 2,
+  "name": "Hello Gecko",
+  "version": "1.0.0",
+  "description": "Gecko-style demo extension for the hodo browser",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "hello-gecko@hodo.example",
+      "strict_min_version": "115.0"
+    }
+  },
+  "permissions": ["storage", "tabs"],
+  "browser_action": {
+    "default_title": "Hello (Gecko)"
+  },
+  "background": {
+    "scripts": ["bg.js"]
+  }
+}
