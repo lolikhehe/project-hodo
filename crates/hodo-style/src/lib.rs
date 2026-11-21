@@ -1,15 +1,25 @@
-//! Style resolution: UA sheet + author sheets, cascaded by specificity and order.
+//! Style resolution: UA sheet + author sheets + inline `style`, cascaded by
+//! origin, `!important`, specificity and source order.
+//!
+//! Limits inherited from `hodo-css`: at most 64 compounds per selector, `:not()`
+//! depth 2, 10 000 rules per sheet. Each element tests only rules selected by
+//! the rightmost-compound index; descendant rules are fast-rejected by a
+//! 64-bit ancestor Bloom filter, sibling rules use a cached sibling scan.
+//! Matching is iterative and a 1000-level DOM stays under the 1 s test budget.
 
 use std::collections::HashMap;
 
 use hodo_css::{
-    matches_element, parse_stylesheet, specificity, Declaration, StyleRule, Stylesheet,
+    declaration_value, is_compound, is_important, matches_selector_ref, parse_style_attribute,
+    parse_stylesheet, specificity_ref, AncestorBloom, Declaration, MatchContext, RuleIndex,
+    StyleRule, Stylesheet,
 };
 use hodo_dom::{Dom, NodeId, NodeKind};
 use hodo_types::{Color, Edges};
 
-type OrderedRule<'a> = (u32, usize, &'a StyleRule);
-type Match<'a> = (u32, (u32, u32, u32), usize, &'a [Declaration]);
+type OrderedRule<'a> = (u8, usize, &'a StyleRule);
+// (origin rank, specificity, source order, pre-split declaration references)
+type Match<'a> = (u8, (u32, u32, u32), usize, &'a [&'a Declaration]);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Display {
@@ -42,11 +52,11 @@ pub struct StyleMap {
 
 impl StyleMap {
     pub fn get(&self, id: NodeId) -> Option<&ComputedStyle> {
-        self.styles.get(id.0 as usize).and_then(Option::as_ref)
+        self.styles.get(id.slot() as usize).and_then(Option::as_ref)
     }
 
     pub(crate) fn set(&mut self, id: NodeId, s: ComputedStyle) {
-        let index = id.0 as usize;
+        let index = id.slot() as usize;
         if self.styles.len() <= index {
             self.styles.resize(index + 1, None);
         }
@@ -85,10 +95,16 @@ pub fn ua_stylesheet() -> &'static str {
      td { display: inline; }\n"
 }
 
-/// Apply the UA sheet first, then author sheets; cascade by specificity then order.
-/// `color` and `font_size` inherit from the parent.
+/// Apply the UA sheet, then author sheets, then the element's inline `style`
+/// attribute. Cascade order is UA normal < author normal < inline normal <
+/// author `!important` < inline `!important` < UA `!important`, then
+/// specificity, then source order. `color` and `font_size` inherit.
 pub fn compute_styles(dom: &Dom, sheets: &[Stylesheet]) -> StyleMap {
-    let ua = parse_stylesheet(ua_stylesheet());
+    compute_styles_inner(dom, sheets, ua_stylesheet())
+}
+
+fn compute_styles_inner(dom: &Dom, sheets: &[Stylesheet], ua_css: &str) -> StyleMap {
+    let ua = parse_stylesheet(ua_css);
 
     // (origin, source order, rule); origin 0 = UA, 1 = author.
     let mut ordered: Vec<OrderedRule<'_>> = Vec::new();
@@ -103,8 +119,36 @@ pub fn compute_styles(dom: &Dom, sheets: &[Stylesheet]) -> StyleMap {
             order += 1;
         }
     }
+    let index = RuleIndex::new(ordered.iter().map(|(_, _, rule)| *rule));
+    let needs_bloom = ordered
+        .iter()
+        .any(|(_, _, rule)| !is_compound(&rule.selector));
+    // Split declarations once per style pass, not once per element × rule.
+    let prepared: Vec<(Vec<&Declaration>, Vec<&Declaration>)> = ordered
+        .iter()
+        .map(|(_, _, rule)| {
+            let mut normal = Vec::new();
+            let mut important = Vec::new();
+            for declaration in &rule.declarations {
+                if is_important(declaration) {
+                    important.push(declaration);
+                } else {
+                    normal.push(declaration);
+                }
+            }
+            (normal, important)
+        })
+        .collect();
 
     let mut map = StyleMap::with_len(dom.len());
+    let mut blooms = vec![AncestorBloom::default(); dom.len()];
+    let mut ctx = MatchContext::new();
+    let mut rules = CascadeRules {
+        ordered: &ordered,
+        index: &index,
+        prepared: &prepared,
+        candidates: Vec::new(),
+    };
     // Pre-order guarantees a node's parent is already resolved when it is visited.
     dom.walk(|id, node| {
         let parent = dom
@@ -113,11 +157,38 @@ pub fn compute_styles(dom: &Dom, sheets: &[Stylesheet]) -> StyleMap {
             .unwrap_or_else(initial_style);
         match node.kind {
             NodeKind::Text(_) => map.set(id, parent),
-            NodeKind::Element { .. } => map.set(id, cascade(dom, id, &ordered, &parent)),
+            NodeKind::Element { .. } => {
+                let ancestors = if needs_bloom {
+                    dom.parent(id)
+                        .map(|p| AncestorBloom::child_of(blooms[p.slot() as usize], dom, p))
+                        .unwrap_or_default()
+                } else {
+                    AncestorBloom::default()
+                };
+                if let Some(slot) = blooms.get_mut(id.slot() as usize) {
+                    *slot = ancestors;
+                }
+                ctx.ancestors = ancestors;
+                map.set(id, cascade(dom, id, &mut rules, &mut ctx, &parent));
+            }
             NodeKind::Document => {}
         }
     });
     map
+}
+
+/// Cascade rank. Important author declarations outrank normal inline style,
+/// while important UA declarations outrank important author declarations.
+fn rank(origin: u8, important: bool) -> u8 {
+    match (origin, important) {
+        (0, false) => 0,
+        (1, false) => 1,
+        (2, false) => 2,
+        (1, true) => 3,
+        (2, true) => 4,
+        (0, true) => 5,
+        _ => 1,
+    }
 }
 
 fn initial_style() -> ComputedStyle {
@@ -137,34 +208,80 @@ fn initial_style() -> ComputedStyle {
     }
 }
 
+/// Per-pass rule data shared by every element's cascade.
+struct CascadeRules<'a> {
+    ordered: &'a [OrderedRule<'a>],
+    index: &'a RuleIndex,
+    prepared: &'a [(Vec<&'a Declaration>, Vec<&'a Declaration>)],
+    candidates: Vec<usize>,
+}
+
 fn cascade(
     dom: &Dom,
     id: NodeId,
-    ordered: &[OrderedRule<'_>],
+    rules: &mut CascadeRules<'_>,
+    ctx: &mut MatchContext,
     parent: &ComputedStyle,
 ) -> ComputedStyle {
-    let mut matched: Vec<Match<'_>> = Vec::new();
-    for &(origin, order, rule) in ordered {
-        if matches_element(&rule.selector, dom, id) {
-            matched.push((
-                origin,
-                specificity(&rule.selector),
+    let mut normal: Vec<Match<'_>> = Vec::new();
+    let mut important: Vec<Match<'_>> = Vec::new();
+    rules.index.candidates(dom, id, &mut rules.candidates);
+    for &candidate in &rules.candidates {
+        let Some(&(origin, order, rule)) = rules.ordered.get(candidate) else {
+            continue;
+        };
+        if !matches_selector_ref(&rule.selector, dom, id, ctx) {
+            continue;
+        }
+        let specificity = specificity_ref(&rule.selector);
+        if !rules.prepared[candidate].0.is_empty() {
+            normal.push((
+                rank(origin, false),
+                specificity,
                 order,
-                &rule.declarations,
+                &rules.prepared[candidate].0,
+            ));
+        }
+        if !rules.prepared[candidate].1.is_empty() {
+            important.push((
+                rank(origin, true),
+                specificity,
+                order,
+                &rules.prepared[candidate].1,
             ));
         }
     }
-    // Stable sort: ties keep source order. Larger origin/specificity/order win last.
-    matched.sort_by_key(|m| (m.0, m.1, m.2));
+    // Inline style is an author-origin layer above author sheets.
+    let inline = dom.attr(id, "style").map(parse_style_attribute);
+    let mut inline_normal: Vec<&Declaration> = Vec::new();
+    let mut inline_important: Vec<&Declaration> = Vec::new();
+    if let Some(declarations) = &inline {
+        for declaration in declarations {
+            if is_important(declaration) {
+                inline_important.push(declaration);
+            } else {
+                inline_normal.push(declaration);
+            }
+        }
+        if !inline_normal.is_empty() {
+            normal.push((rank(2, false), (0, 0, 0), usize::MAX / 2, &inline_normal));
+        }
+        if !inline_important.is_empty() {
+            important.push((rank(2, true), (0, 0, 0), usize::MAX / 2, &inline_important));
+        }
+    }
+    // Stable sort: ties keep source order. Larger rank/specificity/order win last.
+    normal.sort_by_key(|m| (m.0, m.1, m.2));
+    important.sort_by_key(|m| (m.0, m.1, m.2));
 
     // Last declaration for each property wins after the cascade sort. Edge
     // shorthands are expanded to their four longhands as we walk in cascade
     // order, so a later longhand (or a later shorthand) wins by source order.
     let mut winning: HashMap<String, String> = HashMap::new();
-    for m in &matched {
+    for m in normal.iter().chain(&important) {
         for decl in m.3 {
             let property = decl.property.trim().to_ascii_lowercase();
-            let value = decl.value.trim().to_string();
+            let value = declaration_value(decl).to_string();
             if property == "border" {
                 expand_border_shorthand(&value, &mut winning);
                 continue;
@@ -744,5 +861,145 @@ mod tests {
         map.set(NodeId(0), initial_style());
         assert_eq!(map.get(NodeId(0)).unwrap().font_size, 16.0);
         assert!(map.get(NodeId(1)).is_none());
+    }
+
+    #[test]
+    fn detached_slot_reuse_does_not_alias_styles_or_reattach_via_stale_handle() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        // A occupies a slot and is styled red.
+        let a = element(&mut dom, root, "p", &[]);
+        let sheets = [sheet("p { color: red } div { color: blue }")];
+        let before = compute_styles(&dom, &sheets);
+        assert_eq!(before.get(a).unwrap().color, Color::rgb(255, 0, 0));
+
+        // Detaching A puts its slot on the free list with a bumped generation.
+        dom.detach_subtree(a);
+        assert!(!dom.validate(a));
+
+        // Re-creating reuses A's slot but must hand out a fresh handle.
+        let c = element(&mut dom, root, "div", &[]);
+        assert_ne!(c, a, "recycled slot must not reuse the stale handle");
+        assert_eq!(c.slot(), a.slot(), "recycled slot is the same arena index");
+
+        // Appending through the stale handle is ignored, so C stays under root.
+        dom.append(a, c);
+        assert_eq!(dom.parent(c), Some(root));
+
+        // The fresh cascade styles C blue at the recycled slot, never A's
+        // stale red style.
+        let after = compute_styles(&dom, &sheets);
+        assert_eq!(after.get(c).unwrap().color, Color::rgb(0, 0, 255));
+    }
+
+    // --- M7.1: cascade extensions ---------------------------------------
+
+    fn sheet(css: &str) -> Stylesheet {
+        hodo_css::parse_stylesheet(css)
+    }
+
+    #[test]
+    fn author_important_beats_specificity_and_source_order() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let id = element(&mut dom, root, "p", &[("id", "main")]);
+        let sheets = [sheet("#main { color: blue } p { color: red !important }")];
+        let map = compute_styles(&dom, &sheets);
+        assert_eq!(map.get(id).unwrap().color, Color::rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn ua_important_beats_author_important() {
+        let (dom, id) = one_element("div");
+        let sheets = [sheet("div { color: red !important }")];
+        let map = compute_styles_inner(&dom, &sheets, "div { color: green !important }");
+        assert_eq!(map.get(id).unwrap().color, Color::rgb(0, 128, 0));
+    }
+
+    #[test]
+    fn inline_style_is_highest_normal_origin() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let id = element(
+            &mut dom,
+            root,
+            "p",
+            &[("style", "color: green; font-size: 20px; margin: 3px")],
+        );
+        let sheets = [sheet("p { color: red; font-size: 12px; margin: 9px }")];
+        let map = compute_styles(&dom, &sheets);
+        let style = map.get(id).unwrap();
+        assert_eq!(style.color, Color::rgb(0, 128, 0));
+        assert_eq!(style.font_size, 20.0);
+        assert_eq!(style.margin.top, 3.0);
+    }
+
+    #[test]
+    fn origin_ladder_from_spec() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        // UA !important beats every author-origin declaration, including
+        // inline !important.
+        let id = element(
+            &mut dom,
+            root,
+            "div",
+            &[("style", "color: cyan !important")],
+        );
+        let sheets = [sheet("div { color: red !important }")];
+        let map = compute_styles_inner(&dom, &sheets, "div { color: blue !important }");
+        assert_eq!(map.get(id).unwrap().color, Color::rgb(0, 0, 255));
+
+        let plain = element(&mut dom, root, "p", &[("style", "color: cyan")]);
+        let sheets = [sheet("p { color: red !important }")];
+        let map = compute_styles(&dom, &sheets);
+        assert_eq!(map.get(plain).unwrap().color, Color::rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn complex_selectors_drive_cascade() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let html = element(&mut dom, root, "html", &[]);
+        let body = element(&mut dom, html, "body", &[]);
+        let list = element(&mut dom, body, "ul", &[]);
+        let first = element(&mut dom, list, "li", &[("class", "first")]);
+        let target = element(&mut dom, list, "li", &[("id", "target")]);
+        element(&mut dom, list, "li", &[]);
+        let sheets = [sheet(
+            "ul li { color: red } ul > li + li { color: green } \
+             li:first-child { color: blue } .first + #target { color: yellow }",
+        )];
+        let map = compute_styles(&dom, &sheets);
+        assert_eq!(map.get(first).unwrap().color, Color::rgb(0, 0, 255));
+        assert_eq!(map.get(target).unwrap().color, Color::rgb(255, 255, 0));
+    }
+
+    #[test]
+    fn invalid_selector_only_drops_its_rule_in_cascade() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let id = element(&mut dom, root, "p", &[]);
+        let sheets = [sheet("::before { color: red } p { color: blue }")];
+        let map = compute_styles(&dom, &sheets);
+        assert_eq!(map.get(id).unwrap().color, Color::rgb(0, 0, 255));
+    }
+
+    #[test]
+    fn deep_dom_style_pass_completes_under_budget() {
+        let mut dom = Dom::new();
+        let mut cursor = dom.root();
+        for _ in 0..1000 {
+            cursor = element(&mut dom, cursor, "div", &[]);
+        }
+        let sheets = [sheet("div div div { color: red }")];
+        let start = std::time::Instant::now();
+        let map = compute_styles(&dom, &sheets);
+        let elapsed = start.elapsed();
+        assert_eq!(map.get(cursor).unwrap().color, Color::rgb(255, 0, 0));
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "took {elapsed:?}"
+        );
     }
 }
