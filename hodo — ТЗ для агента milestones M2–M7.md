@@ -377,3 +377,21 @@ GPU зазвичай збільшує RSS (драйвери, шейдер-кеш
 3. `position/float/overflow` входять у M7 чи йдуть в окремий M8.
 4. Цільові числа: RSS холодного старту, бюджет мс/кадр, квота кешу — усі пороги в цьому ТЗ орієнтовні.
 5. Чи підтримуємо macOS (впливає на sandbox і CI-матрицю).
+
+## M8 — position/float/overflow (окреме рішення)
+
+Винесено з M7 як окремий milestone (brief уже зафіксовано): `position: static|relative|absolute|fixed`, `float`/`clear`, `overflow: visible|hidden|clip`, `min/max-width/height` (px-only), поля `width/height`. Порядок всередині: relative → overflow → absolute → min/max → float → clear. Без `z-index`, sticky, `%`-довжин, box-sizing, var()/calc(), @media, @font-face, background-image (тільки за рішенням власника після M8).
+
+## M9 — Material Design 3 (дизайн UI браузера)
+
+Ухвалено власником: UI браузера (chrome — toolbar, вкладки, URL-бар, popup-и, error-сторінки, about:hodo) оформляється за **Material Design 3** (https://m3.material.io/). НЕ стосується стилізації веб-сторінок — UA-стилі залишаються нейтральними.
+
+- **Дизайн-токени, єдине джерело правди:** новий модуль `hodo-shell/src/design.rs` (тільки shell): колірні ролі M3 baseline-схеми light+dark (primary/on-primary/primary-container, surface, surface-container-low…high, on-surface/on-surface-variant, outline/outline-variant, error-ролі); типографічна шкала M3 (title/label/body для toolbar/вкладок/URL); shape scale (поля 4dp, вкладки/картки 8dp, popup-поверхня 12dp); state layers (hover 8% / focus 10% / pressed 10% поверх ролі); elevation без тіней = тонування surface-рівнів (ми 2D raster, не Jetpack).
+- **Компоненти на наявному raster-харнесі, без нових залежностей:** toolbar = top app bar; рядок вкладок (active = surface-container-high, shape 8dp); URL-бар = M3 text field (focus ring 2px primary); popup розширення = surface-container + shape 12dp + scrim; error/about:hodo на токенах; фокус-кільця для клавіатурної навігації.
+- **Dark theme:** перемикач (about:hodo) + збереження вибору; перемикання = repaint без relayout.
+- **Гейти:** нуль raw-hex поза design.rs (греп-гейт у CI); піксель-тести на обидві теми; RAM-нейтрально; perf-дельта < 1%.
+- **Не-цілі:** dynamic color (екстракція зі шпалер), складні анімації, стилізація веб-контенту.
+
+**DoD M9:** токен-таблиця в docs; light+dark піксель-тести зелені; hover/focus/pressed тести станів; греп-гейт жодного hex поза design.rs.
+
+**Порядок M9:** стартує ПІСЛЯ ленду shell-фіч поточної мега-хвилі (popup/forms/damage володіють тими ж файлами shell), окремим агентом MD-restyle з повним брифом токенів.
