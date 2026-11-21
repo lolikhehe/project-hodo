@@ -23,20 +23,26 @@ crates parse manifests, dispatch APIs and enforce permissions.
 
 Windowed browser shell using `winit` + `softbuffer`: a tab strip and a URL/address
 bar wired to the engine. The GUI implementation is in progress (the M0 engine
-stages behind it are done). Goal is a usable CPU-rendered window that can drive
-the M0 pipeline.
+stages behind it are done); headless screenshots (`--screenshot`) already work.
+Goal is a usable CPU-rendered window that can drive the M0 pipeline.
 
 **Crates:** `hodo-shell`, plus the `hodo-render` / `hodo-layout` outputs it
 consumes.
 
-## M2 — JavaScript execution
+## M2 — JavaScript execution (in progress)
 
 Embed `boa_engine` and inject `chrome.*` and `browser.*` globals so both map to
-the single canonical dispatch table in `hodo-ext-api`. This finally executes
-the `bg.js` files in `extensions/hello-chrome` and `extensions/hello-gecko`,
-routing storage/tabs/runtime calls through the permission gate.
+the single canonical dispatch table in `hodo-ext-api`. **Landed:** the `hodo-js`
+crate embeds boa 0.22, exposes `ExtScriptRuntime`, and installs `chrome` and
+`browser` as the same object (storage.local/sync, tabs.create/list,
+runtime.sendMessage, notifications.create). `hodo-ext-api` also gained sync
+storage, tabs/notification calls, `ExtEvent` and `drain_events`. **In progress:**
+host wiring — one runtime per extension, per-extension namespace filtering by
+manifest permissions, and delivery of drained events to JS listeners. Async
+callbacks/promises are deferred; end-to-end `bg.js` execution in the shell is
+not finished yet.
 
-**Crates:** `hodo-ext-host`, `hodo-ext-api`, `hodo-ext-manifest`.
+**Crates:** `hodo-js` (new), `hodo-ext-host`, `hodo-ext-api`, `hodo-ext-manifest`.
 
 ## M3 — Out-of-process sandboxed extension host
 
@@ -51,9 +57,14 @@ trust boundary.
 
 Add an HTTP cache and `gzip`/`br` content decoding to `hodo-net`, and make HTML
 parsing streaming rather than whole-document. Respects the existing 2 MiB
-resource cap. Reduces latency and memory for real pages.
+resource cap. Reduces latency and memory for real pages. **Landed:** the
+`hodo-cache` crate provides a size-capped, corruption-tolerant disk LRU with
+payloads kept off RAM. `hodo-net` already transparently decompresses gzip
+(ureq default features) and hardens content sniffing, BOM stripping, the
+Content-Length guard and the 5-redirect cap. **Pending:** wiring `hodo-cache`
+into `hodo-net`, `br` decoding and streaming HTML parse.
 
-**Crates:** `hodo-net`, `hodo-html`.
+**Crates:** `hodo-cache` (new), `hodo-net`, `hodo-html`.
 
 ## M5 — Incremental layout + partial repaint
 

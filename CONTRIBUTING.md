@@ -13,7 +13,7 @@ cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Run all four before opening a PR; CI enforces them.
+Run all four before opening a PR; CI enforces them. When touching a parser (HTML, CSS, manifest or net), also run the fuzz suite: `cargo test -p hodo-fuzz`. It is deterministic and needs no nightly.
 
 ## Rules
 
