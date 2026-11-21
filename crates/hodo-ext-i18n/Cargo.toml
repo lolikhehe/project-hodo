@@ -1,0 +1,17 @@
+[package]
+name = "hodo-ext-i18n"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hodo-types.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# sys-locale 0.3.2 (latest as of 2026-11-22) is a small, pure-Rust, safe
+# wrapper over OS locale APIs (no unsafe in our code, no build.rs, no network).
+# Pinned because it is our only source for getUILanguage/getAcceptLanguages.
+sys-locale = "=0.3.2"
+
+[lints]
+workspace = true

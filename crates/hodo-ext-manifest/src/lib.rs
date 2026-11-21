@@ -1,7 +1,9 @@
 //! Chrome and Gecko WebExtension manifest parsing (MV2 and MV3).
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
+use hodo_ext_i18n::{I18nError, Messages};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +36,12 @@ pub struct Manifest {
     pub chrome_key: Option<String>,
     pub action_title: Option<String>,
     pub icons: HashMap<String, String>,
+    /// Required when the extension ships a `_locales` directory.
+    pub default_locale: Option<String>,
+    /// Kept so `__MSG_` tokens can be substituted (CSS/HTML are NOT touched).
+    pub description: Option<String>,
+    /// `name` after `__MSG_` resolution; set by [`resolve_messages`].
+    pub resolved_name: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -112,6 +120,14 @@ pub fn parse(json: &str) -> Result<Manifest, ManifestError> {
         .map(str::to_owned);
 
     let chrome_key = root.get("key").and_then(Value::as_str).map(str::to_owned);
+    let default_locale = root
+        .get("default_locale")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let description = root
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
 
     let action_title = ["action", "browser_action"]
         .iter()
@@ -140,6 +156,9 @@ pub fn parse(json: &str) -> Result<Manifest, ManifestError> {
         chrome_key,
         action_title,
         icons,
+        default_locale,
+        description,
+        resolved_name: None,
     })
 }
 
@@ -151,6 +170,68 @@ pub fn flavor(m: &Manifest) -> BrowserFlavor {
     } else {
         BrowserFlavor::Generic
     }
+}
+
+/// Resolve `__MSG_name__` tokens in `name`, `description` and `action_title`.
+/// Called by the host/loader once the extension root is known; `parse` stays
+/// root-free and cheap. CSS is deliberately not rewritten, and HTML is only
+/// localized explicitly through `i18n.getMessage` in the JS bridge.
+pub fn resolve_messages(root: &Path, manifest: &mut Manifest) -> Result<(), I18nError> {
+    resolve_messages_with_ui(root, manifest, &hodo_ext_i18n::ui_locale())
+}
+
+/// Same as [`resolve_messages`] with an explicit UI locale (tests, `--lang`).
+pub fn resolve_messages_with_ui(
+    root: &Path,
+    manifest: &mut Manifest,
+    ui_locale: &str,
+) -> Result<(), I18nError> {
+    let messages =
+        hodo_ext_i18n::load_locales(root, manifest.default_locale.as_deref(), ui_locale)?
+            .with_extension_id(manifest.gecko_id.as_deref().unwrap_or(""));
+    manifest.name = substitute_messages(&manifest.name, &messages);
+    manifest.description = manifest
+        .description
+        .take()
+        .map(|text| substitute_messages(&text, &messages));
+    manifest.action_title = manifest
+        .action_title
+        .take()
+        .map(|text| substitute_messages(&text, &messages));
+    manifest.resolved_name = Some(manifest.name.clone());
+    Ok(())
+}
+
+/// Single pass: text produced for a token is never rescanned.
+fn substitute_messages(text: &str, messages: &Messages) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'_' && text[i..].starts_with("__MSG_") {
+            if let Some(offset) = text[i + 6..].find("__") {
+                let end = i + 6 + offset + 2;
+                let name = &text[i + 6..end - 2];
+                if !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'@')
+                {
+                    out.push_str(&messages.get_message(name, &[]));
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        match text[i..].chars().next() {
+            Some(ch) => {
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+            None => break,
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -282,5 +363,119 @@ mod tests {
         assert_eq!(flavor(&m), BrowserFlavor::Generic);
         assert!(m.permissions.is_empty());
         assert!(m.icons.is_empty());
+    }
+
+    #[test]
+    fn parse_keeps_default_locale_and_description() {
+        let m = parse(
+            r#"{"manifest_version":3,"name":"x","version":"1",
+                "default_locale":"uk-UA","description":"desc"}"#,
+        )
+        .expect("valid manifest");
+        assert_eq!(m.default_locale.as_deref(), Some("uk-UA"));
+        assert_eq!(m.description.as_deref(), Some("desc"));
+        assert_eq!(m.resolved_name, None);
+    }
+
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "hodo-manifest-i18n-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).expect("create temp dir");
+            Self(path)
+        }
+
+        fn write_extension(&self, manifest: &str, messages: &str) {
+            fs::write(self.0.join("manifest.json"), manifest).expect("write manifest");
+            let locale = self.0.join("_locales").join("en");
+            fs::create_dir_all(&locale).expect("create locale dir");
+            fs::write(locale.join("messages.json"), messages).expect("write messages");
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const MESSAGES: &str = r#"{
+        "appName": { "message": "Localized Name" },
+        "appDesc": { "message": "Localized Description" }
+    }"#;
+
+    #[test]
+    fn msg_tokens_resolve_in_chrome_mv3_manifest() {
+        let dir = TempDir::new();
+        let manifest = r#"{
+            "manifest_version": 3,
+            "name": "__MSG_appName__",
+            "description": "__MSG_appDesc__",
+            "version": "1.0",
+            "default_locale": "en",
+            "action": { "default_title": "__MSG_appName__" }
+        }"#;
+        dir.write_extension(manifest, MESSAGES);
+
+        let mut m = parse(manifest).expect("valid manifest");
+        assert_eq!(m.name, "__MSG_appName__"); // parse stays raw
+        resolve_messages_with_ui(&dir.0, &mut m, "en").expect("resolve");
+        assert_eq!(m.name, "Localized Name");
+        assert_eq!(m.resolved_name.as_deref(), Some("Localized Name"));
+        assert_eq!(m.description.as_deref(), Some("Localized Description"));
+        assert_eq!(m.action_title.as_deref(), Some("Localized Name"));
+    }
+
+    #[test]
+    fn msg_tokens_resolve_in_gecko_mv2_manifest() {
+        let dir = TempDir::new();
+        let manifest = r#"{
+            "manifest_version": 2,
+            "name": "__MSG_appName__",
+            "description": "__MSG_appDesc__",
+            "version": "1.0",
+            "default_locale": "en",
+            "applications": { "gecko": { "id": "gecko@example.com" } },
+            "browser_action": { "default_title": "__MSG_appName__" }
+        }"#;
+        dir.write_extension(manifest, MESSAGES);
+
+        let mut m = parse(manifest).expect("valid manifest");
+        resolve_messages_with_ui(&dir.0, &mut m, "en").expect("resolve");
+        assert_eq!(m.name, "Localized Name");
+        assert_eq!(m.description.as_deref(), Some("Localized Description"));
+        assert_eq!(m.action_title.as_deref(), Some("Localized Name"));
+        assert_eq!(flavor(&m), BrowserFlavor::Gecko);
+    }
+
+    #[test]
+    fn i18n_gecko_demo_resolves_to_i18n_demo() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../extensions/i18n-gecko");
+        let json = fs::read_to_string(root.join("manifest.json")).expect("demo manifest");
+        let mut m = parse(&json).expect("valid demo manifest");
+        resolve_messages_with_ui(&root, &mut m, "en").expect("resolve demo");
+        assert_eq!(m.name, "i18n Demo");
+        assert_eq!(m.resolved_name.as_deref(), Some("i18n Demo"));
+        assert_eq!(m.action_title.as_deref(), Some("i18n Demo"));
+    }
+
+    #[test]
+    fn resolve_without_locales_leaves_plain_fields_untouched() {
+        let dir = TempDir::new();
+        let manifest = r#"{"manifest_version":3,"name":"Plain Name","version":"1"}"#;
+        fs::write(dir.0.join("manifest.json"), manifest).expect("write manifest");
+        let mut m = parse(manifest).expect("valid manifest");
+        resolve_messages_with_ui(&dir.0, &mut m, "de-DE").expect("resolve");
+        assert_eq!(m.name, "Plain Name");
+        assert_eq!(m.resolved_name.as_deref(), Some("Plain Name"));
     }
 }

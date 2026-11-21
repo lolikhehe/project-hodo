@@ -9,6 +9,7 @@ members = [
   "crates/hodo-layout",
   "crates/hodo-render",
   "crates/hodo-net",
+  "crates/hodo-ext-i18n",
   "crates/hodo-ext-manifest",
   "crates/hodo-ext-api",
   "crates/hodo-ext-host",
