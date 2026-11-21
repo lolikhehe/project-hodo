@@ -29,6 +29,11 @@ pub enum DisplayItem {
         color: Color,
         font_size: f32,
         weight: u16,
+        href: Option<String>,
+    },
+    Image {
+        rect: Rect,
+        path: String,
     },
 }
 
@@ -49,7 +54,7 @@ pub fn layout(dom: &Dom, styles: &StyleMap, viewport: Size) -> DisplayList {
         };
         let fallback = fallback_style();
         let mut flow = Flow::new(0.0, viewport.w, 0.0);
-        layout_children(&mut ctx, &mut flow, &fallback, dom.root());
+        layout_children(&mut ctx, &mut flow, &fallback, dom.root(), None);
         flush_line(&mut flow, &mut *ctx.list);
     }
     DisplayList { items: list }
@@ -75,6 +80,8 @@ struct Atom {
     font_size: f32,
     color: Color,
     weight: u16,
+    /// Nearest ancestor `<a href>` whose text this atom belongs to.
+    href: Option<String>,
 }
 
 /// Mutable inline-flow state for a single block's content area.
@@ -139,44 +146,93 @@ fn patch_rect(list: &mut [DisplayItem], idx: usize, f: impl FnOnce(&mut Rect)) {
 }
 
 /// Walk a node's children in order, stacking blocks and flowing text.
-fn layout_children(ctx: &mut Ctx<'_>, flow: &mut Flow, fallback: &ComputedStyle, parent: NodeId) {
+/// `link` is the nearest ancestor `<a>` href in scope for this subtree.
+fn layout_children(
+    ctx: &mut Ctx<'_>,
+    flow: &mut Flow,
+    fallback: &ComputedStyle,
+    parent: NodeId,
+    link: Option<String>,
+) {
     let children: Vec<NodeId> = ctx.dom.children(parent).to_vec();
     for child in children {
         let s = ctx.styles.get(child).cloned();
         if s.as_ref().is_some_and(|st| st.display == Display::None) {
             continue;
         }
+        let tag = ctx.dom.tag(child).unwrap_or("");
+        // An <a> without href does not replace an outer link already in scope.
+        let link = if tag.eq_ignore_ascii_case("a") {
+            ctx.dom
+                .attr(child, "href")
+                .map(str::to_string)
+                .or_else(|| link.clone())
+        } else {
+            link.clone()
+        };
         match &ctx.dom.get(child).kind {
             NodeKind::Text(t) => {
                 let st = s.as_ref().unwrap_or(fallback);
-                feed_text(flow, ctx.list, t, st);
+                feed_text(flow, ctx.list, t, st, link);
             }
             NodeKind::Element { .. } => {
-                if s.as_ref().is_some_and(|st| st.display == Display::Block) {
+                if tag.eq_ignore_ascii_case("img") {
+                    flush_line(flow, ctx.list);
+                    // shortcut: relative src resolution needs a base URL; the shell passes
+                    // absolute paths/URLs until layout grows a base-url parameter.
+                    if let Some(src) = ctx.dom.attr(child, "src") {
+                        let w = ctx
+                            .dom
+                            .attr(child, "width")
+                            .and_then(|v| v.parse::<f32>().ok())
+                            .unwrap_or(64.0);
+                        let h = ctx
+                            .dom
+                            .attr(child, "height")
+                            .and_then(|v| v.parse::<f32>().ok())
+                            .unwrap_or(64.0);
+                        ctx.list.push(DisplayItem::Image {
+                            rect: Rect {
+                                x: flow.left,
+                                y: flow.y,
+                                w,
+                                h,
+                            },
+                            path: src.to_string(),
+                        });
+                        flow.y += h;
+                    }
+                } else if s.as_ref().is_some_and(|st| st.display == Display::Block) {
                     flush_line(flow, ctx.list);
                     let avail = Avail {
                         x: flow.left,
                         y: flow.y,
                         width: flow.right - flow.left,
                     };
-                    let consumed = layout_block(ctx, s.as_ref().unwrap(), child, avail);
+                    let consumed = layout_block(ctx, s.as_ref().unwrap(), child, avail, link);
                     // shortcut: vertical margins sum, no collapsing (MVP); upgrade when
                     // CSS margin collapsing is required for spec fidelity.
                     flow.y += consumed;
                 } else {
                     // shortcut: inline elements create no box; their text joins this
                     // block's flow. Upgrade for true inline box layout/vertical alignment.
-                    layout_children(ctx, flow, fallback, child);
+                    layout_children(ctx, flow, fallback, child, link);
                 }
             }
-            NodeKind::Document => layout_children(ctx, flow, fallback, child),
+            NodeKind::Document => layout_children(ctx, flow, fallback, child, link),
         }
     }
 }
 
 /// Lay out one block box and return the total vertical space it consumes,
 /// including its own top and bottom margins.
-fn layout_block(ctx: &mut Ctx<'_>, style: &ComputedStyle, id: NodeId, avail: Avail) -> f32 {
+fn layout_block(
+    ctx: &mut Ctx<'_>,
+    style: &ComputedStyle,
+    id: NodeId,
+    avail: Avail,
+    link: Option<String>,
+) -> f32 {
     let m = &style.margin;
     let p = &style.padding;
     let bw = style.border_width.max(0.0);
@@ -258,7 +314,7 @@ fn layout_block(ctx: &mut Ctx<'_>, style: &ComputedStyle, id: NodeId, avail: Ava
     {
         flow.bullet = true;
     }
-    layout_children(ctx, &mut flow, style, id);
+    layout_children(ctx, &mut flow, style, id, link);
     flush_line(&mut flow, ctx.list);
 
     let content_h = (flow.y - top).max(0.0);
@@ -289,6 +345,9 @@ fn flush_line(flow: &mut Flow, list: &mut Vec<DisplayItem>) {
     let font_size = first.font_size;
     let color = first.color;
     let weight = first.weight;
+    // shortcut: a line mixing linked and plain atoms takes its link from the first
+    // atom, matching the first-atom-wins style rule; upgrade for per-run hit boxes.
+    let href = first.href.clone();
     let mut text = String::new();
     if flow.bullet {
         // shortcut: UA ::marker emulation, real markers when list-style engine lands
@@ -311,6 +370,7 @@ fn flush_line(flow: &mut Flow, list: &mut Vec<DisplayItem>) {
         color,
         font_size,
         weight,
+        href,
     });
     flow.y += line_h;
     flow.line.clear();
@@ -350,6 +410,7 @@ fn place_word(flow: &mut Flow, list: &mut Vec<DisplayItem>, atom: Atom) {
                 font_size: atom.font_size,
                 color: atom.color,
                 weight: atom.weight,
+                href: atom.href.clone(),
             });
             flow.line_w += chunk.chars().count() as f32 * cw;
             flush_line(flow, list);
@@ -364,6 +425,7 @@ fn place_word(flow: &mut Flow, list: &mut Vec<DisplayItem>, atom: Atom) {
                     font_size: atom.font_size,
                     color: atom.color,
                     weight: atom.weight,
+                    href: atom.href.clone(),
                 });
                 flow.line_w += sw;
             }
@@ -374,6 +436,7 @@ fn place_word(flow: &mut Flow, list: &mut Vec<DisplayItem>, atom: Atom) {
             font_size: atom.font_size,
             color: atom.color,
             weight: atom.weight,
+            href: atom.href,
         });
         flow.line_w += word_w;
         break;
@@ -382,7 +445,13 @@ fn place_word(flow: &mut Flow, list: &mut Vec<DisplayItem>, atom: Atom) {
 
 /// Feed a text node into the inline flow: whitespace runs collapse to a
 /// single space, pure-whitespace nodes are skipped.
-fn feed_text(flow: &mut Flow, list: &mut Vec<DisplayItem>, text: &str, style: &ComputedStyle) {
+fn feed_text(
+    flow: &mut Flow,
+    list: &mut Vec<DisplayItem>,
+    text: &str,
+    style: &ComputedStyle,
+    href: Option<String>,
+) {
     if text.chars().all(char::is_whitespace) {
         return;
     }
@@ -405,6 +474,7 @@ fn feed_text(flow: &mut Flow, list: &mut Vec<DisplayItem>, text: &str, style: &C
                 font_size: fs,
                 color,
                 weight,
+                href: href.clone(),
             },
         );
         first = false;
@@ -442,9 +512,16 @@ mod tests {
     }
 
     fn elem(dom: &mut Dom, parent: NodeId, tag: &str) -> NodeId {
+        elem_with_attrs(dom, parent, tag, &[])
+    }
+
+    fn elem_with_attrs(dom: &mut Dom, parent: NodeId, tag: &str, attrs: &[(&str, &str)]) -> NodeId {
         let id = dom.create(NodeKind::Element {
             tag: tag.to_string(),
-            attrs: Vec::new(),
+            attrs: attrs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
         });
         dom.append(parent, id);
         id
@@ -664,6 +741,71 @@ mod tests {
             lines.iter().filter(|s| s.starts_with('•')).count(),
             1,
             "only the list item's first line gets a bullet"
+        );
+    }
+
+    #[test]
+    fn text_in_anchor_carries_href() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let a = elem_with_attrs(&mut dom, root, "a", &[("href", "/target")]);
+        text(&mut dom, a, "linked");
+        let p = elem(&mut dom, root, "p");
+        text(&mut dom, p, "plain");
+
+        let styles = compute_styles(&dom, &[]);
+        let list = layout(&dom, &styles, Size { w: 800.0, h: 600.0 });
+        let links: Vec<_> = list
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                DisplayItem::Text { text, href, .. } => Some((text.as_str(), href.clone())),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            links.contains(&("linked", Some("/target".to_string()))),
+            "anchor text must carry its href: {links:?}"
+        );
+        assert!(
+            links.contains(&("plain", None)),
+            "text outside an anchor must have no href: {links:?}"
+        );
+    }
+
+    #[test]
+    fn img_emits_image_item_in_flow() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        elem_with_attrs(
+            &mut dom,
+            root,
+            "img",
+            &[("src", "/p.png"), ("width", "30"), ("height", "40")],
+        );
+        elem_with_attrs(&mut dom, root, "img", &[("src", "/q.png")]);
+        elem(&mut dom, root, "img"); // no src -> skipped
+
+        let styles = compute_styles(&dom, &[]);
+        let list = layout(&dom, &styles, Size { w: 800.0, h: 600.0 });
+        let images: Vec<_> = list
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                DisplayItem::Image { rect, path } => Some((*rect, path.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(images.len(), 2, "only images with a src are emitted");
+        assert_eq!(images[0].1, "/p.png");
+        assert!((images[0].0.w - 30.0).abs() < f32::EPSILON);
+        assert!((images[0].0.h - 40.0).abs() < f32::EPSILON);
+        assert_eq!(images[1].1, "/q.png");
+        assert!((images[1].0.w - 64.0).abs() < f32::EPSILON);
+        assert!((images[1].0.h - 64.0).abs() < f32::EPSILON);
+        assert!(
+            images[1].0.y >= images[0].0.y + images[0].0.h,
+            "images stack in flow"
         );
     }
 }
