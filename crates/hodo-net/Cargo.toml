@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+ureq = "3.5.2"
 
 [lints]
 workspace = true
