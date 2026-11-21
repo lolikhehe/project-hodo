@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Async Chrome",
+  "version": "1.0.0",
+  "description": "MV3 demo mixing chrome.* async/await with callback style",
+  "permissions": ["storage", "alarms"],
+  "action": {
+    "default_title": "Async Chrome"
+  },
+  "background": {
+    "service_worker": "bg.js"
+  }
+}

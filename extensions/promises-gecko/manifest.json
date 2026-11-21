@@ -1,0 +1,18 @@
+{
+  "manifest_version": 2,
+  "name": "Promises Gecko",
+  "version": "1.0.0",
+  "description": "MV2 demo using browser.* promise chains and runtime messaging",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "promises-gecko@hodo.example"
+    }
+  },
+  "permissions": ["storage", "tabs"],
+  "browser_action": {
+    "default_title": "Promises Gecko"
+  },
+  "background": {
+    "scripts": ["bg.js"]
+  }
+}

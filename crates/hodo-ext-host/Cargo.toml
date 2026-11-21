@@ -5,10 +5,16 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+hodo-types.workspace = true
 hodo-ext-manifest.workspace = true
 hodo-ext-api.workspace = true
 hodo-js.workspace = true
+hodo-net.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+# POST is not exposed by hodo-net 0.1's `load`/`load_with` (GET only); the host
+# uses the same pinned ureq version already in the workspace for POST bodies.
+ureq = "=3.5.2"
 
 [lints]
 workspace = true
