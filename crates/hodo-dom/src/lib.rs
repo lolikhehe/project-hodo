@@ -1,8 +1,50 @@
 //! Arena-based DOM: u32 handles, zero Rc/RefCell, minimal RAM.
+//!
+//! Internal invariant: every `NodeId` used here was issued by this `Dom`.
+//! All arena indexing goes through [`NodeId::slot`], and debug builds check the
+//! handle's generation. Untrusted handles (from JS, IPC or extensions) must be
+//! filtered through [`Dom::validate`] first; forged indices are developer
+//! misuse, never parser-fed data.
 
-/// Stable handle into the node arena.
+use hodo_types::limits::MAX_DOM_NODES;
+
+/// Opaque handle into the node arena: low 20 bits are the slot, high 12 bits
+/// the generation. A reused slot therefore hands out a *different* handle, so
+/// an old handle can be rejected instead of silently aliasing a new node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(pub u32);
+
+const SLOT_BITS: u32 = 20;
+const SLOT_MASK: u32 = (1 << SLOT_BITS) - 1;
+const GEN_MOD: u32 = 1 << (32 - SLOT_BITS);
+const GEN_MASK: u32 = GEN_MOD - 1;
+
+// `MAX_DOM_NODES` must fit in the 20-bit slot encoding.
+const _: () = assert!(MAX_DOM_NODES as u32 <= SLOT_MASK);
+
+impl NodeId {
+    /// Arena slot. Callers keeping parallel arrays by handle should use this
+    /// rather than the raw `u32` once generation bits are in play.
+    #[inline]
+    pub const fn slot(self) -> u32 {
+        self.0 & SLOT_MASK
+    }
+
+    #[inline]
+    const fn generation(self) -> u32 {
+        self.0 >> SLOT_BITS
+    }
+
+    #[inline]
+    const fn encode(slot: u32, generation: u32) -> Self {
+        Self(((generation & GEN_MASK) << SLOT_BITS) | (slot & SLOT_MASK))
+    }
+
+    #[inline]
+    const fn bump(generation: u32) -> u32 {
+        (generation + 1) & GEN_MASK
+    }
+}
 
 /// What a node represents.
 #[derive(Debug, Clone)]
@@ -27,7 +69,15 @@ pub struct Node {
 #[derive(Debug, Clone)]
 pub struct Dom {
     nodes: Vec<Node>,
+    /// Current generation of each slot; bumped on detach and on reuse.
+    generations: Vec<u32>,
+    /// True while a slot belongs to the unreachable `#detached` trash.
+    trashed: Vec<bool>,
     root_id: NodeId,
+    /// Slots eligible for reuse, populated only by `detach_subtree`.
+    free: Vec<u32>,
+    /// Lazily created trash root: owned by the arena but unreachable from the root.
+    detached: Option<NodeId>,
 }
 
 impl Dom {
@@ -38,7 +88,11 @@ impl Dom {
                 parent: None,
                 children: Vec::new(),
             }],
+            generations: vec![0],
+            trashed: vec![false],
             root_id: NodeId(0),
+            free: Vec::new(),
+            detached: None,
         }
     }
 
@@ -46,14 +100,90 @@ impl Dom {
         self.root_id
     }
 
+    /// Create a node, reusing a detached slot when one is available.
     pub fn create(&mut self, kind: NodeKind) -> NodeId {
-        let id = NodeId(self.nodes.len() as u32);
-        self.nodes.push(Node {
+        let node = Node {
             kind,
             parent: None,
             children: Vec::new(),
-        });
+        };
+        let (slot, generation) = if let Some(slot) = self.free.pop() {
+            let old = self.generations[slot as usize];
+            let generation = NodeId::bump(old);
+            // The whole point of the generation table: a recycled slot must
+            // never hand out the previous occupant's handle.
+            debug_assert_ne!(generation, old, "reused slot must bump generation");
+            self.nodes[slot as usize] = node;
+            self.generations[slot as usize] = generation;
+            self.trashed[slot as usize] = false;
+            (slot, generation)
+        } else {
+            if self.nodes.len() >= MAX_DOM_NODES {
+                // Cap reached: degrade to the root handle instead of wrapping
+                // the 20-bit slot encoding (no panic on oversized input).
+                return self.root_id;
+            }
+            let slot = self.nodes.len() as u32;
+            self.nodes.push(node);
+            self.generations.push(0);
+            self.trashed.push(false);
+            (slot, 0)
+        };
+        let id = NodeId::encode(slot, generation);
+        self.debug_assert_handle(id);
         id
+    }
+
+    /// Remove `root` and its whole subtree from the visible tree.
+    ///
+    /// The nodes are moved under an internal `#detached` node that is not
+    /// reachable from the document root, so `walk` skips them. Their slots are
+    /// put on the free list for a future [`Dom::create`]; every handle into the
+    /// subtree is invalidated immediately. Invalid or already-detached handles
+    /// are ignored rather than panicking.
+    pub fn detach_subtree(&mut self, root: NodeId) {
+        if root == self.root_id || !self.validate(root) {
+            return;
+        }
+        let root_slot = root.slot() as usize;
+        if let Some(parent) = self.nodes[root_slot].parent {
+            let p = parent.slot() as usize;
+            self.nodes[p].children.retain(|c| *c != root);
+        }
+        self.nodes[root_slot].parent = None;
+
+        let trash = self.ensure_trash();
+        let mut stack = vec![root];
+        let mut detached = Vec::new();
+        while let Some(id) = stack.pop() {
+            let slot = id.slot() as usize;
+            if slot >= self.nodes.len() || self.trashed[slot] {
+                continue;
+            }
+            // A stale child handle may point at a slot that has since been
+            // reused by a live node; never trash that new occupant.
+            if self.generations[slot] != id.generation() {
+                continue;
+            }
+            self.trashed[slot] = true;
+            detached.push(slot as u32);
+            for &child in &self.nodes[slot].children {
+                stack.push(child);
+            }
+        }
+        for slot in detached {
+            self.generations[slot as usize] = NodeId::bump(self.generations[slot as usize]);
+            self.free.push(slot);
+        }
+        let t = trash.slot() as usize;
+        self.nodes[root_slot].parent = Some(trash);
+        self.nodes[t].children.push(root);
+    }
+
+    /// True only for a handle that is in range, live and of the current generation.
+    pub fn validate(&self, id: NodeId) -> bool {
+        let slot = id.slot() as usize;
+        slot < self.nodes.len() && !self.trashed[slot] && self.generations[slot] == id.generation()
     }
 
     /// Attach `child` to `parent`, detaching it from any previous parent.
@@ -61,8 +191,7 @@ impl Dom {
     /// Appends that would break the forest invariant are ignored: the root stays
     /// parentless, and a node cannot become its own ancestor's descendant.
     pub fn append(&mut self, parent: NodeId, child: NodeId) {
-        // The document root must stay parentless.
-        if child == self.root_id {
+        if child == self.root_id || !self.validate(parent) || !self.validate(child) {
             return;
         }
         // If `parent` is `child` or lies below it, linking them makes a cycle.
@@ -71,36 +200,41 @@ impl Dom {
             if id == child {
                 return;
             }
-            cursor = self.nodes[id.0 as usize].parent;
+            cursor = self.nodes[id.slot() as usize].parent;
         }
-        if let Some(old) = self.nodes[child.0 as usize].parent {
-            self.nodes[old.0 as usize].children.retain(|c| *c != child);
+        let c = child.slot() as usize;
+        if let Some(old) = self.nodes[c].parent {
+            self.nodes[old.slot() as usize]
+                .children
+                .retain(|x| *x != child);
         }
-        self.nodes[child.0 as usize].parent = Some(parent);
-        self.nodes[parent.0 as usize].children.push(child);
+        self.nodes[c].parent = Some(parent);
+        self.nodes[parent.slot() as usize].children.push(child);
     }
 
+    /// Indexing assumes `id` came from this arena (or passed [`Dom::validate`]):
+    /// a forged out-of-range handle is developer misuse, not untrusted input.
     pub fn get(&self, id: NodeId) -> &Node {
-        &self.nodes[id.0 as usize]
+        &self.nodes[id.slot() as usize]
     }
 
     pub fn children(&self, id: NodeId) -> &[NodeId] {
-        &self.nodes[id.0 as usize].children
+        &self.nodes[id.slot() as usize].children
     }
 
     pub fn parent(&self, id: NodeId) -> Option<NodeId> {
-        self.nodes[id.0 as usize].parent
+        self.nodes[id.slot() as usize].parent
     }
 
     pub fn tag(&self, id: NodeId) -> Option<&str> {
-        match &self.nodes[id.0 as usize].kind {
+        match &self.nodes[id.slot() as usize].kind {
             NodeKind::Element { tag, .. } => Some(tag),
             _ => None,
         }
     }
 
     pub fn attr(&self, id: NodeId, name: &str) -> Option<&str> {
-        match &self.nodes[id.0 as usize].kind {
+        match &self.nodes[id.slot() as usize].kind {
             NodeKind::Element { attrs, .. } => attrs
                 .iter()
                 .find(|(k, _)| k == name)
@@ -109,8 +243,24 @@ impl Dom {
         }
     }
 
+    /// Set an attribute on a live element, adding it when absent. No-op for
+    /// invalid handles and non-elements. Lets a host resolve relative URLs
+    /// (e.g. `img[src]`) against the page it loaded before layout runs.
+    pub fn set_attr(&mut self, id: NodeId, name: &str, value: String) {
+        if !self.validate(id) {
+            return;
+        }
+        if let NodeKind::Element { attrs, .. } = &mut self.nodes[id.slot() as usize].kind {
+            if let Some((_, v)) = attrs.iter_mut().find(|(k, _)| k == name) {
+                *v = value;
+            } else {
+                attrs.push((name.to_string(), value));
+            }
+        }
+    }
+
     pub fn text(&self, id: NodeId) -> Option<&str> {
-        match &self.nodes[id.0 as usize].kind {
+        match &self.nodes[id.slot() as usize].kind {
             NodeKind::Text(text) => Some(text),
             _ => None,
         }
@@ -124,9 +274,10 @@ impl Dom {
         self.nodes.is_empty()
     }
 
-    /// Visit every node from the root in pre-order.
+    /// Visit every node reachable from the root in pre-order. Trash is unreachable.
     pub fn walk(&self, mut f: impl FnMut(NodeId, &Node)) {
         fn visit(dom: &Dom, id: NodeId, f: &mut impl FnMut(NodeId, &Node)) {
+            dom.debug_assert_handle(id);
             let node = dom.get(id);
             f(id, node);
             for &child in &node.children {
@@ -134,6 +285,44 @@ impl Dom {
             }
         }
         visit(self, self.root_id, &mut f);
+    }
+
+    fn ensure_trash(&mut self) -> NodeId {
+        if let Some(id) = self.detached {
+            return id;
+        }
+        let slot = self.nodes.len() as u32;
+        self.nodes.push(Node {
+            kind: NodeKind::Element {
+                tag: "#detached".to_string(),
+                attrs: Vec::new(),
+            },
+            parent: None,
+            children: Vec::new(),
+        });
+        self.generations.push(0);
+        // The trash root is an internal node, never a valid external handle.
+        self.trashed.push(true);
+        let id = NodeId::encode(slot, 0);
+        self.detached = Some(id);
+        id
+    }
+
+    /// Debug-only arena invariants; called from `create` and `walk`.
+    #[inline]
+    pub(crate) fn debug_assert_handle(&self, id: NodeId) {
+        let slot = id.slot() as usize;
+        debug_assert!(slot < self.nodes.len(), "NodeId slot out of range");
+        debug_assert!(
+            slot < self.generations.len(),
+            "generation table out of sync"
+        );
+        debug_assert!(!self.trashed[slot], "trash node reached from the live tree");
+        debug_assert_eq!(
+            self.generations[slot],
+            id.generation(),
+            "stale NodeId used after slot reuse"
+        );
     }
 }
 
@@ -146,7 +335,9 @@ impl Default for Dom {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hodo_types::limits::MAX_NESTING_DEPTH;
     use std::collections::HashSet;
+    use std::mem::size_of;
 
     fn elem(dom: &mut Dom, tag: &str) -> NodeId {
         dom.create(NodeKind::Element {
@@ -341,11 +532,16 @@ mod tests {
                 assert_eq!(dom.parent(c), Some(id), "child must point back to parent");
             }
             if id != root {
-                let p = dom.parent(id).expect("non-root node has a parent");
-                assert!(
-                    dom.children(p).contains(&id),
-                    "parent must list the node as a child"
-                );
+                // Test-only invariant of this hand-built tree: every non-root
+                // node has a parent (not parser-fed data).
+                let p = dom.parent(id);
+                assert!(p.is_some(), "non-root node has a parent");
+                if let Some(p) = p {
+                    assert!(
+                        dom.children(p).contains(&id),
+                        "parent must list the node as a child"
+                    );
+                }
             }
         }
     }
@@ -356,5 +552,118 @@ mod tests {
         assert_eq!(dom.parent(dom.root()), None);
         assert!(dom.children(dom.root()).is_empty());
         assert_eq!(dom.tag(dom.root()), None);
+    }
+
+    fn count_walk(dom: &Dom) -> usize {
+        let mut n = 0;
+        dom.walk(|_, _| n += 1);
+        n
+    }
+
+    fn collect_tags(dom: &Dom) -> Vec<String> {
+        let mut tags = Vec::new();
+        dom.walk(|_, node| {
+            if let NodeKind::Element { tag, .. } = &node.kind {
+                tags.push(tag.clone());
+            }
+        });
+        tags
+    }
+
+    #[test]
+    fn detach_subtree_removes_it_from_parent_and_walk() {
+        let mut dom = Dom::new();
+        let shell = elem(&mut dom, "shell");
+        let branch = elem(&mut dom, "branch");
+        let leaf = elem(&mut dom, "leaf");
+        dom.append(dom.root(), shell);
+        dom.append(shell, branch);
+        dom.append(branch, leaf);
+
+        assert_eq!(count_walk(&dom), 4);
+        dom.detach_subtree(branch);
+
+        assert!(dom.children(shell).is_empty());
+        assert_eq!(collect_tags(&dom), ["shell"]);
+        assert_eq!(count_walk(&dom), 2); // document + shell
+        assert!(!dom.validate(branch));
+        assert!(!dom.validate(leaf));
+        assert!(dom.validate(shell));
+        assert!(dom.validate(dom.root()));
+    }
+
+    #[test]
+    fn reused_slot_bumps_generation_and_invalidates_old_handle() {
+        let mut dom = Dom::new();
+        let old = elem(&mut dom, "old");
+        dom.append(dom.root(), old);
+        dom.detach_subtree(old);
+        assert!(!dom.validate(old));
+
+        let new = elem(&mut dom, "new");
+        assert_eq!(old.slot(), new.slot(), "create must reuse the free slot");
+        assert_ne!(old, new, "a reused slot must produce a different handle");
+        assert_ne!(old.generation(), new.generation());
+        assert!(!dom.validate(old));
+        assert!(dom.validate(new));
+        assert_eq!(dom.tag(new), Some("new"));
+        assert_eq!(dom.children(dom.root()), &[]);
+
+        // A second reuse keeps invalidating every older generation.
+        dom.detach_subtree(new);
+        let newest = elem(&mut dom, "newest");
+        assert!(!dom.validate(new));
+        assert!(!dom.validate(old));
+        assert!(dom.validate(newest));
+    }
+
+    #[test]
+    fn validate_rejects_forged_and_internal_handles() {
+        let mut dom = Dom::new();
+        assert!(!dom.validate(NodeId(u32::MAX)));
+        assert!(!dom.validate(NodeId(SLOT_MASK)));
+        let a = elem(&mut dom, "a");
+        dom.detach_subtree(a);
+        let internal_trash = NodeId::encode((dom.len() - 1) as u32, 0);
+        assert!(!dom.validate(internal_trash));
+        dom.append(dom.root(), internal_trash); // forged append is ignored
+        assert!(dom.children(dom.root()).is_empty());
+    }
+
+    #[test]
+    fn parent_child_invariants_hold_after_detach_and_reuse() {
+        let mut dom = Dom::new();
+        let keep = elem(&mut dom, "keep");
+        let gone = elem(&mut dom, "gone");
+        let child = elem(&mut dom, "child");
+        dom.append(dom.root(), keep);
+        dom.append(dom.root(), gone);
+        dom.append(gone, child);
+        dom.detach_subtree(gone);
+        let replacement = elem(&mut dom, "replacement");
+        dom.append(keep, replacement);
+
+        assert_eq!(dom.children(dom.root()), &[keep]);
+        assert_eq!(dom.parent(keep), Some(dom.root()));
+        assert_eq!(dom.children(keep), &[replacement]);
+        assert_eq!(dom.parent(replacement), Some(keep));
+        assert_eq!(collect_tags(&dom), ["keep", "replacement"]);
+        dom.walk(|id, node| {
+            assert!(dom.validate(id));
+            for &c in &node.children {
+                assert_eq!(dom.parent(c), Some(id));
+            }
+        });
+    }
+
+    #[test]
+    fn node_size_budget_matches_nesting_cap() {
+        // ТЗ §1: a stack overflow aborts instead of panicking, so the depth cap
+        // must keep a full recursion frame chain far below 64 MiB.
+        assert!(
+            MAX_NESTING_DEPTH * size_of::<Node>() < 64 * 1024 * 1024,
+            "depth cap and node size exceed the stack budget"
+        );
+        assert!(MAX_DOM_NODES as u32 <= SLOT_MASK);
     }
 }

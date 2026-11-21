@@ -4,5 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[dependencies]
+hodo-types.workspace = true
+
 [lints]
 workspace = true

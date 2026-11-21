@@ -1,5 +1,7 @@
 //! Shared value types for the hodo browser engine.
 
+pub mod limits;
+
 /// Axis-aligned rectangle in CSS pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rect {
