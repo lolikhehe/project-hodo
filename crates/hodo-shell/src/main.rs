@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
@@ -60,7 +60,8 @@ fn screenshot_frame(
 /// Headless screenshot: run the page pipeline (no UI overlay), premultiply
 /// the straight-alpha frame for tiny-skia, encode and write the PNG.
 fn screenshot(url: &str, out: &str) {
-    let (_, display_list) = app::load_page(url, app::DEFAULT_VIEWPORT);
+    let (title, display_list) = app::load_page(url, app::DEFAULT_VIEWPORT);
+    println!("title: {title}");
     let premultiplied = screenshot_frame(&display_list, app::DEFAULT_VIEWPORT);
     let size = tiny_skia::IntSize::from_wh(1200, 800).expect("fixed screenshot size is valid");
     let pixmap = tiny_skia::Pixmap::from_vec(premultiplied, size).expect("frame matches viewport");
@@ -79,6 +80,8 @@ struct BrowserApp {
     modifiers: ModifiersState,
     ext_titles: Vec<String>,
     viewport: hodo_types::Size,
+    /// Last cursor position in physical pixels (same space as the viewport).
+    cursor: (f32, f32),
 }
 
 impl BrowserApp {
@@ -91,6 +94,7 @@ impl BrowserApp {
             modifiers: ModifiersState::default(),
             ext_titles,
             viewport: app::DEFAULT_VIEWPORT,
+            cursor: (0.0, 0.0),
         }
     }
 
@@ -136,6 +140,33 @@ impl BrowserApp {
                 }
                 self.request_redraw();
             }
+            Key::Named(NamedKey::ArrowLeft) if self.modifiers.alt_key() => {
+                let title = self.state.back(self.viewport);
+                self.set_window_title(&title);
+                self.request_redraw();
+            }
+            Key::Named(NamedKey::ArrowRight) if self.modifiers.alt_key() => {
+                let title = self.state.forward(self.viewport);
+                self.set_window_title(&title);
+                self.request_redraw();
+            }
+            Key::Named(NamedKey::PageUp) => {
+                self.state.scroll_by(-app::SCROLL_PAGE, self.viewport);
+                self.request_redraw();
+            }
+            Key::Named(NamedKey::PageDown) => {
+                self.state.scroll_by(app::SCROLL_PAGE, self.viewport);
+                self.request_redraw();
+            }
+            Key::Named(NamedKey::Home) => {
+                self.state.scroll_to(0.0, self.viewport);
+                self.request_redraw();
+            }
+            Key::Named(NamedKey::End) => {
+                let end = self.state.active_tab().page_height;
+                self.state.scroll_to(end, self.viewport);
+                self.request_redraw();
+            }
             Key::Character(text) if ctrl => match text.to_ascii_lowercase().as_str() {
                 "l" => {
                     self.state.url_focused = true;
@@ -144,7 +175,8 @@ impl BrowserApp {
                 }
                 "t" => {
                     self.state.new_tab();
-                    self.set_window_title("");
+                    let title = self.state.active_tab().title.clone();
+                    self.set_window_title(&title);
                     self.request_redraw();
                 }
                 "w" => {
@@ -230,6 +262,7 @@ impl ApplicationHandler for BrowserApp {
             w: inner.width as f32,
             h: inner.height as f32,
         };
+        self.state.set_viewport(self.viewport);
         let title = self.state.active_tab().title.clone();
         window.set_title(if title.is_empty() { "hodo" } else { &title });
         self.window = Some(window.clone());
@@ -254,6 +287,7 @@ impl ApplicationHandler for BrowserApp {
                     w: size.width as f32,
                     h: size.height as f32,
                 };
+                self.state.set_viewport(self.viewport);
                 if let (Some(width), Some(height)) =
                     (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
                 {
@@ -266,7 +300,29 @@ impl ApplicationHandler for BrowserApp {
                 self.request_redraw();
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = (position.x as f32, position.y as f32);
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => {
+                if self.state.handle_click(self.cursor.0, self.cursor.1) {
+                    let title = self.state.active_tab().title.clone();
+                    self.set_window_title(&title);
+                }
+                self.request_redraw();
+            }
             WindowEvent::KeyboardInput { event, .. } => self.on_key(event),
+            WindowEvent::MouseWheel {
+                delta: MouseScrollDelta::LineDelta(_, lines),
+                ..
+            } => {
+                self.state
+                    .scroll_by(lines * app::SCROLL_LINE, self.viewport);
+                self.request_redraw();
+            }
             WindowEvent::RedrawRequested => self.draw(),
             _ => {}
         }

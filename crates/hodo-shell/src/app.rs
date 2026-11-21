@@ -22,11 +22,26 @@ const TOP_BAR_H: f32 = 40.0;
 /// Height of the bottom extension toolbar strip.
 const BOTTOM_BAR_H: f32 = 28.0;
 
+/// Synthetic welcome page used for new tabs and bare launches.
+pub const ABOUT_HODO_URL: &str = "about:hodo";
+/// Pixels scrolled per wheel line.
+pub const SCROLL_LINE: f32 = 40.0;
+/// Pixels scrolled per PageUp / PageDown key press.
+pub const SCROLL_PAGE: f32 = 400.0;
+
 /// A browser tab. Deliberately holds no DOM, stylesheet or pixels.
 pub struct Tab {
     pub url: String,
     pub title: String,
     pub display_list: DisplayList,
+    /// Current vertical scroll, in pixels (tab-local, applied at compose time).
+    pub scroll_offset: f32,
+    /// Bottom edge of the page before scrolling; source of the scroll clamp.
+    pub page_height: f32,
+    /// Visited URLs, oldest first.
+    pub history: Vec<String>,
+    /// Index into `history` of the current URL.
+    pub history_cursor: usize,
 }
 
 impl Tab {
@@ -35,6 +50,10 @@ impl Tab {
             url: String::new(),
             title: String::new(),
             display_list: DisplayList::default(),
+            scroll_offset: 0.0,
+            page_height: 0.0,
+            history: Vec::new(),
+            history_cursor: 0,
         }
     }
 }
@@ -46,23 +65,27 @@ pub struct App {
     /// Editable content of the URL bar (shown in the UI overlay).
     pub url_bar: String,
     pub url_focused: bool,
+    /// Last known surface size, used to compose lists for hit-testing.
+    viewport: Size,
     /// ARGB8888 frame for the *active* tab only: `(255<<24)|(r<<16)|(g<<8)|b`.
     frame: Vec<u32>,
 }
 
 impl App {
-    /// Create one blank tab, optionally navigating it immediately.
+    /// Create one tab, navigating it to `initial_url` or the welcome page.
     pub fn new(initial_url: Option<&str>) -> Self {
         let mut app = Self {
             tabs: vec![Tab::blank()],
             active: 0,
             url_bar: String::new(),
             url_focused: true,
+            viewport: DEFAULT_VIEWPORT,
             frame: Vec::new(),
         };
-        if let Some(url) = initial_url {
-            app.navigate(url, DEFAULT_VIEWPORT);
-        }
+        let welcome = initial_url.is_none();
+        app.navigate(initial_url.unwrap_or(ABOUT_HODO_URL), DEFAULT_VIEWPORT);
+        // On a bare launch keep the URL bar focused so typing works at once.
+        app.url_focused = welcome;
         app
     }
 
@@ -70,13 +93,12 @@ impl App {
         &self.tabs[self.active]
     }
 
-    /// Open a new blank tab and make it active.
+    /// Open a new tab on the welcome page and make it active.
     pub fn new_tab(&mut self) {
         self.tabs.push(Tab::blank());
         self.active = self.tabs.len() - 1;
-        self.url_bar.clear();
-        self.url_focused = true;
         self.frame.clear();
+        self.navigate(ABOUT_HODO_URL, DEFAULT_VIEWPORT);
     }
 
     /// Close the active tab, keeping at least one tab open at all times.
@@ -94,16 +116,51 @@ impl App {
     }
 
     /// Navigate the active tab and return its resolved title for the window.
+    ///
+    /// A new entry is pushed after the cursor and any forward entries are
+    /// dropped, matching standard browser history behaviour.
     pub fn navigate(&mut self, url: &str, viewport: Size) -> String {
-        let (title, display_list) = load_page(url, viewport);
         let tab = &mut self.tabs[self.active];
-        tab.url = url.to_string();
+        tab.history.truncate(tab.history_cursor + 1);
+        tab.history.push(url.to_string());
+        tab.history_cursor = tab.history.len() - 1;
+        self.load_history_entry(viewport)
+    }
+
+    /// Load the active tab's current history entry without adding history.
+    fn load_history_entry(&mut self, viewport: Size) -> String {
+        let url = self.tabs[self.active].history[self.tabs[self.active].history_cursor].clone();
+        let (title, display_list) = load_page(&url, viewport);
+        let tab = &mut self.tabs[self.active];
+        tab.url = url.clone();
         tab.title = title.clone();
         tab.display_list = display_list;
-        self.url_bar = url.to_string();
+        tab.scroll_offset = 0.0;
+        tab.page_height = display_bottom(&tab.display_list);
+        self.url_bar = url;
         self.url_focused = false;
         self.frame.clear();
         title
+    }
+
+    /// Move one entry back in history. No-op at the oldest entry.
+    pub fn back(&mut self, viewport: Size) -> String {
+        let cursor = self.tabs[self.active].history_cursor;
+        if cursor == 0 {
+            return self.tabs[self.active].title.clone();
+        }
+        self.tabs[self.active].history_cursor = cursor - 1;
+        self.load_history_entry(viewport)
+    }
+
+    /// Move one entry forward in history. No-op at the newest entry.
+    pub fn forward(&mut self, viewport: Size) -> String {
+        let tab = &mut self.tabs[self.active];
+        if tab.history_cursor + 1 >= tab.history.len() {
+            return tab.title.clone();
+        }
+        tab.history_cursor += 1;
+        self.load_history_entry(viewport)
     }
 
     /// Re-run the pipeline for the active tab (F5). No-op on a blank tab.
@@ -112,7 +169,57 @@ impl App {
         if url.is_empty() {
             return String::new();
         }
-        self.navigate(&url, viewport)
+        let (title, display_list) = load_page(&url, viewport);
+        let tab = &mut self.tabs[self.active];
+        tab.title = title.clone();
+        tab.display_list = display_list;
+        tab.scroll_offset = 0.0;
+        tab.page_height = display_bottom(&tab.display_list);
+        self.frame.clear();
+        title
+    }
+
+    /// Scroll the active tab by a pixel delta, clamped to the page.
+    pub fn scroll_by(&mut self, delta: f32, viewport: Size) {
+        let tab = &mut self.tabs[self.active];
+        tab.scroll_offset =
+            clamp_scroll_offset(tab.scroll_offset + delta, tab.page_height, viewport.h);
+    }
+
+    /// Scroll the active tab to an absolute offset, clamped to the page.
+    pub fn scroll_to(&mut self, offset: f32, viewport: Size) {
+        let tab = &mut self.tabs[self.active];
+        tab.scroll_offset = clamp_scroll_offset(offset, tab.page_height, viewport.h);
+    }
+
+    /// Keep hit-testing in sync with the GUI surface size.
+    pub fn set_viewport(&mut self, viewport: Size) {
+        self.viewport = viewport;
+    }
+
+    /// Click at `(x, y)` (viewport pixel coordinates). Navigates if a link is
+    /// hit, otherwise just drops URL-bar focus. Returns true on navigation.
+    pub fn handle_click(&mut self, x: f32, y: f32) -> bool {
+        let tab = &self.tabs[self.active];
+        let label = tab_counter(self.active + 1, self.tabs.len());
+        let composed = compose_display_list(
+            &tab.display_list,
+            self.viewport,
+            &self.url_bar,
+            &[],
+            tab.scroll_offset,
+            &label,
+        );
+        match hit_test_link(&composed.items, x, y) {
+            Some(href) => {
+                self.navigate(&href, self.viewport);
+                true
+            }
+            None => {
+                self.url_focused = false;
+                false
+            }
+        }
     }
 
     /// Compose the full frame for the active tab, with the UI overlay on top.
@@ -121,8 +228,17 @@ impl App {
     /// it every redraw is cheap (the page is already a flat display list) and
     /// guarantees a tab switch or resize shows up within one 33 ms tick.
     pub fn frame(&mut self, viewport: Size, ext_titles: &[String]) -> &[u32] {
+        self.viewport = viewport;
         let tab = &self.tabs[self.active];
-        let list = compose_display_list(&tab.display_list, viewport, &self.url_bar, ext_titles);
+        let label = tab_counter(self.active + 1, self.tabs.len());
+        let list = compose_display_list(
+            &tab.display_list,
+            viewport,
+            &self.url_bar,
+            ext_titles,
+            tab.scroll_offset,
+            &label,
+        );
         let mut rgba = hodo_render::render(&list, viewport);
         composite_over_white(&mut rgba);
         self.frame.clear();
@@ -154,6 +270,70 @@ pub fn join_url(base: &str, href: &str) -> String {
     }
 }
 
+/// Synthetic welcome page for `about:hodo` (no network involved).
+pub fn about_hodo_html() -> String {
+    "<html><head><title>hodo — new tab</title></head><body>\
+     <h1>hodo</h1><p>A small browser, built from small crates.</p>\
+     <ul>\
+     <li>Type a URL above and press Enter to visit it.</li>\
+     <li>Ctrl+T opens a new tab; Ctrl+W closes it.</li>\
+     <li>Alt+Left / Alt+Right walk your history.</li>\
+     <li>Scroll, PageUp / PageDown and Home / End move the page.</li>\
+     </ul></body></html>"
+        .to_string()
+}
+
+/// Status text in the top strip, e.g. `tab 2/3`.
+pub fn tab_counter(active: usize, total: usize) -> String {
+    format!("tab {active}/{total}")
+}
+
+/// Clamp a scroll offset to the visible page range.
+pub fn clamp_scroll_offset(offset: f32, page_height: f32, viewport_h: f32) -> f32 {
+    offset.clamp(0.0, (page_height - viewport_h).max(0.0))
+}
+
+/// Borrow the rect of a display item; every current variant has one.
+fn item_rect(item: &DisplayItem) -> Option<&Rect> {
+    match item {
+        DisplayItem::Rect { rect, .. }
+        | DisplayItem::Text { rect, .. }
+        | DisplayItem::Image { rect, .. } => Some(rect),
+    }
+}
+
+fn item_rect_mut(item: &mut DisplayItem) -> Option<&mut Rect> {
+    match item {
+        DisplayItem::Rect { rect, .. }
+        | DisplayItem::Text { rect, .. }
+        | DisplayItem::Image { rect, .. } => Some(rect),
+    }
+}
+
+/// Topmost linked text under `(x, y)`, or `None`. Items later in the list are
+/// painted on top, so they win; unlinked text is ignored.
+pub fn hit_test_link(items: &[DisplayItem], x: f32, y: f32) -> Option<String> {
+    items.iter().rev().find_map(|item| match item {
+        DisplayItem::Text {
+            rect,
+            href: Some(href),
+            ..
+        } if x >= rect.x && x < rect.x + rect.w && y >= rect.y && y < rect.y + rect.h => {
+            Some(href.clone())
+        }
+        _ => None,
+    })
+}
+
+/// Bottom edge of the page content, before any scroll offset is applied.
+pub fn display_bottom(page: &DisplayList) -> f32 {
+    page.items
+        .iter()
+        .filter_map(item_rect)
+        .map(|rect| rect.y + rect.h)
+        .fold(0.0, f32::max)
+}
+
 /// Synthetic error page. The engine has no inline-style support, so the
 /// error text is emitted as plain text (and HTML-escaped to keep the markup).
 pub fn error_page_html(err: &str) -> String {
@@ -168,10 +348,14 @@ pub fn error_page_html(err: &str) -> String {
 /// The DOM, stylesheet and style map are local to this function and dropped
 /// before it returns — that is the low-RAM contract of the shell.
 pub fn load_page(url: &str, viewport: Size) -> (String, DisplayList) {
-    let html = match hodo_net::load(url) {
-        Ok(Resource::Html(text)) => text,
-        Ok(Resource::Other { data, .. }) => String::from_utf8_lossy(&data).into_owned(),
-        Err(err) => error_page_html(&err.to_string()),
+    let html = if url == ABOUT_HODO_URL {
+        about_hodo_html()
+    } else {
+        match hodo_net::load(url) {
+            Ok(Resource::Html(text)) => text,
+            Ok(Resource::Other { data, .. }) => String::from_utf8_lossy(&data).into_owned(),
+            Err(err) => error_page_html(&err.to_string()),
+        }
     };
     let dom = hodo_html::parse_document(&html);
     let title = first_title(&dom);
@@ -181,14 +365,28 @@ pub fn load_page(url: &str, viewport: Size) -> (String, DisplayList) {
     (title, display_list)
 }
 
-/// Page display list + the two UI strips, rendered in a single pass.
+/// Page display list (shifted by the scroll offset) + the fixed UI strips,
+/// rendered in a single pass.
 pub fn compose_display_list(
     page: &DisplayList,
     viewport: Size,
     url: &str,
     ext_titles: &[String],
+    scroll_offset: f32,
+    tab_label: &str,
 ) -> DisplayList {
-    let mut items = page.items.clone();
+    let offset = clamp_scroll_offset(scroll_offset, display_bottom(page), viewport.h);
+    let mut items: Vec<DisplayItem> = page
+        .items
+        .iter()
+        .cloned()
+        .map(|mut item| {
+            if let Some(rect) = item_rect_mut(&mut item) {
+                rect.y -= offset;
+            }
+            item
+        })
+        .collect();
 
     items.push(DisplayItem::Rect {
         rect: Rect {
@@ -212,6 +410,20 @@ pub fn compose_display_list(
         color: Color::BLACK,
         font_size: 16.0,
         weight: 400,
+        href: None,
+    });
+    items.push(DisplayItem::Text {
+        rect: Rect {
+            x: (viewport.w - 108.0).max(0.0),
+            y: 6.0,
+            w: 100.0,
+            h: 28.0,
+        },
+        text: tab_label.to_string(),
+        color: Color::BLACK,
+        font_size: 14.0,
+        weight: 400,
+        href: None,
     });
 
     let bottom_y = viewport.h - BOTTOM_BAR_H;
@@ -237,6 +449,7 @@ pub fn compose_display_list(
         color: Color::BLACK,
         font_size: 14.0,
         weight: 400,
+        href: None,
     });
 
     DisplayList { items }
@@ -346,6 +559,17 @@ fn escape_html(input: &str) -> String {
 mod tests {
     use super::*;
 
+    fn linked_text(x: f32, y: f32, w: f32, h: f32, href: Option<&str>) -> DisplayItem {
+        DisplayItem::Text {
+            rect: Rect { x, y, w, h },
+            text: "link".into(),
+            color: Color::BLACK,
+            font_size: 16.0,
+            weight: 400,
+            href: href.map(str::to_string),
+        }
+    }
+
     #[test]
     fn url_join_handles_absolute_and_relative_links() {
         assert_eq!(
@@ -398,6 +622,103 @@ mod tests {
     }
 
     #[test]
+    fn history_push_back_forward_and_truncate() {
+        let mut app = App::new(Some("/a"));
+        assert_eq!(app.active_tab().history, vec!["/a"]);
+        assert_eq!(app.active_tab().history_cursor, 0);
+
+        app.navigate("/b", DEFAULT_VIEWPORT);
+        app.navigate("/c", DEFAULT_VIEWPORT);
+        assert_eq!(app.active_tab().history, vec!["/a", "/b", "/c"]);
+        assert_eq!(app.active_tab().history_cursor, 2);
+
+        app.back(DEFAULT_VIEWPORT);
+        assert_eq!(app.active_tab().url, "/b");
+        app.back(DEFAULT_VIEWPORT);
+        assert_eq!(app.active_tab().url, "/a");
+        app.back(DEFAULT_VIEWPORT);
+        assert_eq!(app.active_tab().url, "/a"); // no-op at the start
+        app.forward(DEFAULT_VIEWPORT);
+        assert_eq!(app.active_tab().url, "/b");
+        app.forward(DEFAULT_VIEWPORT);
+        assert_eq!(app.active_tab().url, "/c");
+        app.forward(DEFAULT_VIEWPORT);
+        assert_eq!(app.active_tab().url, "/c"); // no-op at the end
+
+        app.back(DEFAULT_VIEWPORT); // /b
+        app.back(DEFAULT_VIEWPORT); // /a
+        app.navigate("/d", DEFAULT_VIEWPORT);
+        assert_eq!(app.active_tab().history, vec!["/a", "/d"]);
+        assert_eq!(app.active_tab().history_cursor, 1);
+        assert_eq!(app.active_tab().url, "/d");
+    }
+
+    #[test]
+    fn scroll_offset_is_clamped_to_the_page() {
+        assert_eq!(clamp_scroll_offset(-10.0, 1000.0, 800.0), 0.0);
+        assert_eq!(clamp_scroll_offset(50.0, 1000.0, 800.0), 50.0);
+        assert_eq!(clamp_scroll_offset(500.0, 1000.0, 800.0), 200.0);
+        assert_eq!(clamp_scroll_offset(1000.0, 500.0, 800.0), 0.0);
+
+        let page = DisplayList {
+            items: vec![
+                DisplayItem::Text {
+                    rect: Rect {
+                        x: 0.0,
+                        y: 10.0,
+                        w: 100.0,
+                        h: 20.0,
+                    },
+                    text: "a".into(),
+                    color: Color::BLACK,
+                    font_size: 16.0,
+                    weight: 400,
+                    href: None,
+                },
+                DisplayItem::Rect {
+                    rect: Rect {
+                        x: 0.0,
+                        y: 400.0,
+                        w: 100.0,
+                        h: 50.0,
+                    },
+                    color: Color::WHITE,
+                    border_color: None,
+                    radius: 0.0,
+                },
+            ],
+        };
+        assert_eq!(display_bottom(&page), 450.0);
+
+        let mut app = App::new(Some(ABOUT_HODO_URL));
+        app.tabs[0].page_height = 450.0;
+        app.scroll_by(SCROLL_PAGE, DEFAULT_VIEWPORT);
+        assert_eq!(app.active_tab().scroll_offset, 0.0); // 450 < 800
+        app.scroll_to(1000.0, DEFAULT_VIEWPORT);
+        assert_eq!(app.active_tab().scroll_offset, 0.0);
+    }
+
+    #[test]
+    fn about_hodo_html_has_expected_content() {
+        let html = about_hodo_html();
+        assert!(html.contains("<h1>hodo</h1>"));
+        assert!(html.contains("<title>hodo — new tab</title>"));
+        assert!(html.contains("Ctrl+T opens a new tab"));
+        assert!(html.contains("<ul>"));
+
+        let (title, list) = load_page(ABOUT_HODO_URL, DEFAULT_VIEWPORT);
+        assert_eq!(title, "hodo — new tab");
+        assert!(!list.items.is_empty());
+    }
+
+    #[test]
+    fn tab_counter_formats_one_based_position() {
+        assert_eq!(tab_counter(1, 3), "tab 1/3");
+        assert_eq!(tab_counter(2, 3), "tab 2/3");
+        assert_eq!(tab_counter(1, 1), "tab 1/1");
+    }
+
+    #[test]
     fn compositing_and_premultiply_are_byte_exact() {
         let mut rgba = vec![255, 0, 0, 128, 0, 0, 0, 0, 10, 20, 30, 255];
         composite_over_white(&mut rgba);
@@ -408,5 +729,76 @@ mod tests {
 
         let premul = premultiply_rgba(&[100, 50, 25, 128]);
         assert_eq!(premul, vec![50, 25, 13, 128]);
+    }
+
+    #[test]
+    fn image_and_text_rects_shift_together_but_bars_stay_fixed() {
+        let page = DisplayList {
+            items: vec![
+                DisplayItem::Image {
+                    rect: Rect {
+                        x: 0.0,
+                        y: 900.0,
+                        w: 100.0,
+                        h: 100.0,
+                    },
+                    path: "pic.png".into(),
+                },
+                linked_text(0.0, 950.0, 100.0, 20.0, None),
+            ],
+        };
+        let composed = compose_display_list(&page, DEFAULT_VIEWPORT, "", &[], 30.0, "tab 1/1");
+        let y = |index: usize| item_rect(&composed.items[index]).unwrap().y;
+
+        assert_eq!(y(0), 870.0); // image shifted
+        assert_eq!(y(1), 920.0); // text shifted by the same amount
+        assert_eq!(y(2), 0.0); // top bar fixed
+        assert_eq!(y(5), DEFAULT_VIEWPORT.h - BOTTOM_BAR_H); // bottom bar fixed
+        assert_eq!(display_bottom(&page), 1000.0); // images count toward height
+    }
+
+    #[test]
+    fn hit_test_link_uses_containment_and_reverse_priority() {
+        let items = vec![
+            linked_text(0.0, 0.0, 100.0, 20.0, Some("/first")),
+            linked_text(0.0, 0.0, 100.0, 20.0, None), // ignored
+            linked_text(0.0, 0.0, 100.0, 20.0, Some("/second")),
+        ];
+        assert_eq!(
+            hit_test_link(&items, 10.0, 10.0).as_deref(),
+            Some("/second")
+        );
+        assert_eq!(hit_test_link(&items, 200.0, 10.0), None); // outside x
+        assert_eq!(hit_test_link(&items, 10.0, 25.0), None); // outside y
+        assert_eq!(hit_test_link(&items, 100.0, 20.0), None); // exclusive edge
+
+        // An unlinked overlapping item does not mask a link below it.
+        let single = vec![
+            linked_text(0.0, 0.0, 100.0, 20.0, Some("/below")),
+            linked_text(0.0, 0.0, 100.0, 20.0, None),
+        ];
+        assert_eq!(hit_test_link(&single, 5.0, 5.0).as_deref(), Some("/below"));
+    }
+
+    #[test]
+    fn handle_click_navigates_or_unfocuses_the_url_bar() {
+        let mut app = App::new(Some(ABOUT_HODO_URL));
+        app.tabs[0].display_list = DisplayList {
+            items: vec![linked_text(0.0, 100.0, 100.0, 20.0, Some("/clicked"))],
+        };
+        app.tabs[0].page_height = 120.0;
+        app.url_focused = true;
+
+        assert!(app.handle_click(10.0, 110.0));
+        assert_eq!(app.active_tab().url, "/clicked");
+        assert_eq!(app.active_tab().history, vec![ABOUT_HODO_URL, "/clicked"]);
+        assert_eq!(app.active_tab().history_cursor, 1);
+        assert!(!app.url_focused);
+
+        app.url_focused = true;
+        assert!(!app.handle_click(500.0, 110.0)); // miss
+        assert_eq!(app.active_tab().url, "/clicked");
+        assert_eq!(app.active_tab().history.len(), 2);
+        assert!(!app.url_focused);
     }
 }
