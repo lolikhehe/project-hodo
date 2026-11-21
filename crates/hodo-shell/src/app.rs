@@ -5,6 +5,9 @@
 //! created and dropped inside [`load_page`]. Only the active tab ever has a
 //! pixel buffer, rebuilt on navigation, tab switch and resize (~33 ms).
 
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+
 use hodo_css::{parse_stylesheet, Stylesheet};
 use hodo_dom::Dom;
 use hodo_layout::{DisplayItem, DisplayList};
@@ -270,17 +273,49 @@ pub fn join_url(base: &str, href: &str) -> String {
     }
 }
 
+/// The shell's single disk-cache owner: one `DiskCache` per process, guarded
+/// by a mutex so each page load can briefly borrow it mutably. `open` creates
+/// the `cache/` directory under this root (the current working directory).
+fn shell_cache() -> Option<&'static Mutex<hodo_cache::DiskCache>> {
+    static CACHE: OnceLock<Option<Mutex<hodo_cache::DiskCache>>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            hodo_cache::DiskCache::open(&root, 128 * 1024 * 1024)
+                .ok()
+                .map(Mutex::new)
+        })
+        .as_ref()
+}
+
+/// Load a page resource through the shared cache. If the cache cannot be
+/// opened, degrade to the frozen uncached loader rather than failing the page.
+fn load_resource(url: &str) -> Result<Resource, hodo_net::FetchError> {
+    let opts = hodo_net::FetchOptions::default();
+    match shell_cache() {
+        Some(cache) => {
+            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            hodo_net::load_with(url, &opts, &mut guard)
+        }
+        None => hodo_net::load(url),
+    }
+}
+
 /// Synthetic welcome page for `about:hodo` (no network involved).
 pub fn about_hodo_html() -> String {
-    "<html><head><title>hodo — new tab</title></head><body>\
-     <h1>hodo</h1><p>A small browser, built from small crates.</p>\
-     <ul>\
-     <li>Type a URL above and press Enter to visit it.</li>\
-     <li>Ctrl+T opens a new tab; Ctrl+W closes it.</li>\
-     <li>Alt+Left / Alt+Right walk your history.</li>\
-     <li>Scroll, PageUp / PageDown and Home / End move the page.</li>\
-     </ul></body></html>"
-        .to_string()
+    let stats = hodo_net::cache_stats();
+    format!(
+        "<html><head><title>hodo — new tab</title></head><body>\
+         <h1>hodo</h1><p>A small browser, built from small crates.</p>\
+         <ul>\
+         <li>Type a URL above and press Enter to visit it.</li>\
+         <li>Ctrl+T opens a new tab; Ctrl+W closes it.</li>\
+         <li>Alt+Left / Alt+Right walk your history.</li>\
+         <li>Scroll, PageUp / PageDown and Home / End move the page.</li>\
+         <li>Cache: {} hits, {} misses, {} bytes, {} evictions.</li>\
+         </ul></body></html>",
+        stats.hits, stats.misses, stats.bytes, stats.evictions
+    )
 }
 
 /// Status text in the top strip, e.g. `tab 2/3`.
@@ -351,13 +386,28 @@ pub fn load_page(url: &str, viewport: Size) -> (String, DisplayList) {
     let html = if url == ABOUT_HODO_URL {
         about_hodo_html()
     } else {
-        match hodo_net::load(url) {
+        match load_resource(url) {
             Ok(Resource::Html(text)) => text,
             Ok(Resource::Other { data, .. }) => String::from_utf8_lossy(&data).into_owned(),
             Err(err) => error_page_html(&err.to_string()),
         }
     };
-    let dom = hodo_html::parse_document(&html);
+    let mut dom = hodo_html::parse_document(&html);
+    // Layout has no base-URL parameter, so a relative img[src] would resolve
+    // against the process CWD. Rewrite it against the page we actually loaded.
+    let mut relative_images = Vec::new();
+    dom.walk(|id, _| {
+        if dom.tag(id).is_some_and(|t| t.eq_ignore_ascii_case("img")) {
+            if let Some(src) = dom.attr(id, "src") {
+                if !src.contains("://") && !src.starts_with("data:") {
+                    relative_images.push((id, join_url(url, src)));
+                }
+            }
+        }
+    });
+    for (id, src) in relative_images {
+        dom.set_attr(id, "src", src);
+    }
     let title = first_title(&dom);
     let stylesheet = collect_styles(&dom, url);
     let styles = hodo_style::compute_styles(&dom, &[stylesheet]);
@@ -522,7 +572,7 @@ fn collect_styles(dom: &Dom, page_url: &str) -> Stylesheet {
         if dom.tag(id) == Some("link") && dom.attr(id, "rel") == Some("stylesheet") {
             if let Some(href) = dom.attr(id, "href") {
                 let resolved = join_url(page_url, href);
-                if let Ok(resource) = hodo_net::load(&resolved) {
+                if let Ok(resource) = load_resource(&resolved) {
                     match resource {
                         Resource::Html(text) => sources.push(text),
                         Resource::Other { data, .. } => {
@@ -558,6 +608,7 @@ fn escape_html(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn linked_text(x: f32, y: f32, w: f32, h: f32, href: Option<&str>) -> DisplayItem {
         DisplayItem::Text {
@@ -585,6 +636,31 @@ mod tests {
             "D:\\site\\style.css"
         );
         assert_eq!(join_url("page.html", "style.css"), "style.css");
+    }
+
+    #[test]
+    fn demo_page_image_src_is_resolved_against_the_page_directory() {
+        let page = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/demo-site/index.html")
+            .to_string_lossy()
+            .into_owned();
+        let (_, list) = load_page(&page, DEFAULT_VIEWPORT);
+        let image = list
+            .items
+            .iter()
+            .find_map(|item| match item {
+                DisplayItem::Image { path, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .expect("demo page contains an <img>");
+        assert!(
+            Path::new(image).is_absolute(),
+            "image src should be resolved to an absolute path: {image}"
+        );
+        assert!(
+            Path::new(image).exists(),
+            "resolved image path must point at the real file: {image}"
+        );
     }
 
     #[test]
@@ -705,6 +781,7 @@ mod tests {
         assert!(html.contains("<title>hodo — new tab</title>"));
         assert!(html.contains("Ctrl+T opens a new tab"));
         assert!(html.contains("<ul>"));
+        assert!(html.contains("Cache:") && html.contains("hits"));
 
         let (title, list) = load_page(ABOUT_HODO_URL, DEFAULT_VIEWPORT);
         assert_eq!(title, "hodo — new tab");

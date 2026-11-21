@@ -999,11 +999,15 @@ dependencies = [
 [[package]]
 name = "hodo-dom"
 version = "0.1.0"
+dependencies = [
+ "hodo-types",
+]
 
 [[package]]
 name = "hodo-ext-api"
 version = "0.1.0"
 dependencies = [
+ "hodo-types",
  "serde_json",
 ]
 
@@ -1014,6 +1018,20 @@ dependencies = [
  "hodo-ext-api",
  "hodo-ext-manifest",
  "hodo-js",
+ "hodo-net",
+ "hodo-types",
+ "serde_json",
+ "thiserror 2.0.21",
+ "ureq",
+]
+
+[[package]]
+name = "hodo-ext-i18n"
+version = "0.1.0"
+dependencies = [
+ "hodo-types",
+ "serde_json",
+ "sys-locale",
  "thiserror 2.0.21",
 ]
 
@@ -1021,6 +1039,7 @@ dependencies = [
 name = "hodo-ext-manifest"
 version = "0.1.0"
 dependencies = [
+ "hodo-ext-i18n",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -1052,6 +1071,7 @@ version = "0.1.0"
 dependencies = [
  "boa_engine",
  "hodo-ext-api",
+ "hodo-types",
  "serde_json",
 ]
 
@@ -1061,6 +1081,7 @@ version = "0.1.0"
 dependencies = [
  "hodo-css",
  "hodo-dom",
+ "hodo-render",
  "hodo-style",
  "hodo-types",
 ]
@@ -1069,6 +1090,7 @@ dependencies = [
 name = "hodo-net"
 version = "0.1.0"
 dependencies = [
+ "hodo-cache",
  "thiserror 2.0.21",
  "ureq",
 ]
@@ -1103,6 +1125,7 @@ dependencies = [
 name = "hodo-shell"
 version = "0.1.0"
 dependencies = [
+ "hodo-cache",
  "hodo-css",
  "hodo-dom",
  "hodo-ext-api",
@@ -2623,6 +2646,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
+]
+
+[[package]]
+name = "sys-locale"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eab9a99a024a169fe8a903cf9d4a3b3601109bcc13bd9e3c6fff259138626c4"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
