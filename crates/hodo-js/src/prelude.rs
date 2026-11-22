@@ -645,15 +645,27 @@ function __hodoConnect(inst) {
 // wrappers and by custom-element instances constructed through HTMLElement().
 function __hodoDomProps(api, node) {
   api.__hodoNode = node;
+  var isFragment = __hodo_dom_tag(node) === '#document-fragment';
   api.appendChild = function (child) {
+    // The native flattens a DocumentFragment. Children only become connected
+    // when they land in the live tree, not while parked in a fragment.
+    var moved = child instanceof DocumentFragment ? child.childNodes : null;
     __hodo_dom_append_child(node, child.__hodoNode);
-    __hodoConnect(child);
+    if (moved) {
+      for (var i = 0; i < moved.length; i++) __hodoConnect(moved[i]);
+    } else if (!isFragment) {
+      __hodoConnect(child);
+    }
     return child;
   };
   api.removeChild = function (child) { __hodo_dom_remove_child(node, child.__hodoNode); return child; };
   api.getAttribute = function (name) { return __hodo_dom_get_attribute(node, String(name)); };
   api.setAttribute = function (name, value) { __hodo_dom_set_attribute(node, String(name), String(value)); };
   api.addEventListener = function (kind, fn) { __hodo_dom_add_listener(node, String(kind), fn); };
+  api.dispatchEvent = function (evt) {
+    evt.target = this;
+    return __hodo_dom_dispatch_event(node, evt, !!evt.bubbles);
+  };
   api.classList = {
     add: function (c) { __hodo_dom_class_list(node, 'add', String(c)); },
     remove: function (c) { __hodo_dom_class_list(node, 'remove', String(c)); },
@@ -691,6 +703,18 @@ function __hodoDomProps(api, node) {
       var handles = __hodo_dom_children(node);
       var out = [];
       for (var i = 0; i < handles.length; i++) {
+        out.push(__hodoDomWrap(handles[i], null, null, HTMLElement.prototype));
+      }
+      return out;
+    }
+  });
+  Object.defineProperty(api, 'childNodes', {
+    get: function () {
+      var handles = __hodo_dom_child_nodes(node);
+      var out = [];
+      for (var i = 0; i < handles.length; i++) {
+        // shortcut: text nodes get an element-shaped view until a node-kind
+        // wrapper exists; the child list and identity are still real.
         out.push(__hodoDomWrap(handles[i], null, null, HTMLElement.prototype));
       }
       return out;
@@ -760,6 +784,113 @@ function __hodoMakeInstance(node, ctor) {
   return inst;
 }
 
+// Event construction. Unlike the DOM element constructors, `new Event()` is
+// legal and subclassing works: these are ordinary constructible functions, so
+// the derived constructor reaches this body through the normal prototype chain.
+function Event(type, init) {
+  var opts = init || {};
+  this.type = String(type === undefined ? '' : type);
+  this.bubbles = !!opts.bubbles;
+  this.cancelable = !!opts.cancelable;
+  this.target = null;
+  this.defaultPrevented = false;
+}
+Event.prototype.preventDefault = function () {
+  if (this.cancelable) this.defaultPrevented = true;
+};
+Event.prototype.stopPropagation = function () {
+  // Honored by dispatchEvent's native loop below; the host-driven
+  // dispatch_page_event path in hodo-js still ignores it (no event there).
+  this.__hodoStopPropagation = true;
+};
+// Deprecated but still the API the webcomponents polyfill reaches for.
+Event.prototype.initEvent = function (type, bubbles, cancelable) {
+  this.type = String(type === undefined ? '' : type);
+  this.bubbles = !!bubbles;
+  this.cancelable = !!cancelable;
+  this.defaultPrevented = false;
+};
+function CustomEvent(type, init) {
+  Event.call(this, type, init);
+  var opts = init || {};
+  this.detail = opts.detail === undefined ? null : opts.detail;
+}
+CustomEvent.prototype = Object.create(Event.prototype);
+CustomEvent.prototype.constructor = CustomEvent;
+
+// UIEvent family. Plain constructible functions like Event/CustomEvent, so
+// `new`, `instanceof` and `class X extends ...` all work through the normal
+// chain: MouseEvent -> UIEvent -> Event. All device fields are honest defaults:
+// hodo has no synthetic input device, so no coordinates or keys are invented.
+// shortcut: the host click payload carries x/y as raw JSON straight to list
+// listeners (fire_page_event never constructs a MouseEvent), so clientX/clientY
+// stay zero; upgrade when a real event-construction path exists.
+function UIEvent(type, init) {
+  Event.call(this, type, init);
+  var opts = init || {};
+  this.view = null; // honest: no Window view object semantics here
+  this.detail = opts.detail === undefined ? 0 : opts.detail;
+}
+UIEvent.prototype = Object.create(Event.prototype);
+UIEvent.prototype.constructor = UIEvent;
+
+function MouseEvent(type, init) {
+  UIEvent.call(this, type, init);
+  var opts = init || {};
+  this.clientX = opts.clientX === undefined ? 0 : opts.clientX;
+  this.clientY = opts.clientY === undefined ? 0 : opts.clientY;
+  this.screenX = opts.screenX === undefined ? 0 : opts.screenX;
+  this.screenY = opts.screenY === undefined ? 0 : opts.screenY;
+  this.pageX = opts.pageX === undefined ? 0 : opts.pageX;
+  this.pageY = opts.pageY === undefined ? 0 : opts.pageY;
+  this.button = opts.button === undefined ? 0 : opts.button;
+  this.buttons = opts.buttons === undefined ? 0 : opts.buttons;
+  this.relatedTarget = opts.relatedTarget === undefined ? null : opts.relatedTarget;
+  this.altKey = !!opts.altKey;
+  this.ctrlKey = !!opts.ctrlKey;
+  this.shiftKey = !!opts.shiftKey;
+  this.metaKey = !!opts.metaKey;
+}
+MouseEvent.prototype = Object.create(UIEvent.prototype);
+MouseEvent.prototype.constructor = MouseEvent;
+// The webcomponents polyfill capability-sniffs this method; initializing the
+// base Event fields is honest, coordinates stay at their defaults.
+MouseEvent.prototype.initMouseEvent = function (type, bubbles, cancelable) {
+  this.initEvent(type, bubbles, cancelable);
+};
+
+function KeyboardEvent(type, init) {
+  UIEvent.call(this, type, init);
+  var opts = init || {};
+  this.key = opts.key === undefined ? '' : opts.key;
+  this.code = opts.code === undefined ? '' : opts.code;
+  this.keyCode = opts.keyCode === undefined ? 0 : opts.keyCode;
+  this.which = opts.which === undefined ? 0 : opts.which;
+  this.ctrlKey = !!opts.ctrlKey;
+  this.altKey = !!opts.altKey;
+  this.shiftKey = !!opts.shiftKey;
+  this.metaKey = !!opts.metaKey;
+}
+KeyboardEvent.prototype = Object.create(UIEvent.prototype);
+KeyboardEvent.prototype.constructor = KeyboardEvent;
+
+function FocusEvent(type, init) {
+  UIEvent.call(this, type, init);
+  var opts = init || {};
+  this.relatedTarget = opts.relatedTarget === undefined ? null : opts.relatedTarget;
+}
+FocusEvent.prototype = Object.create(UIEvent.prototype);
+FocusEvent.prototype.constructor = FocusEvent;
+
+function InputEvent(type, init) {
+  UIEvent.call(this, type, init);
+  var opts = init || {};
+  this.inputType = opts.inputType === undefined ? '' : opts.inputType;
+  this.data = opts.data === undefined ? null : opts.data;
+}
+InputEvent.prototype = Object.create(UIEvent.prototype);
+InputEvent.prototype.constructor = InputEvent;
+
 // Minimal DOM class surface. Constructors are illegal to invoke directly
 // (a bare `new Element()` has no backing node); only the wrappers above are
 // real instances. Plain functions give boa a normal prototype chain so
@@ -802,6 +933,28 @@ Node.DOCUMENT_TYPE_NODE = 10;
 Node.DOCUMENT_FRAGMENT_NODE = 11;
 Node.NOTATION_NODE = 12;
 
+// Unlike the element/document constructors, `new DocumentFragment()` is legal:
+// the native allocates an unparented #document-fragment node (hodo-html already
+// uses that shape for template contents). It stays a valid handle, is skipped by
+// Dom::walk so it never paints, and ordinary functions keep subclassing working.
+function __hodoFragmentProps(api, node) {
+  __hodoDomProps(api, node);
+  api.nodeType = Node.DOCUMENT_FRAGMENT_NODE;
+  api.nodeName = '#document-fragment';
+  api.tagName = null;
+  return api;
+}
+function DocumentFragment() {
+  __hodoFragmentProps(this, __hodo_dom_create_fragment());
+}
+DocumentFragment.prototype = Object.create(Node.prototype);
+DocumentFragment.prototype.constructor = DocumentFragment;
+// Absent this rung: throw instead of handing out a fake Range/clone/import.
+function __hodoUnsupportedMethod(name) {
+  return function () { throw new TypeError(name + ' is not supported in hodo page scripts'); };
+}
+Node.prototype.cloneNode = __hodoUnsupportedMethod('cloneNode');
+
 var __hodoRoot = __hodo_dom_root();
 var document = __hodoDomWrap(__hodoRoot, {
   getElementById: function (id) {
@@ -825,7 +978,29 @@ var document = __hodoDomWrap(__hodoRoot, {
     var ctor = __hodoCustomElements[raw.toLowerCase()];
     if (ctor !== undefined) return __hodoMakeInstance(node, ctor);
     return __hodoDomWrap(node, null, null, HTMLElement.prototype);
-  }
+  },
+  createDocumentFragment: function () { return new DocumentFragment(); },
+  createRange: __hodoUnsupportedMethod('document.createRange'),
+  importNode: __hodoUnsupportedMethod('document.importNode'),
+  // The pre-`new Event()` API the webcomponents polyfill uses at load time.
+  // Only the two event-interface domTypes that map cleanly to our Event shape
+  // are accepted; anything else throws instead of returning a broken object.
+  createEvent: function (domType) {
+    var name = String(domType);
+    if (name === 'MouseEvents') return new MouseEvent('');
+    if (name === 'UIEvents') return new UIEvent('');
+    if (name === 'KeyboardEvent') return new KeyboardEvent('');
+    if (name === 'Event' || name === 'HTMLEvents') return new Event('');
+    throw new TypeError('createEvent: unsupported event interface: ' + name);
+  },
+  // Buffered until the current script completes; the shell parses the text and
+  // appends the resulting children to <body>. After load this is a warned no-op.
+  write: function () {
+    var text = '';
+    for (var i = 0; i < arguments.length; i++) text += String(arguments[i]);
+    __hodo_doc_write(text);
+  },
+  close: function () { __hodo_doc_close(); }
 }, {
   // Kept in RuntimeState so the shell integrator can mirror it into the tab
   // title. hodo-js has no shell dependency and cannot do that itself.
@@ -866,6 +1041,10 @@ Object.defineProperty(window, 'location', {
 window.addEventListener = function (type, fn) {
   if (typeof fn !== 'function') throw new TypeError('addEventListener expects a function');
   __hodo_dom_add_listener(__hodoRoot, String(type), fn);
+};
+window.dispatchEvent = function (evt) {
+  evt.target = window;
+  return __hodo_dom_dispatch_event(__hodoRoot, evt, !!evt.bubbles);
 };
 window.setTimeout = setTimeout;
 window.setInterval = setInterval;
@@ -929,11 +1108,12 @@ window.customElements = {
 };
 // Explicit throwing getters instead of a Proxy: a script can catch these and
 // sees exactly which global is missing. No fake objects are handed out.
-function __hodoUnsupportedGlobal(name) {
+function __hodoUnsupportedGlobal(name, ErrorType) {
+  var kind = ErrorType || ReferenceError;
   Object.defineProperty(window, name, {
     configurable: false,
     get: function () {
-      throw new ReferenceError(name + ' is not supported in hodo page scripts');
+      throw new kind(name + ' is not supported in hodo page scripts');
     }
   });
 }
@@ -950,6 +1130,7 @@ var navigator = Object.freeze({
 });
 __hodoUnsupportedGlobal('screen');
 __hodoUnsupportedGlobal('history');
+__hodoUnsupportedGlobal('Range', TypeError);
 "#;
 
 /// Build the page (popup) prelude for one runtime. Injection is intentionally

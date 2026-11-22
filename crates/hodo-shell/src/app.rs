@@ -4,6 +4,7 @@
 //! [`ui`]; the softbuffer draw path in [`present`].
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -12,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use hodo_cache::CacheKey;
 use hodo_css::{parse_stylesheet_with, Stylesheet};
-use hodo_dom::{Dom, NodeId};
+use hodo_dom::{Dom, NodeId, NodeKind};
 use hodo_ext_api::{ApiCall, ApiResult};
 use hodo_js::ExtScriptRuntime;
 use hodo_layout::DisplayList;
@@ -709,6 +710,45 @@ where
 const MAX_PAGE_SCRIPTS: usize = hodo_types::limits::MAX_EXT_CONTEXTS;
 /// Per-script source cap, shared with every other untrusted resource.
 const MAX_SCRIPT_BYTES: usize = hodo_types::limits::MAX_RESOURCE_BYTES;
+/// Dynamic scripts discovered per tick. A script that injects another one on
+/// every run would otherwise never converge; the cap is per tick, so a live
+/// timer can legitimately make progress on later frames.
+const MAX_DYNAMIC_SCRIPT_ROUNDS: usize = 8;
+/// `document.write` is parsed into a detached document and its `<body>`
+/// children are copied into the live one.
+/// shortcut: only these attributes are copied; extend when a written tag needs
+/// arbitrary attributes (hodo-dom has no public attribute iterator).
+const DOC_WRITE_ATTRS: &[&str] = &[
+    "id",
+    "class",
+    "name",
+    "src",
+    "href",
+    "alt",
+    "title",
+    "type",
+    "value",
+    "placeholder",
+    "role",
+    "style",
+    "width",
+    "height",
+    "rel",
+    "target",
+    "action",
+    "method",
+    "for",
+    "content",
+    "charset",
+    "lang",
+    "dir",
+    "checked",
+    "selected",
+    "disabled",
+    "readonly",
+    "required",
+    "hidden",
+];
 /// Wall budget for a *series* of script evals. A single script is still bounded
 /// by hodo-js's loop (1e6) and recursion (256) runtime limits.
 ///
@@ -824,16 +864,32 @@ pub(crate) struct PageContext {
     runtime: ExtScriptRuntime,
     base_url: String,
     fingerprint: u64,
+    budget: Duration,
+    /// Script nodes already evaluated (or deliberately skipped). Keyed by the
+    /// real arena `NodeId`, so a node can never run twice even after moves.
+    executed_scripts: HashSet<NodeId>,
+    /// Shared with the initial load's 16-script cap.
+    script_count: usize,
 }
 
 impl PageContext {
-    fn new(dom: Rc<RefCell<Dom>>, base_url: String, runtime: ExtScriptRuntime) -> Self {
+    fn new(
+        dom: Rc<RefCell<Dom>>,
+        base_url: String,
+        runtime: ExtScriptRuntime,
+        budget: Duration,
+        executed_scripts: HashSet<NodeId>,
+        script_count: usize,
+    ) -> Self {
         let fingerprint = dom_fingerprint(&dom.borrow());
         Self {
             dom,
             runtime,
             base_url,
             fingerprint,
+            budget,
+            executed_scripts,
+            script_count,
         }
     }
 
@@ -851,16 +907,120 @@ impl PageContext {
         self.runtime.document_title()
     }
 
-    /// Drain timers/promises/queued events, then relayout only if a native
-    /// actually changed the DOM. One fingerprint check per frame, so changes
-    /// from several tasks coalesce into one relayout.
-    pub(crate) fn tick(&mut self, viewport: Size) -> Option<DisplayList> {
-        self.runtime.tick();
-        let _ = self.runtime.take_message_replies();
+    fn drain_logs(&mut self) {
         for line in self.runtime.take_logs() {
             eprintln!("hodo: page script: {line}");
         }
-        self.recompute_if_changed(viewport)
+    }
+
+    /// Drain timers/promises/queued events, then relayout only if a native
+    /// actually changed the DOM. One fingerprint check per frame, so changes
+    /// from several tasks coalesce into one relayout. Newly inserted scripts
+    /// are executed after the first diff, then the layout is refreshed once.
+    pub(crate) fn tick(&mut self, viewport: Size) -> Option<DisplayList> {
+        self.runtime.tick();
+        let _ = self.runtime.take_message_replies();
+        self.drain_logs();
+        let mut list = self.recompute_if_changed(viewport);
+        if self.run_dynamic_scripts() {
+            self.drain_logs();
+            if let Some(next) = self.recompute_if_changed(viewport) {
+                list = Some(next);
+            }
+        }
+        list
+    }
+
+    /// Execute `<script>` nodes inserted since the last pass. The fingerprint
+    /// diff above detects the insertion; this pass is where those nodes run.
+    /// Capped at [`MAX_DYNAMIC_SCRIPT_ROUNDS`] per tick so a self-injecting
+    /// script cannot spin forever, and bounded by the same wall budget, byte
+    /// cap and 16-script total as the initial load.
+    fn run_dynamic_scripts(&mut self) -> bool {
+        let started = Instant::now();
+        let mut executed_any = false;
+        for _ in 0..MAX_DYNAMIC_SCRIPT_ROUNDS {
+            if started.elapsed() > self.budget {
+                break;
+            }
+            let pending: Vec<(NodeId, Option<String>, Option<String>, String)> = {
+                let dom = self.dom.borrow();
+                let mut out = Vec::new();
+                dom.walk(|id, _| {
+                    if dom.tag(id) != Some("script") || self.executed_scripts.contains(&id) {
+                        return;
+                    }
+                    let src = dom.attr(id, "src").map(str::to_string);
+                    let kind = dom.attr(id, "type").map(str::to_string);
+                    let mut inline = String::new();
+                    for &child in dom.children(id) {
+                        if let Some(text) = dom.text(child) {
+                            inline.push_str(text);
+                        }
+                    }
+                    // An empty script may still be waiting for `src`/text to be
+                    // assigned; leave it unmarked so a later tick can run it.
+                    if src.is_none() && inline.trim().is_empty() {
+                        return;
+                    }
+                    out.push((id, src, kind, inline));
+                });
+                out
+            };
+            if pending.is_empty() {
+                break;
+            }
+            for (id, src, kind, inline) in pending {
+                self.executed_scripts.insert(id);
+                if !is_js_script_type(kind.as_deref()) {
+                    continue;
+                }
+                if self.script_count >= MAX_PAGE_SCRIPTS {
+                    eprintln!(
+                        "hodo: dynamic page script cap of {MAX_PAGE_SCRIPTS} reached on {}",
+                        self.base_url
+                    );
+                    continue;
+                }
+                let code = match src {
+                    Some(src) => {
+                        let url = join_url(&self.base_url, &src);
+                        match load_resource(&url) {
+                            Ok(Resource::Html(text)) => text,
+                            Ok(Resource::Other { data, .. }) => {
+                                String::from_utf8_lossy(&data).into_owned()
+                            }
+                            Err(err) => {
+                                eprintln!("hodo: dynamic page script {url}: {err}");
+                                continue;
+                            }
+                        }
+                    }
+                    None => inline,
+                };
+                if code.len() > MAX_SCRIPT_BYTES {
+                    eprintln!(
+                        "hodo: dynamic page script on {} exceeds {MAX_SCRIPT_BYTES} bytes",
+                        self.base_url
+                    );
+                    continue;
+                }
+                if started.elapsed() > self.budget {
+                    eprintln!(
+                        "hodo: dynamic page script budget exceeded on {}",
+                        self.base_url
+                    );
+                    break;
+                }
+                if let Err(err) = self.runtime.eval(&code) {
+                    eprintln!("hodo: dynamic page script on {}: {err}", self.base_url);
+                }
+                flush_doc_write(&self.runtime, &self.dom);
+                self.script_count += 1;
+                executed_any = true;
+            }
+        }
+        executed_any
     }
 
     /// Queue a DOM event and deliver it in this frame, so click/key handlers
@@ -923,6 +1083,66 @@ fn collect_scripts(found: Vec<ScriptSource>, page_url: &str) -> Vec<String> {
         scripts.push(code);
     }
     scripts
+}
+
+/// Copy one parsed subtree into the live arena. NodeIds are arena-local, so the
+/// nodes must be recreated; attributes come from the fixed list above.
+fn copy_written_children(parsed: &Dom, from: NodeId, live: &mut Dom, to: NodeId) {
+    for &child in parsed.children(from) {
+        let copied = if let Some(text) = parsed.text(child) {
+            live.create(NodeKind::Text(text.to_string()))
+        } else if let Some(tag) = parsed.tag(child) {
+            let attrs = DOC_WRITE_ATTRS
+                .iter()
+                .filter_map(|name| {
+                    parsed
+                        .attr(child, name)
+                        .map(|v| ((*name).to_string(), v.to_string()))
+                })
+                .collect();
+            live.create(NodeKind::Element {
+                tag: tag.to_string(),
+                attrs,
+            })
+        } else {
+            continue;
+        };
+        live.append(to, copied);
+        copy_written_children(parsed, child, live, copied);
+    }
+}
+
+/// Parse buffered `document.write` text and append its `<body>` children to the
+/// live `<body>`. Simplification: real browsers rewrite the open parse stream
+/// mid-document; we approximate the common case (a script injecting a tag).
+fn append_written_html(live: &mut Dom, html: &str) {
+    if html.is_empty() {
+        return;
+    }
+    let parsed = hodo_html::parse_document_with(true, &format!("<html><body>{html}</body></html>"));
+    let mut parsed_body = None;
+    let mut live_body = None;
+    parsed.walk(|id, _| {
+        if parsed_body.is_none() && parsed.tag(id) == Some("body") {
+            parsed_body = Some(id);
+        }
+    });
+    live.walk(|id, _| {
+        if live_body.is_none() && live.tag(id) == Some("body") {
+            live_body = Some(id);
+        }
+    });
+    if let (Some(parsed_body), Some(live_body)) = (parsed_body, live_body) {
+        copy_written_children(&parsed, parsed_body, live, live_body);
+    }
+}
+
+/// Drain `document.write` text after one script completes and append it.
+fn flush_doc_write(runtime: &ExtScriptRuntime, dom: &Rc<RefCell<Dom>>) {
+    let written = runtime.take_doc_write();
+    if !written.is_empty() {
+        append_written_html(&mut dom.borrow_mut(), &written);
+    }
 }
 
 /// Full pipeline with an explicit JS toggle. The GUI keeps the returned realm;
@@ -998,6 +1218,19 @@ fn load_page_with_flag(
     } else {
         Vec::new()
     };
+    // Every script node from the original parse is already accounted for. The
+    // dynamic pass must only see scripts inserted later by page JS or written
+    // in during initial load.
+    let mut executed_scripts = HashSet::new();
+    {
+        let doc = dom.borrow();
+        doc.walk(|id, _| {
+            if doc.tag(id) == Some("script") {
+                executed_scripts.insert(id);
+            }
+        });
+    }
+    let initial_count = scripts.len();
 
     // realm-drop → parse → collect → eval → DOMContentLoaded → styles/layout
     let page = if scripts.is_empty() {
@@ -1021,13 +1254,30 @@ fn load_page_with_flag(
             if let Err(err) = runtime.eval(&script) {
                 eprintln!("hodo: page script on {url}: {err}");
             }
+            // document.write buffers during script eval; each completed script
+            // flushes its text into <body> before the next one runs.
+            flush_doc_write(&runtime, &dom);
         }
         runtime.dispatch_page_event(root, "DOMContentLoaded", json!({}));
         let _ = runtime.tick();
+        flush_doc_write(&runtime, &dom);
         for line in runtime.take_logs() {
             eprintln!("hodo: page script on {url}: {line}");
         }
-        Some(PageContext::new(Rc::clone(&dom), base_url.clone(), runtime))
+        runtime.close_doc_write();
+        let mut page = PageContext::new(
+            Rc::clone(&dom),
+            base_url.clone(),
+            runtime,
+            budget,
+            executed_scripts,
+            initial_count,
+        );
+        // Headless callers never reach about_to_wait, so drive the dynamic pass
+        // here too; the GUI realm runs it again as a no-op on its first tick.
+        let _ = page.run_dynamic_scripts();
+        page.drain_logs();
+        Some(page)
     };
 
     let display_list = {
@@ -2109,6 +2359,156 @@ pub(crate) mod tests {
             app.active_tab().title,
             "New",
             "a script-assigned document.title must reach the tab title"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Write an HTML fixture into a unique temp dir; return the dir and URL.
+    fn html_fixture(tag: &str, html: &str) -> (std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!("hodo-dyn-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let page = dir.join("index.html");
+        std::fs::write(&page, html).unwrap();
+        (dir, page.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn document_write_during_load_appends_and_renders() {
+        let _guard = PAGE_JS_ENV_LOCK.lock().unwrap();
+        let (dir, url) = html_fixture(
+            "write",
+            "<html><body><div id='out'>none</div>\
+             <script>document.write('<div id=\"w\">Written</div>');</script></body></html>",
+        );
+        let (_, list, ctx) = load_page_live(&url, DEFAULT_VIEWPORT);
+        assert!(ctx.is_some());
+        assert!(list_has(&list, "Written"), "written markup must render");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn appended_script_with_src_executes() {
+        let _guard = PAGE_JS_ENV_LOCK.lock().unwrap();
+        let (dir, url) = html_fixture(
+            "src",
+            "<html><body><div id='out'>none</div><script>\
+             var s = document.createElement('script'); s.src = 'dyn.js'; \
+             document.body.appendChild(s);</script></body></html>",
+        );
+        std::fs::write(
+            dir.join("dyn.js"),
+            "document.getElementById('out').textContent = 'SRC-RAN';",
+        )
+        .unwrap();
+        let (_, list, ctx) = load_page_live(&url, DEFAULT_VIEWPORT);
+        assert!(ctx.is_some());
+        assert!(list_has(&list, "SRC-RAN"), "appended src script must run");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn appended_inline_script_executes() {
+        let _guard = PAGE_JS_ENV_LOCK.lock().unwrap();
+        let (dir, url) = html_fixture(
+            "inline",
+            "<html><body><div id='out'>none</div><script>\
+             var s = document.createElement('script'); \
+             s.textContent = \"document.getElementById('out').textContent='INLINE-RAN';\"; \
+             document.body.appendChild(s);</script></body></html>",
+        );
+        let (_, list, ctx) = load_page_live(&url, DEFAULT_VIEWPORT);
+        assert!(ctx.is_some());
+        assert!(
+            list_has(&list, "INLINE-RAN"),
+            "appended inline script must run"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_script_node_never_executes_twice_across_ticks() {
+        let _guard = PAGE_JS_ENV_LOCK.lock().unwrap();
+        let (dir, url) = html_fixture(
+            "dedupe",
+            "<html><body><div id='out'>none</div><script>\
+             window.n = 0; var s = document.createElement('script'); \
+             s.textContent = \"window.n++; document.getElementById('out').textContent='n='+window.n;\"; \
+             document.body.appendChild(s); document.head.appendChild(s); \
+             document.body.appendChild(s);</script></body></html>",
+        );
+        let (_, list, ctx) = load_page_live(&url, DEFAULT_VIEWPORT);
+        let mut ctx = ctx.unwrap();
+        assert!(list_has(&list, "n=1"), "one node runs once");
+        for _ in 0..3 {
+            let next = ctx
+                .tick(DEFAULT_VIEWPORT)
+                .unwrap_or_else(|| ctx.relayout(DEFAULT_VIEWPORT));
+            assert!(
+                !list_has(&next, "n=2"),
+                "the same NodeId must not run again"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dynamic_non_js_script_types_are_skipped() {
+        let _guard = PAGE_JS_ENV_LOCK.lock().unwrap();
+        let (dir, url) = html_fixture(
+            "json-type",
+            "<html><body><div id='out'>none</div><script>\
+             var s = document.createElement('script'); s.setAttribute('type','application/json'); \
+             s.textContent = \"document.getElementById('out').textContent='JSON-DYN-RAN';\"; \
+             document.body.appendChild(s);</script></body></html>",
+        );
+        let (_, list, ctx) = load_page_live(&url, DEFAULT_VIEWPORT);
+        assert!(ctx.is_some());
+        assert!(
+            !list_has(&list, "JSON-DYN-RAN"),
+            "data blocks never execute"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dynamic_script_rounds_are_capped_per_tick() {
+        let _guard = PAGE_JS_ENV_LOCK.lock().unwrap();
+        let (dir, url) = html_fixture(
+            "cap",
+            "<html><body><div id='out'>none</div><script>\
+             window.n = 0; function inject() { var s = document.createElement('script'); \
+             s.textContent = \"window.n++; document.getElementById('out').textContent='rounds='+window.n; inject();\"; \
+             document.body.appendChild(s); } inject();</script></body></html>",
+        );
+        let (_, list, ctx) = load_page_live(&url, DEFAULT_VIEWPORT);
+        assert!(ctx.is_some());
+        assert!(
+            list_has(&list, &format!("rounds={MAX_DYNAMIC_SCRIPT_ROUNDS}")),
+            "a self-injecting script stops after the per-tick cap"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn post_load_document_write_is_ignored() {
+        let _guard = PAGE_JS_ENV_LOCK.lock().unwrap();
+        let (dir, url) = html_fixture(
+            "late-write",
+            "<html><body><div id='out'>none</div><script>\
+             document.close(); \
+             window.setTimeout(function () { document.write('<div>LATE-WRITE</div>'); }, 1); \
+             </script></body></html>",
+        );
+        let (_, list, ctx) = load_page_live(&url, DEFAULT_VIEWPORT);
+        let mut ctx = ctx.unwrap();
+        assert!(!list_has(&list, "LATE-WRITE"));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let _ = ctx.tick(DEFAULT_VIEWPORT);
+        let list = ctx.relayout(DEFAULT_VIEWPORT);
+        assert!(
+            !list_has(&list, "LATE-WRITE"),
+            "post-load writes do nothing"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

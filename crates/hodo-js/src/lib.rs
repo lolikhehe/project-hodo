@@ -189,6 +189,13 @@ pub(crate) struct RuntimeState {
     /// Writes posted but not yet dispatched: a synchronous PURE read would see
     /// stale state, so the prelude falls back to the normal task path.
     pending_writes: Cell<u32>,
+    /// `document.write` text buffered during initial page-load script eval; the
+    /// shell drains and parses it when the current script completes.
+    doc_write_buffer: RefCell<String>,
+    /// False after `document.close()` or once initial load finishes; later
+    /// writes are ignored with one warning.
+    doc_write_open: Cell<bool>,
+    doc_write_warned: Cell<bool>,
 }
 
 #[cfg(feature = "js")]
@@ -214,6 +221,16 @@ impl RuntimeState {
             next_id: Cell::new(1),
             memo_epoch: Cell::new(1),
             pending_writes: Cell::new(0),
+            doc_write_buffer: RefCell::new(String::new()),
+            doc_write_open: Cell::new(true),
+            doc_write_warned: Cell::new(false),
+        }
+    }
+
+    /// Emit at most one stderr warning for post-load `document.write` calls.
+    fn warn_doc_write(&self) {
+        if !self.doc_write_warned.replace(true) {
+            self.log("document.write after page load is ignored".to_string());
         }
     }
 
@@ -624,6 +641,57 @@ impl ExtScriptRuntime {
     #[must_use]
     pub fn document_title(&self) -> String {
         String::new()
+    }
+
+    /// Drain the text buffered by `document.write` during page-script eval.
+    /// Parsing and appending is the shell's job (hodo-js has no HTML parser).
+    #[cfg(feature = "js")]
+    pub fn take_doc_write(&self) -> String {
+        std::mem::take(&mut self.state.doc_write_buffer.borrow_mut())
+    }
+
+    /// Non-JS builds never buffer writes.
+    #[cfg(not(feature = "js"))]
+    pub fn take_doc_write(&self) -> String {
+        String::new()
+    }
+
+    /// Stop buffering `document.write` (end of initial load / `document.close`).
+    #[cfg(feature = "js")]
+    pub fn close_doc_write(&self) {
+        self.state.doc_write_open.set(false);
+    }
+
+    /// Non-JS builds have no write buffer to close.
+    #[cfg(not(feature = "js"))]
+    pub fn close_doc_write(&self) {}
+
+    /// Whether `document.write` is still buffering (used by tests).
+    #[cfg(feature = "js")]
+    #[must_use]
+    pub fn doc_write_is_open(&self) -> bool {
+        self.state.doc_write_open.get()
+    }
+
+    /// Non-JS builds never accept writes.
+    #[cfg(not(feature = "js"))]
+    #[must_use]
+    pub fn doc_write_is_open(&self) -> bool {
+        false
+    }
+
+    /// Whether a post-load write was ignored with a warning (used by tests).
+    #[cfg(feature = "js")]
+    #[must_use]
+    pub fn doc_write_warned(&self) -> bool {
+        self.state.doc_write_warned.get()
+    }
+
+    /// Non-JS builds never warn.
+    #[cfg(not(feature = "js"))]
+    #[must_use]
+    pub fn doc_write_warned(&self) -> bool {
+        false
     }
 
     /// Number of queued tasks (used by tests).

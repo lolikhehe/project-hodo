@@ -16,7 +16,7 @@ use hodo_css::{matches_selector, Selector};
 use hodo_dom::{Dom, NodeId, NodeKind};
 use serde_json::json;
 
-use super::{js_error, register, string_arg, with_state, RuntimeState};
+use super::{error_message, js_error, register, string_arg, with_state, RuntimeState};
 
 type DomHandleEntry = (Rc<RefCell<Dom>>, NodeId);
 
@@ -331,6 +331,22 @@ fn op_dom_create_element(id: u64) -> NativeFunction {
     })
 }
 
+/// Page-only: an unparented `#document-fragment` node, the same kind hodo-html
+/// uses for `<template>` contents. It stays valid (unlike `detach_subtree`
+/// trash) and is invisible to `Dom::walk`, so fragments never paint.
+fn op_dom_create_fragment(id: u64) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |_this, _args, _ctx| {
+        let state = with_state(id, Rc::clone).map_err(js_error)?;
+        let page = page_of(&state).map_err(js_error)?;
+        let node = page.dom.borrow_mut().create(NodeKind::Element {
+            tag: "#document-fragment".to_string(),
+            attrs: Vec::new(),
+        });
+        let handle = alloc_handle(&state, node).map_err(js_error)?;
+        Ok(JsValue::from(handle as f64))
+    })
+}
+
 fn op_dom_append_child(id: u64) -> NativeFunction {
     NativeFunction::from_copy_closure(move |_this, args, _ctx| {
         let state = with_state(id, Rc::clone).map_err(js_error)?;
@@ -338,7 +354,16 @@ fn op_dom_append_child(id: u64) -> NativeFunction {
         let child_handle = handle_arg(args, 1).map_err(js_error)?;
         let (dom, parent) = resolve_for(&state, parent_handle).map_err(js_error)?;
         let (_, child) = resolve_for(&state, child_handle).map_err(js_error)?;
-        dom.borrow_mut().append(parent, child);
+        if dom.borrow().tag(child) == Some("#document-fragment") {
+            // Spec append: move the fragment's children, leave the fragment empty
+            // and reusable. Snapshot first — `append` reparents out of the source.
+            let moved = dom.borrow().children(child).to_vec();
+            for node in moved {
+                dom.borrow_mut().append(parent, node);
+            }
+        } else {
+            dom.borrow_mut().append(parent, child);
+        }
         Ok(JsValue::undefined())
     })
 }
@@ -422,6 +447,23 @@ fn op_dom_children(id: u64) -> NativeFunction {
                 if dom.tag(child).is_some() {
                     handles.push(alloc_handle(&state, child).map_err(js_error)?);
                 }
+            }
+        }
+        JsValue::from_json(&json!(handles), ctx).map_err(|err| js_error(err.to_string()))
+    })
+}
+
+/// Page-only: every child handle (text nodes included), backing `childNodes`.
+fn op_dom_child_nodes(id: u64) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |_this, args, ctx| {
+        let state = with_state(id, Rc::clone).map_err(js_error)?;
+        let (dom, node) =
+            resolve_for(&state, handle_arg(args, 0).map_err(js_error)?).map_err(js_error)?;
+        let mut handles = Vec::new();
+        {
+            let dom = dom.borrow();
+            for &child in dom.children(node) {
+                handles.push(alloc_handle(&state, child).map_err(js_error)?);
             }
         }
         JsValue::from_json(&json!(handles), ctx).map_err(|err| js_error(err.to_string()))
@@ -607,6 +649,79 @@ fn op_dom_add_listener(id: u64) -> NativeFunction {
     })
 }
 
+/// Page-only: synchronously deliver a JS `Event` object to listeners registered
+/// for its type on the target node, then (when bubbling) to listeners on each
+/// ancestor up to the document root. Reuses the exact same listener registry
+/// and `__hodoListener_*` globals as the host-driven `dispatch_page_event` path.
+/// Unlike that host path, this loop sees the event object and so honors
+/// `stopPropagation()`; the shell's `dispatch_page_event` still ignores it.
+fn op_dom_dispatch_event(id: u64) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |_this, args, ctx| {
+        let state = with_state(id, Rc::clone).map_err(js_error)?;
+        let handle = handle_arg(args, 0).map_err(js_error)?;
+        // Keep the event as a real JS object: listeners read `e.type`/`e.target`
+        // and may call `e.preventDefault()`/`e.stopPropagation()` on it.
+        let event = args.get_or_undefined(1).clone();
+        let bubbles = args.get_or_undefined(2).as_boolean().unwrap_or(false);
+        let (dom, node) = resolve_for(&state, handle).map_err(js_error)?;
+
+        let event_object = event
+            .as_object()
+            .ok_or_else(|| js_error("dispatchEvent expects an event object".to_string()))?;
+        let kind = event_object
+            .get(JsString::from("type"), ctx)
+            .and_then(|value| value.to_string(ctx))
+            .map(|text| text.to_std_string_escaped())
+            .map_err(|err| js_error(err.to_string()))?;
+
+        // Target first, then ancestors up to the document root. Document-level
+        // listeners are registered on the root, so bubbling reaches them here.
+        let mut chain = vec![node];
+        if bubbles {
+            let dom = dom.borrow();
+            let mut current = node;
+            while let Some(parent) = dom.parent(current) {
+                chain.push(parent);
+                current = parent;
+            }
+        }
+
+        let page = page_of(&state).map_err(js_error)?;
+        'nodes: for current in chain {
+            let callbacks: Vec<u64> = page
+                .listeners
+                .borrow()
+                .iter()
+                .filter(|listener| listener.node == current && listener.kind == kind)
+                .map(|listener| listener.callback_id)
+                .collect();
+            for callback_id in callbacks {
+                let key =
+                    PropertyKey::from(JsString::from(format!("__hodoListener_{callback_id}")));
+                let callback = ctx
+                    .global_object()
+                    .get(key, ctx)
+                    .map_err(|err| js_error(err.to_string()))?;
+                if let Some(function) = callback.as_callable() {
+                    if let Err(err) =
+                        function.call(&JsValue::undefined(), std::slice::from_ref(&event), ctx)
+                    {
+                        state.log(format!("dispatchEvent listener: {}", error_message(&err)));
+                    }
+                }
+            }
+            let stopped = event_object
+                .get(JsString::from("__hodoStopPropagation"), ctx)
+                .map(|value| value.as_boolean() == Some(true))
+                .unwrap_or(false);
+            if stopped {
+                break 'nodes;
+            }
+        }
+        Ok(JsValue::from(true))
+    })
+}
+
 /// Page-only: the URL the host threaded into `new_page_with_url` (or the
 /// `<base>`/empty fallback). No network or navigation is performed here.
 fn op_page_url(id: u64) -> NativeFunction {
@@ -635,8 +750,38 @@ fn op_page_title(id: u64, set: bool) -> NativeFunction {
     })
 }
 
+/// Buffer one `document.write` call. Multiple arguments concatenate, matching
+/// the web overload; the shell parses the drained text once a script completes.
+fn op_doc_write(id: u64) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |_this, args, ctx| {
+        let state = with_state(id, Rc::clone).map_err(js_error)?;
+        if !state.doc_write_open.get() {
+            state.warn_doc_write();
+            return Ok(JsValue::undefined());
+        }
+        let mut text = String::new();
+        for (index, _) in args.iter().enumerate() {
+            text.push_str(&string_arg(args, index, ctx).unwrap_or_default());
+        }
+        state.doc_write_buffer.borrow_mut().push_str(&text);
+        Ok(JsValue::undefined())
+    })
+}
+
+/// `document.close()` ends buffering; the shell still drains anything already
+/// written when the current script completes.
+fn op_doc_close(id: u64) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |_this, _args, _ctx| {
+        let state = with_state(id, Rc::clone).map_err(js_error)?;
+        state.doc_write_open.set(false);
+        Ok(JsValue::undefined())
+    })
+}
+
 pub(crate) fn register_natives(context: &mut boa_engine::Context, id: u64) {
     register(context, "__hodo_page_url", 0, op_page_url(id));
+    register(context, "__hodo_doc_write", 1, op_doc_write(id));
+    register(context, "__hodo_doc_close", 0, op_doc_close(id));
     register(context, "__hodo_get_title", 0, op_page_title(id, false));
     register(context, "__hodo_set_title", 1, op_page_title(id, true));
     register(context, "__hodo_dom_root", 0, op_dom_root(id));
@@ -663,6 +808,12 @@ pub(crate) fn register_natives(context: &mut boa_engine::Context, id: u64) {
     );
     register(
         context,
+        "__hodo_dom_create_fragment",
+        0,
+        op_dom_create_fragment(id),
+    );
+    register(
+        context,
         "__hodo_dom_append_child",
         2,
         op_dom_append_child(id),
@@ -677,6 +828,7 @@ pub(crate) fn register_natives(context: &mut boa_engine::Context, id: u64) {
     register(context, "__hodo_dom_set_text", 2, op_dom_set_text(id));
     register(context, "__hodo_dom_tag", 1, op_dom_tag(id));
     register(context, "__hodo_dom_children", 1, op_dom_children(id));
+    register(context, "__hodo_dom_child_nodes", 1, op_dom_child_nodes(id));
     register(context, "__hodo_dom_parent", 1, op_dom_parent(id));
     register(context, "__hodo_dom_find_tag", 2, op_dom_find_tag(id));
     register(
@@ -703,6 +855,12 @@ pub(crate) fn register_natives(context: &mut boa_engine::Context, id: u64) {
         "__hodo_dom_add_listener",
         3,
         op_dom_add_listener(id),
+    );
+    register(
+        context,
+        "__hodo_dom_dispatch_event",
+        3,
+        op_dom_dispatch_event(id),
     );
 }
 
@@ -1220,6 +1378,123 @@ mod tests {
         assert_eq!(probe, "[true,true,true,true]");
     }
 
+    #[test]
+    fn document_fragment_constructs_and_is_a_node() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var a = new DocumentFragment(); \
+                 var b = document.createDocumentFragment(); \
+                 class Frag extends DocumentFragment {} \
+                 var c = new Frag(); \
+                 JSON.stringify([a instanceof DocumentFragment, a instanceof Node, \
+                 b instanceof DocumentFragment, b instanceof Node, \
+                 c instanceof Frag, c instanceof DocumentFragment, c instanceof Node, \
+                 a.nodeType, a.nodeName, a.tagName, b.nodeType, b.childNodes.length])",
+            )
+            .unwrap();
+        assert_eq!(
+            probe,
+            r##"[true,true,true,true,true,true,true,11,"#document-fragment",null,11,0]"##
+        );
+    }
+
+    #[test]
+    fn document_fragment_children_flatten_into_live_dom() {
+        let (dom, host, kid) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(Rc::clone(&dom));
+        runtime
+            .eval(
+                "var f = document.createDocumentFragment(); \
+                 f.appendChild(document.createElement('b')); \
+                 f.appendChild(document.createElement('i')); \
+                 window.__before = JSON.stringify([f.children.length, f.childNodes.length, \
+                 f.children[0].tagName, f.children[1].tagName]); \
+                 document.getElementById('host').appendChild(f); \
+                 window.__after = JSON.stringify([f.children.length, f.childNodes.length, \
+                 document.getElementById('host').children.length, \
+                 document.getElementById('host').children[1].tagName, \
+                 document.getElementById('host').children[2].tagName]);",
+            )
+            .unwrap();
+        assert_eq!(runtime.eval("window.__before").unwrap(), r#"[2,2,"B","I"]"#);
+        assert_eq!(
+            runtime.eval("window.__after").unwrap(),
+            r#"[0,0,3,"B","I"]"#
+        );
+        let kids = dom.borrow().children(host).to_vec();
+        let tags: Vec<_> = kids
+            .iter()
+            .map(|id| dom.borrow().tag(*id).unwrap().to_string())
+            .collect();
+        assert_eq!(kids[0], kid);
+        assert_eq!(tags, ["span", "b", "i"]);
+    }
+
+    #[test]
+    fn document_fragment_is_reusable_after_emptying() {
+        let (dom, host, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(Rc::clone(&dom));
+        let probe = runtime
+            .eval(
+                "var f = document.createDocumentFragment(); \
+                 var host = document.getElementById('host'); \
+                 f.appendChild(document.createElement('b')); host.appendChild(f); \
+                 f.appendChild(document.createElement('i')); host.appendChild(f); \
+                 JSON.stringify([f.children.length, host.children.length, \
+                 host.children[1].tagName, host.children[2].tagName, \
+                 f instanceof DocumentFragment])",
+            )
+            .unwrap();
+        assert_eq!(probe, r#"[0,3,"B","I",true]"#);
+        assert_eq!(dom.borrow().children(host).len(), 3);
+    }
+
+    #[test]
+    fn fragments_never_enter_the_rendered_tree() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(Rc::clone(&dom));
+        runtime
+            .eval(
+                "var f = document.createDocumentFragment(); \
+                 f.appendChild(document.createElement('b')); \
+                 f.appendChild(document.createElement('i'));",
+            )
+            .unwrap();
+        let mut tags = Vec::new();
+        dom.borrow().walk(|id, _| {
+            if let Some(tag) = dom.borrow().tag(id) {
+                tags.push(tag.to_string());
+            }
+        });
+        assert_eq!(tags, ["div", "span"]);
+    }
+
+    #[test]
+    fn range_import_and_clone_are_honestly_unsupported() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var out = []; \
+                 function probe(fn) { \
+                   try { fn(); out.push('no-throw'); } \
+                   catch (e) { out.push(e.name + ':' + /not supported/.test(e.message)); } \
+                 } \
+                 probe(function () { document.createRange(); }); \
+                 probe(function () { document.importNode(document.createElement('b'), true); }); \
+                 probe(function () { document.createElement('b').cloneNode(true); }); \
+                 probe(function () { Range; }); \
+                 JSON.stringify(out)",
+            )
+            .unwrap();
+        assert_eq!(
+            probe,
+            r#"["TypeError:true","TypeError:true","TypeError:true","TypeError:true"]"#
+        );
+    }
+
     /// Document-order fixture: scripts, img, anchor, div with assorted attrs.
     fn url_dom() -> Rc<RefCell<Dom>> {
         let mut dom = Dom::new();
@@ -1536,6 +1811,27 @@ mod tests {
     }
 
     #[test]
+    fn fragment_children_connect_only_when_moved_into_the_live_tree() {
+        let (dom, _, _) = custom_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var seen = []; \
+                 customElements.define('x-card', class XThing extends HTMLElement { \
+                   connectedCallback() { seen.push(this.tagName); } \
+                 }); \
+                 var afterDefine = seen.length; \
+                 var f = document.createDocumentFragment(); \
+                 f.appendChild(document.createElement('x-card')); \
+                 var inFragment = seen.length; \
+                 document.body.appendChild(f); \
+                 JSON.stringify([afterDefine, inFragment, seen.length])",
+            )
+            .unwrap();
+        assert_eq!(probe, "[2,2,3]");
+    }
+
+    #[test]
     fn custom_elements_when_defined_resolves_on_define() {
         let (dom, _, _) = custom_dom();
         let mut runtime = ExtScriptRuntime::new_page(dom);
@@ -1555,5 +1851,288 @@ mod tests {
         // the settled flags on a second eval so both handlers have executed.
         let probe = runtime.eval("JSON.stringify([a, b])").unwrap();
         assert_eq!(probe, "[true,true]");
+    }
+
+    #[test]
+    fn document_write_buffers_until_the_shell_drains_it() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        assert!(runtime.doc_write_is_open());
+        runtime
+            .eval("document.write('<div id=w>', 'Written', '</div>');")
+            .unwrap();
+        assert_eq!(
+            runtime.take_doc_write(),
+            "<div id=w>Written</div>",
+            "multiple arguments concatenate"
+        );
+        assert_eq!(
+            runtime.take_doc_write(),
+            "",
+            "the buffer drains exactly once"
+        );
+    }
+
+    #[test]
+    fn document_close_stops_buffering_and_later_writes_warn_once() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        runtime
+            .eval("document.write('early'); document.close();")
+            .unwrap();
+        assert_eq!(runtime.take_doc_write(), "early");
+        assert!(!runtime.doc_write_is_open());
+
+        runtime
+            .eval("document.write('late-1'); document.write('late-2');")
+            .unwrap();
+        assert_eq!(
+            runtime.take_doc_write(),
+            "",
+            "post-close writes are ignored"
+        );
+        assert!(runtime.doc_write_warned());
+        let logs = runtime.take_logs();
+        assert_eq!(logs.len(), 1, "one warning even for two writes");
+        assert!(logs[0].contains("document.write after page load is ignored"));
+    }
+
+    #[test]
+    fn create_event_init_event_dispatch_fires_listener_with_type_and_target() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var host = document.getElementById('host'); \
+                 var seen = null; \
+                 host.addEventListener('ping', function (e) { \
+                   seen = [e.type, e.target === host, e.bubbles, e.cancelable]; \
+                 }); \
+                 var evt = document.createEvent('HTMLEvents'); \
+                 evt.initEvent('ping', false, true); \
+                 var ok = host.dispatchEvent(evt); \
+                 JSON.stringify([ok, seen]);",
+            )
+            .unwrap();
+        assert_eq!(probe, r#"[true,["ping",true,false,true]]"#);
+    }
+
+    #[test]
+    fn dispatch_event_bubbles_to_document_only_when_bubbles_is_true() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var host = document.getElementById('host'); \
+                 var docSeen = []; \
+                 document.addEventListener('ping', function (e) { docSeen.push(e.target.tagName); }); \
+                 var flat = document.createEvent('Event'); \
+                 flat.initEvent('ping', false, false); \
+                 host.dispatchEvent(flat); \
+                 var afterFlat = docSeen.length; \
+                 host.dispatchEvent(new Event('ping', { bubbles: true })); \
+                 JSON.stringify([afterFlat, docSeen]);",
+            )
+            .unwrap();
+        assert_eq!(probe, r#"[0,["DIV"]]"#);
+    }
+
+    #[test]
+    fn stop_propagation_halts_bubbling_to_ancestors() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var host = document.getElementById('host'); \
+                 var seen = []; \
+                 document.addEventListener('ping', function () { seen.push('doc'); }); \
+                 host.addEventListener('ping', function (e) { \
+                   seen.push('host'); e.stopPropagation(); \
+                 }); \
+                 host.dispatchEvent(new Event('ping', { bubbles: true })); \
+                 seen.join(',');",
+            )
+            .unwrap();
+        assert_eq!(probe, "host");
+    }
+
+    #[test]
+    fn prevent_default_sets_default_prevented_only_when_cancelable() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var c = new Event('x', { cancelable: true }); c.preventDefault(); \
+                 var n = new Event('x'); n.preventDefault(); \
+                 JSON.stringify([c.defaultPrevented, n.defaultPrevented]);",
+            )
+            .unwrap();
+        assert_eq!(probe, "[true,false]");
+    }
+
+    #[test]
+    fn create_event_rejects_unsupported_dom_types() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var out = []; \
+                 ['MouseEvent', 'UIEvent', 'CustomEvent'].forEach(function (t) { \
+                   try { document.createEvent(t); out.push('no-throw'); } \
+                   catch (e) { out.push(e.name + ':' + /unsupported/.test(e.message)); } \
+                 }); \
+                 JSON.stringify(out);",
+            )
+            .unwrap();
+        assert_eq!(
+            probe,
+            r#"["TypeError:true","TypeError:true","TypeError:true"]"#
+        );
+    }
+
+    #[test]
+    fn event_constructor_shape_and_subclassing() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var e = new Event('click', { bubbles: true, cancelable: true }); \
+                 class MyEvent extends Event {} \
+                 var m = new MyEvent('boom'); \
+                 JSON.stringify([e.type, e.bubbles, e.cancelable, e.target, e.defaultPrevented, \
+                   typeof e.preventDefault, typeof e.stopPropagation, typeof e.initEvent, \
+                   m instanceof MyEvent, m instanceof Event, m.type]);",
+            )
+            .unwrap();
+        assert_eq!(
+            probe,
+            r#"["click",true,true,null,false,"function","function","function",true,true,"boom"]"#
+        );
+    }
+
+    #[test]
+    fn custom_event_carries_detail_and_is_an_event() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var e = new CustomEvent('thing', { detail: { n: 7 } }); \
+                 var d = new CustomEvent('thing'); \
+                 JSON.stringify([e.type, e.detail.n, e instanceof CustomEvent, \
+                   e instanceof Event, d.detail]);",
+            )
+            .unwrap();
+        assert_eq!(probe, r#"["thing",7,true,true,null]"#);
+    }
+
+    #[test]
+    fn event_family_instanceof_chain_and_honest_defaults() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var m = new MouseEvent('click'); \
+                 var u = new UIEvent('u'); \
+                 var k = new KeyboardEvent('keydown'); \
+                 var f = new FocusEvent('focus'); \
+                 var i = new InputEvent('input'); \
+                 JSON.stringify([ \
+                   m instanceof MouseEvent, m instanceof UIEvent, m instanceof Event, \
+                   u instanceof UIEvent, u instanceof Event, \
+                   k instanceof KeyboardEvent, k instanceof UIEvent, k instanceof Event, \
+                   f instanceof FocusEvent, f instanceof UIEvent, \
+                   i instanceof InputEvent, i instanceof UIEvent, \
+                   [m.clientX, m.clientY, m.screenX, m.screenY, m.pageX, m.pageY, \
+                    m.button, m.buttons, m.relatedTarget, \
+                    m.altKey, m.ctrlKey, m.shiftKey, m.metaKey, \
+                    m.view, m.detail, m.bubbles, m.cancelable, m.type], \
+                   [k.key, k.code, k.keyCode, k.which, k.ctrlKey], \
+                   [f.relatedTarget], [i.inputType, i.data], \
+                   typeof m.initMouseEvent \
+                 ]);",
+            )
+            .unwrap();
+        assert_eq!(
+            probe,
+            r#"[true,true,true,true,true,true,true,true,true,true,true,true,[0,0,0,0,0,0,0,0,null,false,false,false,false,null,0,false,false,"click"],["","",0,0,false],[null],["",null],"function"]"#
+        );
+    }
+
+    #[test]
+    fn create_event_returns_event_family_instances() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var me = document.createEvent('MouseEvents'); \
+                 var ue = document.createEvent('UIEvents'); \
+                 var ke = document.createEvent('KeyboardEvent'); \
+                 var ee = document.createEvent('Event'); \
+                 var he = document.createEvent('HTMLEvents'); \
+                 JSON.stringify([ \
+                   me instanceof MouseEvent, me instanceof UIEvent, me instanceof Event, \
+                   ue instanceof UIEvent, ue instanceof Event, \
+                   ke instanceof KeyboardEvent, ke instanceof UIEvent, \
+                   ee instanceof Event, he instanceof Event \
+                 ]);",
+            )
+            .unwrap();
+        assert_eq!(probe, "[true,true,true,true,true,true,true,true,true]");
+    }
+
+    #[test]
+    fn polyfill_prototype_assignment_pattern_does_not_throw() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var out = []; \
+                 ['MouseEvent', 'UIEvent', 'KeyboardEvent', 'FocusEvent', 'InputEvent'].forEach(function (n) { \
+                   var Ctor = window[n]; \
+                   var shim = function () {}; \
+                   try { window[n].prototype = shim.prototype; \
+                         out.push(typeof Ctor + ':' + (window[n].prototype === shim.prototype)); } \
+                   catch (e) { out.push('THREW:' + e.name); } \
+                 }); \
+                 JSON.stringify(out);",
+            )
+            .unwrap();
+        assert_eq!(
+            probe,
+            r#"["function:true","function:true","function:true","function:true","function:true"]"#
+        );
+    }
+
+    #[test]
+    fn event_family_subclassable_and_honors_init_options() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "class MyMouse extends MouseEvent {} \
+                 var m = new MyMouse('click', { clientX: 7, clientY: 9, button: 2, ctrlKey: true }); \
+                 var k = new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', keyCode: 65 }); \
+                 var i = new InputEvent('input', { inputType: 'insertText', data: 'x' }); \
+                 JSON.stringify([ \
+                   m instanceof MyMouse, m instanceof MouseEvent, m instanceof UIEvent, m instanceof Event, \
+                   m.type, m.clientX, m.clientY, m.button, m.ctrlKey, \
+                   k.key, k.code, k.keyCode, i.inputType, i.data \
+                 ]);",
+            )
+            .unwrap();
+        assert_eq!(
+            probe,
+            r#"[true,true,true,true,"click",7,9,2,true,"a","KeyA",65,"insertText","x"]"#
+        );
+    }
+
+    #[test]
+    fn dispatch_event_returns_true_with_no_listeners() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval("document.getElementById('host').dispatchEvent(new Event('nobody'));")
+            .unwrap();
+        assert_eq!(probe, "true");
     }
 }
