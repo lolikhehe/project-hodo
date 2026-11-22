@@ -1,0 +1,12 @@
+[package]
+name = "hodo-a11y"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+accesskit = "0.25.2"
+hodo-dom = { path = "../hodo-dom" }
+
+[lints]
+workspace = true

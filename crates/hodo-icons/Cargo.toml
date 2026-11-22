@@ -1,0 +1,19 @@
+[package]
+name = "hodo-icons"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+tiny-skia = { version = "=0.12.0", default-features = false, features = ["std", "simd"] }
+hodo-types = { path = "../hodo-types" }
+
+[lints]
+workspace = true
+
+# Dependency pins (2026-11-22):
+#   tiny-skia 0.12.0 — current crates.io release; also already present in the
+#                      root Cargo.lock. `png-format` is intentionally off: the
+#                      API hands back a Pixmap, it never encodes PNG.
+#   hodo-types        — in-tree Color type, path dependency (same pattern as
+#                      the other standalone crates).

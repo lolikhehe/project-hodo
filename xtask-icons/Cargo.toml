@@ -1,0 +1,31 @@
+[package]
+name = "xtask-icons"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+usvg = { version = "=0.50.0", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+
+# Standalone on purpose: the root Cargo.toml `members` line is owned by the
+# net-privacy integrator sweep. An empty [workspace] opts this crate out of the
+# root workspace until the integrator adds it.
+# TODO(integrator): add "xtask-icons" to the root [workspace].members list.
+[workspace]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# Dependency pins (2026-11-22):
+#   usvg 0.50.0 — current crates.io release (published 2026-11-11, rust-version
+#                 1.85). Pinned with `=` so regenerated paths.rs stays
+#                 byte-identical across rebuilds. Default features are off:
+#                 the vendored symbols are path-only, so the whole text/font
+#                 stack (fontdb, harfrust, skrifa, ...) is unnecessary.
+#                 usvg re-exports tiny-skia-path 0.12.0, used for PathSegment.
+#   serde 1.0.229 — matches the root workspace pin; listed per the zone brief
+#                   ("serde for nothing else") and currently unused here.

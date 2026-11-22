@@ -1,0 +1,25 @@
+[package]
+name = "xtask-design"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.2.2"
+
+# Standalone on purpose: the root Cargo.toml `members` line is owned by a
+# parallel agent. An empty [workspace] opts this crate out of the root
+# workspace until the integrator adds it.
+[workspace]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# Dependency pins (2026-11-22):
+#   serde 1.0.229  — matches the root workspace pin.
+#   toml  1.2.2    — current crates.io release (rust-version 1.85); API:
+#                    toml::from_str::<T>() via its default `serde` feature.
