@@ -191,7 +191,7 @@ fn collect_scripts(dom: &Dom, base_url: &str) -> Vec<String> {
 
 /// Run the static pipeline for the popup document and make an opaque frame.
 fn render_popup(dom: &Dom, base_url: &str) -> (DisplayList, Vec<u32>) {
-    let stylesheet = crate::app::collect_styles(dom, base_url);
+    let stylesheet = crate::app::collect_styles(dom, base_url, POPUP_VIEWPORT);
     let styles = hodo_style::compute_styles(dom, &[stylesheet]);
     let list = hodo_layout::layout(dom, &styles, POPUP_VIEWPORT);
     let mut rgba = hodo_render::render(&list, POPUP_VIEWPORT);

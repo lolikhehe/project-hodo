@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 hodo-types.workspace = true
+hodo-ui.workspace = true
+hodo-icons.workspace = true
 hodo-dom.workspace = true
 hodo-html.workspace = true
 hodo-css.workspace = true
@@ -28,6 +30,7 @@ lz4_flex = "=0.14.2"
 winit = "0.30"
 softbuffer = "0.4.8"
 tiny-skia = "0.12.0"
+fontdue = "0.9.5"
 
 [lints]
 workspace = true

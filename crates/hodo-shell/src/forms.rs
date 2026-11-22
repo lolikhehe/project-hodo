@@ -353,7 +353,7 @@ fn collect_form(dom: &Dom) -> (String, String) {
 /// Run the static page pipeline over an already-fetched HTML body.
 fn render_html(html: &str, url: &str, viewport: Size) -> (String, DisplayList) {
     let dom = hodo_html::parse_document(html);
-    let stylesheet = crate::app::collect_styles(&dom, url);
+    let stylesheet = crate::app::collect_styles(&dom, url, viewport);
     let styles = hodo_style::compute_styles(&dom, &[stylesheet]);
     let list = hodo_layout::layout(&dom, &styles, viewport);
     let mut title = String::new();
@@ -414,7 +414,7 @@ impl FormPage {
             dom.set_attr(id, "src", src);
         }
 
-        let stylesheet = crate::app::collect_styles(&dom, url);
+        let stylesheet = crate::app::collect_styles(&dom, url, viewport);
         let styles = hodo_style::compute_styles(&dom, &[stylesheet]);
         let list = hodo_layout::layout(&dom, &styles, viewport);
         if !list
@@ -454,7 +454,7 @@ impl FormPage {
     /// the fresh control items. Rendering itself is the shell's normal compose
     /// path, driven by the next redraw.
     fn relayout(&mut self) {
-        let stylesheet = crate::app::collect_styles(&self.dom, &self.base_url);
+        let stylesheet = crate::app::collect_styles(&self.dom, &self.base_url, self.viewport);
         let styles = hodo_style::compute_styles(&self.dom, &[stylesheet]);
         self.list = hodo_layout::layout(&self.dom, &styles, self.viewport);
         // Values live in the registry, not the DOM: paint the current text on

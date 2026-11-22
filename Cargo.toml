@@ -48,6 +48,8 @@ hodo-ext-i18n = { path = "crates/hodo-ext-i18n", version = "0.1.0" }
 hodo-ext-api = { path = "crates/hodo-ext-api", version = "0.1.0" }
 hodo-ext-host = { path = "crates/hodo-ext-host", version = "0.1.0" }
 hodo-js = { path = "crates/hodo-js", version = "0.1.0" }
+hodo-icons = { path = "crates/hodo-icons", version = "0.1.0" }
+hodo-ui = { path = "crates/hodo-ui", version = "0.1.0" }
 hodo-ext-ipc = { path = "crates/hodo-ext-ipc", version = "0.1.0" }
 hodo-ext-worker = { path = "crates/hodo-ext-worker", version = "0.1.0" }
 hodo-cookie = { path = "crates/hodo-cookie", version = "0.1.0" }

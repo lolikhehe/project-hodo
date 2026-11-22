@@ -78,6 +78,10 @@ fn screenshot(url: &str, out: &str) {
 }
 
 fn run_gui(initial_url: Option<&str>) {
+    // Startup pick from cache/design.json. The same accessor is called again on
+    // every draw, so toggling dark mode on hodo://settings restyles the chrome
+    // on the next present without a restart.
+    let _ = ui::current_theme();
     let actions = popup::load_actions();
     let ext_titles = actions.iter().map(|action| action.title.clone()).collect();
     let mut app = app::BrowserApp::new(initial_url, ext_titles, actions);

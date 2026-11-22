@@ -1,8 +1,23 @@
 //! Display-list composition and hit-testing for the browser chrome.
+//!
+//! Every chrome color comes from `hodo-ui`'s [`ThemeAccess`] through
+//! [`current_theme`], which re-reads `cache/design.json` on each call. Chrome
+//! shapes, Roboto text and Material Symbols are rasterized in `present.rs`;
+//! this module owns geometry, colors, the display-list schema and hit-testing.
 
 use hodo_dom::NodeId;
 use hodo_layout::{DisplayItem, DisplayList};
 use hodo_types::{Color, Rect, Size};
+use hodo_ui::{
+    tokens::{self, Theme},
+    ColorRole, ThemeAccess, TypeRole,
+};
+
+/// hodo-ui's token colors cross into the renderer's color type at the chrome
+/// boundary; no color literal is created here.
+pub(crate) fn render_color(color: hodo_ui::Color) -> Color {
+    Color::rgba(color.r, color.g, color.b, color.a)
+}
 
 /// Height of the top URL bar strip. Shared with the scroll-blit content band.
 pub(crate) const TOP_BAR_H: f32 = 40.0;
@@ -10,7 +25,114 @@ pub(crate) const TOP_BAR_H: f32 = 40.0;
 pub(crate) const BOTTOM_BAR_H: f32 = 28.0;
 /// Width of one toolbar action slot.
 pub(crate) const ACTION_SLOT_W: f32 = 120.0;
-const ACTION_FONT: f32 = 14.0;
+/// Built-in actions rasterized by the shell. Extension actions keep their own
+/// bitmaps and are deliberately absent from this list.
+pub(crate) const CHROME_ICONS: [&str; 4] = ["back", "forward", "reload", "home"];
+/// Material Symbol canvas size used by the toolbar buttons.
+pub(crate) const CHROME_ICON_SIZE: u32 = 20;
+const URL_PILL_H: f32 = 28.0;
+const URL_PILL_PAD: f32 = 12.0;
+const TAB_LABEL_W_EXPANDED: f32 = 108.0;
+const TAB_LABEL_W_COMPACT: f32 = 80.0;
+
+/// The chrome theme for this frame. `read_dark_enabled` is the landed
+/// `cache/design.json` contract shared with `hodo://settings`; reading it here
+/// (rather than caching at startup) makes a toggle visible on the next present.
+pub fn current_theme() -> Theme {
+    if crate::hpages::read_dark_enabled() {
+        tokens::DARK
+    } else {
+        tokens::LIGHT
+    }
+}
+
+/// Roomy vs tight chrome metrics from the landed window-class table.
+/// Bar heights stay fixed; only padding/gaps and the URL pill cap change.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ChromeMetrics {
+    pub(crate) name: &'static str,
+    pub(crate) pad: f32,
+    pub(crate) gap: f32,
+    pub(crate) url_max: f32,
+}
+
+pub(crate) fn chrome_metrics(viewport: Size) -> ChromeMetrics {
+    let w = viewport.w;
+    let class = tokens::WINDOW_CLASSES
+        .iter()
+        .find(|class| w >= class.min_dp as f32 && (class.max_dp < 0 || w <= class.max_dp as f32))
+        .copied()
+        .unwrap_or(tokens::WINDOW_CLASSES[0]);
+    // expanded / large / xl reuse the roomy layout; compact / medium share the
+    // tight one (the token table itself only groups layout by url_max).
+    let expanded = matches!(class.name, "expanded" | "large" | "xl");
+    ChromeMetrics {
+        name: class.name,
+        pad: if expanded { 16.0 } else { 8.0 },
+        gap: if expanded { 8.0 } else { 4.0 },
+        url_max: class.url_max as f32,
+    }
+}
+
+/// Slot rect of built-in toolbar icon `index` in the top bar.
+pub(crate) fn toolbar_icon_rect(viewport: Size, index: usize) -> Rect {
+    let m = chrome_metrics(viewport);
+    Rect {
+        x: m.pad + index as f32 * (CHROME_ICON_SIZE as f32 + m.gap),
+        y: ((TOP_BAR_H - CHROME_ICON_SIZE as f32) * 0.5).round(),
+        w: CHROME_ICON_SIZE as f32,
+        h: CHROME_ICON_SIZE as f32,
+    }
+}
+
+/// URL field pill. Its width is capped by the window class and by the space
+/// left between the built-in icons and the tab counter.
+pub(crate) fn url_pill_rect(viewport: Size) -> Rect {
+    let m = chrome_metrics(viewport);
+    let last = toolbar_icon_rect(viewport, CHROME_ICONS.len() - 1);
+    let x = last.x + last.w + m.gap;
+    let tab_w = tab_label_rect(viewport).w;
+    let available = viewport.w - x - m.gap - tab_w - m.pad;
+    Rect {
+        x,
+        y: (TOP_BAR_H - URL_PILL_H) * 0.5,
+        w: m.url_max.min(available).max(1.0),
+        h: URL_PILL_H,
+    }
+}
+
+/// Text area inside the URL pill.
+pub(crate) fn url_text_rect(viewport: Size) -> Rect {
+    let pill = url_pill_rect(viewport);
+    Rect {
+        x: pill.x + URL_PILL_PAD,
+        y: pill.y,
+        w: (pill.w - 2.0 * URL_PILL_PAD).max(1.0),
+        h: pill.h,
+    }
+}
+
+fn tab_label_rect(viewport: Size) -> Rect {
+    let m = chrome_metrics(viewport);
+    let w = if m.name == "compact" || m.name == "medium" {
+        TAB_LABEL_W_COMPACT
+    } else {
+        TAB_LABEL_W_EXPANDED
+    };
+    Rect {
+        x: viewport.w - m.pad - w,
+        y: (TOP_BAR_H - tokens::TYPE_TOOLBAR.line_height as f32) * 0.5,
+        w,
+        h: tokens::TYPE_TOOLBAR.line_height as f32,
+    }
+}
+
+/// Number of chrome display items appended after the page + fixed prefix:
+/// top bar, URL text, tab label, bottom bar, then one slot per visible action.
+pub(crate) fn chrome_item_count(viewport: Size, ext_titles: &[String]) -> usize {
+    let visible = visible_action_count(viewport, ext_titles.len());
+    4 + visible + usize::from(visible < ext_titles.len())
+}
 
 /// Status text in the top strip, e.g. `tab 2/3`.
 pub fn tab_counter(active: usize, total: usize) -> String {
@@ -142,10 +264,9 @@ fn action_slot_rect(viewport: Size, index: usize) -> Rect {
     }
 }
 
-/// Ellipsize a title to the width of one slot (no glyph metrics available, so
-/// the average 14px DejaVu advance is used).
-fn slot_title(title: &str) -> String {
-    let max = ((ACTION_SLOT_W - 8.0) / (ACTION_FONT * 0.55)) as usize;
+/// Ellipsize a title to the width of one slot (average Roboto advance).
+fn slot_title(title: &str, font_size: f32) -> String {
+    let max = ((ACTION_SLOT_W - 8.0) / (font_size * 0.55)) as usize;
     let chars: Vec<char> = title.chars().collect();
     if chars.len() <= max {
         return title.to_string();
@@ -189,6 +310,29 @@ pub fn compose_display_list(
     scroll_offset: f32,
     tab_label: &str,
 ) -> DisplayList {
+    compose_display_list_with_theme(
+        page,
+        viewport,
+        url,
+        ext_titles,
+        scroll_offset,
+        tab_label,
+        current_theme(),
+    )
+}
+
+/// Same schema as [`compose_display_list`] with an explicit theme. The draw
+/// path calls this with one [`current_theme`] snapshot so the display list and
+/// the overlay cannot straddle a settings toggle; tests use it for light/dark.
+pub(crate) fn compose_display_list_with_theme(
+    page: &DisplayList,
+    viewport: Size,
+    url: &str,
+    ext_titles: &[String],
+    scroll_offset: f32,
+    tab_label: &str,
+    theme: Theme,
+) -> DisplayList {
     let offset = clamp_scroll_offset(scroll_offset, display_bottom(page), viewport.h);
     let mut items: Vec<DisplayItem> = page
         .items
@@ -214,6 +358,12 @@ pub fn compose_display_list(
     let fixed_items = page.fixed_items.clone();
     let fixed_node_map = page.fixed_node_map.clone();
 
+    // Chrome suffix (kept index-stable for the shell hit/layout tests): top bar,
+    // URL text, tab label, bottom bar, then extension slots. present.rs strips
+    // this suffix before hodo-render runs and paints the real M3 chrome itself
+    // (pill, Roboto text, Material Symbols); these items still drive the
+    // frame-key hash and damage rects, so a theme or URL change repaints them.
+    let bar_color = render_color(theme.color(ColorRole::SurfaceContainer));
     items.push(DisplayItem::Rect {
         rect: Rect {
             x: 0.0,
@@ -221,36 +371,28 @@ pub fn compose_display_list(
             w: viewport.w,
             h: TOP_BAR_H,
         },
-        color: Color::WHITE,
+        color: bar_color,
         border_color: None,
         radius: 0.0,
     });
+    let url_style = theme.type_style(TypeRole::Url);
     items.push(DisplayItem::Text {
-        rect: Rect {
-            x: 8.0,
-            y: 6.0,
-            w: (viewport.w - 16.0).max(1.0),
-            h: 28.0,
-        },
+        rect: url_text_rect(viewport),
         text: url.to_string(),
-        color: Color::BLACK,
-        font_size: 16.0,
-        weight: 400,
+        color: render_color(theme.color(ColorRole::OnSurface)),
+        font_size: url_style.size as f32,
+        weight: url_style.weight as u16,
         href: None,
         underline: false,
         line_through: false,
     });
+    let tab_style = theme.type_style(TypeRole::Toolbar);
     items.push(DisplayItem::Text {
-        rect: Rect {
-            x: (viewport.w - 108.0).max(0.0),
-            y: 6.0,
-            w: 100.0,
-            h: 28.0,
-        },
+        rect: tab_label_rect(viewport),
         text: tab_label.to_string(),
-        color: Color::BLACK,
-        font_size: 14.0,
-        weight: 400,
+        color: render_color(theme.color(ColorRole::OnSurface)),
+        font_size: tab_style.size as f32,
+        weight: tab_style.weight as u16,
         href: None,
         underline: false,
         line_through: false,
@@ -264,22 +406,22 @@ pub fn compose_display_list(
             w: viewport.w,
             h: BOTTOM_BAR_H,
         },
-        color: Color::rgb(211, 211, 211),
+        color: bar_color,
         border_color: None,
         radius: 0.0,
     });
-    // One slot per extension: a 16px icon would sit at the left of each slot,
-    // but hodo-render keeps `decode_png`/`draw_image` private, so wave 1 shows
-    // the title text only. Titles are clickable when the extension declares a
+    // Extension action icons stay as-is (their own bitmaps); the shell only
+    // paints the title. Titles are clickable when the extension declares a
     // popup; the app checks that before opening one.
+    let strip_style = theme.type_style(TypeRole::Strip);
     let visible = visible_action_count(viewport, ext_titles.len());
     for (index, title) in ext_titles.iter().take(visible).enumerate() {
         items.push(DisplayItem::Text {
             rect: action_slot_rect(viewport, index),
-            text: slot_title(title),
-            color: Color::BLACK,
-            font_size: ACTION_FONT,
-            weight: 400,
+            text: slot_title(title, strip_style.size as f32),
+            color: render_color(theme.color(ColorRole::OnSurfaceVariant)),
+            font_size: strip_style.size as f32,
+            weight: strip_style.weight as u16,
             href: None,
             underline: false,
             line_through: false,
@@ -289,9 +431,9 @@ pub fn compose_display_list(
         items.push(DisplayItem::Text {
             rect: action_slot_rect(viewport, visible),
             text: format!("+{}", ext_titles.len() - visible),
-            color: Color::BLACK,
-            font_size: ACTION_FONT,
-            weight: 400,
+            color: render_color(theme.color(ColorRole::OnSurfaceVariant)),
+            font_size: strip_style.size as f32,
+            weight: strip_style.weight as u16,
             href: None,
             underline: false,
             line_through: false,
@@ -309,6 +451,9 @@ pub fn compose_display_list(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hodo_types::Color;
+    use std::fs;
+    use std::path::Path;
 
     #[test]
     fn scroll_clamp_uses_the_visible_band_and_never_goes_negative() {
@@ -361,5 +506,153 @@ mod tests {
         let (href, owner) = hit_test(&composed, 10.0, 210.0);
         assert_eq!(href.as_deref(), Some("/page-only"));
         assert_eq!(owner, Some(NodeId(12)), "page segment uses node_map");
+    }
+
+    #[test]
+    fn current_theme_follows_the_design_json_flag() {
+        let expected = if crate::hpages::read_dark_enabled() {
+            tokens::DARK
+        } else {
+            tokens::LIGHT
+        };
+        assert_eq!(current_theme(), expected);
+    }
+
+    #[test]
+    fn chrome_colors_and_type_flow_from_the_theme() {
+        let size = Size {
+            w: 1200.0,
+            h: 800.0,
+        };
+        let ext = vec!["Ext".to_string()];
+        for theme in [tokens::LIGHT, tokens::DARK] {
+            let composed = compose_display_list_with_theme(
+                &DisplayList::default(),
+                size,
+                "https://hodo.test",
+                &ext,
+                0.0,
+                "tab 1/1",
+                theme,
+            );
+            let chrome = &composed.items[composed.items.len() - chrome_item_count(size, &ext)..];
+            let DisplayItem::Rect { color: bar, .. } = chrome[0] else {
+                panic!("top bar must be a rect");
+            };
+            assert_eq!(bar, render_color(theme.color(ColorRole::SurfaceContainer)));
+            let DisplayItem::Text {
+                color: url,
+                font_size,
+                weight,
+                ..
+            } = &chrome[1]
+            else {
+                panic!("URL must be a text item");
+            };
+            let url_style = theme.type_style(TypeRole::Url);
+            assert_eq!(*url, render_color(theme.color(ColorRole::OnSurface)));
+            assert_eq!(
+                (*font_size, *weight),
+                (url_style.size as f32, url_style.weight as u16)
+            );
+            let DisplayItem::Rect { color: bottom, .. } = chrome[3] else {
+                panic!("bottom bar must be a rect");
+            };
+            assert_eq!(
+                bottom,
+                render_color(theme.color(ColorRole::SurfaceContainer))
+            );
+            let DisplayItem::Text {
+                color: ext_color, ..
+            } = chrome[4]
+            else {
+                panic!("extension title must be a text item");
+            };
+            assert_eq!(
+                ext_color,
+                render_color(theme.color(ColorRole::OnSurfaceVariant))
+            );
+        }
+    }
+
+    #[test]
+    fn window_class_drives_spacing_and_pill_width_but_not_bar_heights() {
+        let large = chrome_metrics(Size {
+            w: 1200.0,
+            h: 800.0,
+        });
+        assert_eq!(large.name, "large");
+        assert_eq!((large.pad, large.gap, large.url_max), (16.0, 8.0, 720.0));
+        let compact = chrome_metrics(Size { w: 500.0, h: 400.0 });
+        assert_eq!(compact.name, "compact");
+        assert_eq!(
+            (compact.pad, compact.gap, compact.url_max),
+            (8.0, 4.0, 480.0)
+        );
+        assert!(
+            url_pill_rect(Size {
+                w: 1200.0,
+                h: 800.0
+            })
+            .w <= large.url_max
+        );
+        assert!(url_pill_rect(Size { w: 500.0, h: 400.0 }).w <= compact.url_max);
+        assert_eq!((TOP_BAR_H, BOTTOM_BAR_H), (40.0, 28.0));
+    }
+
+    #[test]
+    fn chrome_item_count_matches_the_composed_suffix() {
+        let size = Size { w: 400.0, h: 300.0 };
+        let ext = vec!["a".into(), "b".into(), "c".into()];
+        let composed =
+            compose_display_list(&DisplayList::default(), size, "", &ext, 0.0, "tab 1/1");
+        assert_eq!(chrome_item_count(size, &ext), composed.items.len());
+    }
+
+    // Mirror of `hodo-ui/tests/no_raw_hex.rs`, scoped to the shell chrome code:
+    // present.rs has unrelated ARGB constants in the frame packer, so only the
+    // explicitly delimited chrome draw region is checked there.
+    fn contains_hex(s: &str) -> bool {
+        let b = s.as_bytes();
+        for i in 0..b.len() {
+            let digits_at = if b[i] == b'#' {
+                i + 1
+            } else if b[i] == b'0' && i + 1 < b.len() && (b[i + 1] == b'x' || b[i + 1] == b'X') {
+                i + 2
+            } else {
+                continue;
+            };
+            if digits_at + 6 <= b.len()
+                && b[digits_at..digits_at + 6]
+                    .iter()
+                    .all(|c| c.is_ascii_hexdigit())
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn no_raw_hex_in_chrome_drawing() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let ui_src = fs::read_to_string(root.join("src/ui.rs")).expect("read ui.rs");
+        let present_src = fs::read_to_string(root.join("src/present.rs")).expect("read present.rs");
+        let begin = present_src
+            .find("// BEGIN CHROME DRAW")
+            .expect("chrome draw start marker");
+        let end = present_src
+            .find("// END CHROME DRAW")
+            .expect("chrome draw end marker");
+        assert!(begin < end, "chrome draw markers out of order");
+        let chrome_src = &present_src[begin..end];
+        assert!(
+            !contains_hex(&ui_src),
+            "raw hex in ui.rs chrome composition"
+        );
+        assert!(
+            !contains_hex(chrome_src),
+            "raw hex in present.rs chrome drawing"
+        );
     }
 }

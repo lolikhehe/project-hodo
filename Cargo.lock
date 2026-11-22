@@ -1313,6 +1313,7 @@ name = "hodo-shell"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "fontdue",
  "hodo-adblock",
  "hodo-cache",
  "hodo-css",
@@ -1321,12 +1322,14 @@ dependencies = [
  "hodo-ext-host",
  "hodo-ext-manifest",
  "hodo-html",
+ "hodo-icons",
  "hodo-js",
  "hodo-layout",
  "hodo-net",
  "hodo-render",
  "hodo-style",
  "hodo-types",
+ "hodo-ui",
  "lz4_flex",
  "serde",
  "serde_json",
