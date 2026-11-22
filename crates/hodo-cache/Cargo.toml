@@ -6,6 +6,15 @@ license.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+# Pinned current release (already pinned in Cargo.lock). Read-only mmap for
+# warm cache-body hits; the single audited `unsafe` call lives in src/mmap.rs.
+memmap2 = "=0.9.12"
 
-[lints]
-workspace = true
+# The workspace lints forbid all unsafe. We mirror them with `deny` here so the
+# one memmap2 call can opt out via a narrowly scoped `#[allow(unsafe_code)]`.
+# This is the only crate-level deviation; every other lint stays identical.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

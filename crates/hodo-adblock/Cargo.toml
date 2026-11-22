@@ -1,0 +1,11 @@
+[package]
+name = "hodo-adblock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aho-corasick = "1.1.5"
+
+[lints]
+workspace = true

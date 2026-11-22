@@ -6,9 +6,16 @@ license.workspace = true
 
 [dependencies]
 thiserror.workspace = true
-ureq = "3.5.2"
+# TLS pin: ureq 3.5.2's default features already select rustls 0.23.46 +
+# webpki-roots. Request the `rustls` feature explicitly; native-tls and the
+# platform verifier are NOT enabled. Pin rustls =0.23.46 (the Cargo.lock version).
+# Re-audit this pin when upgrading ureq or rustls.
+ureq = { version = "3.5.2", features = ["rustls"] }
+rustls = "=0.23.46"
 # Internal dependency for the opt-in load_with() cache API; no new external crates.
 hodo-cache = { path = "../hodo-cache" }
+hodo-cookie = { path = "../hodo-cookie" }
+hodo-adblock = { path = "../hodo-adblock" }
 
 [lints]
 workspace = true

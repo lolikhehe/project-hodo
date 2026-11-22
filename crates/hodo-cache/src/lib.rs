@@ -20,11 +20,14 @@
 //! (never panic). Paths are derived **only** from the hash, so `..`, `%2e%2e`,
 //! backslashes and huge URLs cannot escape the cache directory.
 
-use std::collections::BTreeMap;
+mod mmap;
+
+use memmap2::Mmap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Default disk quota (the ТЗ allows 128–256 MiB).
@@ -35,8 +38,17 @@ pub const MAX_ENTRY_BYTES: u64 = 2 * 1024 * 1024;
 const MAGIC: &[u8; 4] = b"HDC2";
 const VERSION: u32 = 2;
 const HEADER_LEN: usize = 32;
+/// Marker for an evicted entry whose unlink was deferred (live mmap on Windows).
+const DEAD_SUFFIX: &str = ".dead";
+/// Temp files created by streaming/atomic writes are reaped on the next open.
+const TEMP_MARK: &str = ".tmp-";
 const MAX_STRING: usize = 64 * 1024;
 const MAX_MAP_ITEMS: usize = 1024;
+/// Upper bound on the length-prefixed metadata block, so a corrupt header can
+/// never make the mmap reader allocate an unbounded buffer.
+const MAX_META_LEN: usize = 1024 * 1024;
+/// Network chunks are streamed in 64 KiB pieces; peak RAM is one such buffer.
+pub const STREAM_CHUNK_LEN: usize = 64 * 1024;
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x1000_0000_01b3;
@@ -134,7 +146,14 @@ impl CacheEntry {
 
     /// RFC 9111 §4.3.4: merge 304 headers into the stored response. Fields
     /// absent from the 304 keep their stored values; the body is untouched.
-    pub fn merge_headers(&mut self, headers: &BTreeMap<String, String>, clock: &dyn Clock) {
+    /// A `Vary` on the 304 replaces the stored Vary selection, so a changed
+    /// `Vary` cannot keep false-hitting on an old selection.
+    pub fn merge_headers(
+        &mut self,
+        headers: &BTreeMap<String, String>,
+        request_headers: &BTreeMap<String, String>,
+        clock: &dyn Clock,
+    ) {
         for (name, value) in headers {
             if name == "content-length" || name == "set-cookie" {
                 continue;
@@ -147,8 +166,28 @@ impl CacheEntry {
                 _ => {}
             }
         }
+        if let Some(vary) = headers.get("vary") {
+            self.vary = vary_selection(vary, request_headers);
+        }
         self.stored_at = clock.now_unix();
     }
+}
+
+/// Recompute the stored Vary selection from a (possibly new) `Vary` header and
+/// the headers of the revalidation request. An unusable selection (`*`) is
+/// stored as a never-matching sentinel so it becomes a conservative miss.
+fn vary_selection(
+    vary: &str,
+    request_headers: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    vary.split(',')
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .map(|name| {
+            let value = request_headers.get(&name).cloned().unwrap_or_default();
+            (name, value)
+        })
+        .collect()
 }
 
 /// Minimal ETag sanity check used when merging a 304. Weak (`W/"x"`) accepted;
@@ -162,6 +201,78 @@ fn parse_quoted_etag(value: &str) -> Option<String> {
         None
     }
 }
+
+/// Body bytes for a warm cache hit: a read-only mmap when the OS allows it, an
+/// owned `Vec` when it does not. Borrow as `&[u8]` — no full-file copy.
+pub enum MappedBody {
+    Mapped(Mmap),
+    Owned(Vec<u8>),
+}
+
+impl MappedBody {
+    /// The body bytes, with a lifetime tied to this mapping/allocation.
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Mapped(map) => map,
+            Self::Owned(bytes) => bytes,
+        }
+    }
+
+    /// `true` when the zero-copy mmap path was used.
+    pub fn is_mapped(&self) -> bool {
+        matches!(self, Self::Mapped(_))
+    }
+
+    fn into_vec(self) -> Vec<u8> {
+        match self {
+            Self::Mapped(map) => map.to_vec(),
+            Self::Owned(bytes) => bytes,
+        }
+    }
+}
+
+/// Metadata plus a zero-copy body view for a warm cache hit.
+pub struct MappedEntry {
+    /// Stored metadata. `data` is intentionally empty; the body lives in `body`.
+    pub meta: CacheEntry,
+    body: MappedBody,
+}
+
+impl MappedEntry {
+    pub fn metadata(&self) -> &CacheEntry {
+        &self.meta
+    }
+
+    /// The body bytes — the `mapped_body(handle)` view used by warm loaders.
+    pub fn mapped_body(&self) -> &[u8] {
+        self.body.as_bytes()
+    }
+
+    pub fn is_mapped(&self) -> bool {
+        self.body.is_mapped()
+    }
+
+    pub fn is_fresh(&self, clock: &dyn Clock) -> bool {
+        self.meta.is_fresh(clock)
+    }
+
+    /// Materialize a full `CacheEntry` (used only by 304 revalidation, which
+    /// writes the entry back to disk).
+    pub fn into_owned(self) -> CacheEntry {
+        let mut meta = self.meta;
+        meta.data = self.body.into_vec();
+        meta
+    }
+}
+
+/// Test hook: force every `get_mapped` down the read() fallback path. This
+/// simulates the Windows lock/AV case deterministically.
+#[doc(hidden)]
+pub fn set_forced_mmap_fallback(forced: bool) {
+    FORCED_MMAP_FALLBACK.store(forced, Ordering::Relaxed);
+}
+
+static FORCED_MMAP_FALLBACK: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CacheStats {
@@ -249,6 +360,42 @@ impl DiskCache {
             if !shard.path().is_dir() {
                 continue;
             }
+            // Reap leftovers from crashes and from evictions deferred on
+            // Windows (a live mmap can keep the file open past unlink). Do this
+            // before indexing so neither a temp nor a tombstoned file is
+            // re-admitted.
+            let mut reaped: HashSet<String> = HashSet::new();
+            let files = match fs::read_dir(shard.path()) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            for file in files.flatten() {
+                let name = file.file_name().to_string_lossy().into_owned();
+                if let Some(hex) = name.strip_suffix(DEAD_SUFFIX) {
+                    reaped.insert(hex.to_string());
+                }
+                if name.contains(TEMP_MARK) {
+                    let path = file.path();
+                    let stale = path
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .map(|t| {
+                            t.elapsed()
+                                .is_ok_and(|age| age >= Duration::from_secs(24 * 60 * 60))
+                        })
+                        .unwrap_or(true);
+                    let hex_name = name.split(TEMP_MARK).next().unwrap_or("");
+                    let target = path.with_file_name(hex_name);
+                    let unlinked = !target.exists();
+                    if stale || unlinked {
+                        let _ = fs::remove_file(&path);
+                    }
+                }
+            }
+            for hex in &reaped {
+                let _ = fs::remove_file(shard.path().join(hex));
+            }
+
             let files = match fs::read_dir(shard.path()) {
                 Ok(f) => f,
                 Err(_) => continue,
@@ -260,6 +407,9 @@ impl DiskCache {
                 };
                 if name.len() != 16 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
                     continue; // temp files and foreign files are never indexed
+                }
+                if reaped.contains(name) {
+                    continue; // deferred unlink not yet possible (file still mapped)
                 }
                 let Some((entry, checksum)) = read_entry_file(&path) else {
                     let _ = fs::remove_file(&path);
@@ -276,6 +426,13 @@ impl DiskCache {
                 self.total = self.total.saturating_add(entry.data.len() as u64);
                 self.tick = self.tick.max(entry.stored_at);
             }
+            // Drop markers only once their target is really gone; otherwise
+            // keep them so the next open still suppresses re-admission.
+            for hex in &reaped {
+                if !shard.path().join(hex).exists() {
+                    let _ = fs::remove_file(shard.path().join(format!("{hex}{DEAD_SUFFIX}")));
+                }
+            }
         }
         Ok(())
     }
@@ -288,7 +445,13 @@ impl DiskCache {
     fn remove_at(&mut self, pos: usize) {
         let hash = self.index[pos].hash;
         self.forget_at(pos);
-        let _ = fs::remove_file(self.entry_path(hash));
+        let path = self.entry_path(hash);
+        if fs::remove_file(&path).is_err() {
+            // Windows: a live read-only mmap may hold the file open, so unlink
+            // fails with a sharing violation. Tombstone it; the next open()
+            // reaps it instead of re-admitting it from the index rebuild.
+            let _ = fs::write(path.with_extension("dead"), b"");
+        }
     }
 
     fn evict_one(&mut self) {
@@ -322,7 +485,12 @@ impl DiskCache {
         let bytes = encode_entry(entry)?;
         // Write first; only touch the in-RAM index after a durable write.
         atomic_write(&self.entry_path(hash), &bytes)?;
+        self.install_index(key, hash, size, fnv1a_64(&bytes[HEADER_LEN..]));
+        Ok(())
+    }
 
+    /// Shared index maintenance for `put` and the streaming commit path.
+    fn install_index(&mut self, key: &CacheKey, hash: u64, size: u64, checksum: u64) {
         // Forget old metadata only: the new file already replaced it on disk.
         if let Some(pos) = self
             .index
@@ -340,7 +508,7 @@ impl DiskCache {
             hash,
             key: key.clone(),
             size,
-            checksum: fnv1a_64(&bytes[HEADER_LEN..]),
+            checksum,
             last_used: self.tick,
         });
         self.total = self.total.saturating_add(size);
@@ -349,7 +517,6 @@ impl DiskCache {
         }
         self.stats.bytes = self.total;
         GLOBAL_BYTES.store(self.total, Ordering::Relaxed);
-        Ok(())
     }
 
     /// Looks up an entry and refreshes its LRU position. A found entry counts
@@ -378,6 +545,72 @@ impl DiskCache {
         self.stats.hits += 1;
         bump(&GLOBAL_HITS);
         Some(entry)
+    }
+
+    /// Warm-hit lookup: metadata plus a zero-copy `&[u8]` body view.
+    ///
+    /// Unlike [`DiskCache::get`], the body is not read into a `Vec`. The
+    /// read-only mapping owns its bytes; if mmap is refused (Windows lock/AV
+    /// sharing violations) we retry briefly and fall back to `read()`. A
+    /// later hit tries mmap again. "Read-only" plus the single-writer rename
+    /// contract keeps the mapping valid for its whole owned lifetime.
+    pub fn get_mapped(&mut self, key: &CacheKey) -> Option<MappedEntry> {
+        let hash = key.hash();
+        let pos = self
+            .index
+            .iter()
+            .position(|e| e.hash == hash && e.key == *key)?;
+        let path = self.entry_path(hash);
+        let Some((meta, body, checksum)) = read_entry_mapped(&path) else {
+            self.remove_at(pos);
+            self.stats.misses += 1;
+            bump(&GLOBAL_MISSES);
+            return None;
+        };
+        if body.as_bytes().len() as u64 != self.index[pos].size
+            || checksum != self.index[pos].checksum
+        {
+            self.remove_at(pos);
+            self.stats.misses += 1;
+            bump(&GLOBAL_MISSES);
+            return None;
+        }
+        self.tick += 1;
+        self.index[pos].last_used = self.tick;
+        self.stats.hits += 1;
+        bump(&GLOBAL_HITS);
+        Some(MappedEntry { meta, body })
+    }
+
+    /// Begin a write-through streaming entry. The response body is fed to
+    /// [`StreamWriter::write`] in chunks and committed with [`StreamWriter::commit`];
+    /// only one chunk is ever resident. `entry.data` is ignored (the body is
+    /// supplied by the stream); all other fields become the stored metadata.
+    pub fn stream_put<'a>(
+        &'a mut self,
+        key: &CacheKey,
+        entry: &CacheEntry,
+    ) -> Result<StreamWriter<'a>, CacheError> {
+        let meta = encode_metadata(entry)?;
+        let target = self.entry_path(key.hash());
+        let temp = temp_path_for(&target)?;
+        let mut file = File::create(&temp).map_err(|e| CacheError::Io(e.to_string()))?;
+        // Reserve the header; commit() seeks back and fills in the real values
+        // once body_len and the rolling checksum are known.
+        file.write_all(&[0u8; HEADER_LEN])
+            .and_then(|()| file.write_all(&meta))
+            .map_err(|e| CacheError::Io(e.to_string()))?;
+        Ok(StreamWriter {
+            cache: self,
+            key: key.clone(),
+            target,
+            temp,
+            file: Some(file),
+            meta_len: meta.len(),
+            checksum: fnv_fold(FNV_OFFSET, &meta),
+            body_len: 0,
+            committed: false,
+        })
     }
 
     /// Invalidate one key (used by future non-GET / unsafe methods).
@@ -435,7 +668,73 @@ impl DiskCache {
     }
 }
 
-fn encode_entry(entry: &CacheEntry) -> Result<Vec<u8>, CacheError> {
+/// A cache entry being written straight from a response body to a temp file.
+/// RAM peak is the caller's chunk buffer (64 KiB in hodo-net), never the body.
+pub struct StreamWriter<'a> {
+    cache: &'a mut DiskCache,
+    key: CacheKey,
+    target: PathBuf,
+    temp: PathBuf,
+    file: Option<File>,
+    meta_len: usize,
+    /// FNV-1a state after metadata, folded with each body chunk.
+    checksum: u64,
+    body_len: u64,
+    committed: bool,
+}
+
+impl StreamWriter<'_> {
+    /// Append one body chunk. Enforces the same 2 MiB / quota caps as `put`.
+    pub fn write(&mut self, chunk: &[u8]) -> Result<(), CacheError> {
+        let next = self.body_len.saturating_add(chunk.len() as u64);
+        if next > MAX_ENTRY_BYTES || next > self.cache.max_total_bytes {
+            return Err(CacheError::TooLarge);
+        }
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| CacheError::Io("stream already closed".into()))?;
+        file.write_all(chunk)
+            .map_err(|e| CacheError::Io(e.to_string()))?;
+        self.body_len = next;
+        self.checksum = fnv_fold(self.checksum, chunk);
+        Ok(())
+    }
+
+    /// Fill in the header, sync, atomically rename into place and index the entry.
+    pub fn commit(mut self) -> Result<(), CacheError> {
+        let mut file = self
+            .file
+            .take()
+            .ok_or_else(|| CacheError::Io("stream already closed".into()))?;
+        let mut head = Vec::with_capacity(HEADER_LEN);
+        head.extend_from_slice(MAGIC);
+        head.extend_from_slice(&VERSION.to_le_bytes());
+        head.extend_from_slice(&(self.meta_len as u64).to_le_bytes());
+        head.extend_from_slice(&self.body_len.to_le_bytes());
+        head.extend_from_slice(&self.checksum.to_le_bytes());
+        file.seek(SeekFrom::Start(0))
+            .and_then(|_| file.write_all(&head))
+            .and_then(|()| file.sync_all())
+            .map_err(|e| CacheError::Io(e.to_string()))?;
+        drop(file);
+        rename_temp_with_retry(&self.temp, &self.target)?;
+        self.committed = true;
+        self.cache
+            .install_index(&self.key, self.key.hash(), self.body_len, self.checksum);
+        Ok(())
+    }
+}
+
+impl Drop for StreamWriter<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.temp);
+        }
+    }
+}
+
+fn encode_metadata(entry: &CacheEntry) -> Result<Vec<u8>, CacheError> {
     let mut meta = Vec::new();
     put_str(&mut meta, &entry.url)?;
     put_u16(&mut meta, entry.status_code);
@@ -448,7 +747,11 @@ fn encode_entry(entry: &CacheEntry) -> Result<Vec<u8>, CacheError> {
     put_str(&mut meta, &entry.request_method)?;
     put_map(&mut meta, &entry.vary)?;
     put_map(&mut meta, &entry.headers)?;
+    Ok(meta)
+}
 
+fn encode_entry(entry: &CacheEntry) -> Result<Vec<u8>, CacheError> {
+    let meta = encode_metadata(entry)?;
     let mut out = Vec::with_capacity(HEADER_LEN + meta.len() + entry.data.len());
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
@@ -459,6 +762,40 @@ fn encode_entry(entry: &CacheEntry) -> Result<Vec<u8>, CacheError> {
     out.extend_from_slice(&meta);
     out.extend_from_slice(&entry.data);
     Ok(out)
+}
+
+/// Decode the metadata block. The returned entry has an empty body; callers
+/// attach it from the file bytes or the mmap view.
+fn parse_metadata(bytes: &[u8]) -> Option<CacheEntry> {
+    let mut cursor = Cursor { bytes, pos: 0 };
+    let url = cursor.string()?;
+    let status_code = cursor.u16()?;
+    let expires_at = cursor.u64()?;
+    let stored_at = cursor.u64()?;
+    let content_type = cursor.string()?;
+    let etag = cursor.opt_string()?;
+    let last_modified = cursor.opt_string()?;
+    let partition_key = cursor.string()?;
+    let request_method = cursor.string()?;
+    let vary = cursor.map()?;
+    let headers = cursor.map()?;
+    if cursor.pos != bytes.len() {
+        return None;
+    }
+    Some(CacheEntry {
+        url,
+        content_type,
+        data: Vec::new(),
+        status_code,
+        expires_at: (expires_at != 0).then_some(expires_at),
+        etag,
+        last_modified,
+        vary,
+        headers,
+        partition_key,
+        request_method,
+        stored_at,
+    })
 }
 
 fn read_entry_file(path: &Path) -> Option<(CacheEntry, u64)> {
@@ -472,7 +809,7 @@ fn read_entry_file(path: &Path) -> Option<(CacheEntry, u64)> {
     let meta_len = u64::from_le_bytes(bytes[8..16].try_into().ok()?) as usize;
     let body_len = u64::from_le_bytes(bytes[16..24].try_into().ok()?) as usize;
     let expected = u64::from_le_bytes(bytes[24..32].try_into().ok()?);
-    if meta_len > bytes.len() - HEADER_LEN {
+    if meta_len > bytes.len() - HEADER_LEN || meta_len > MAX_META_LEN {
         return None;
     }
     let body_start = HEADER_LEN + meta_len;
@@ -484,41 +821,84 @@ fn read_entry_file(path: &Path) -> Option<(CacheEntry, u64)> {
     if fnv_fold(fnv_fold(FNV_OFFSET, meta), body) != expected {
         return None;
     }
-    let mut cursor = Cursor {
-        bytes: meta,
-        pos: 0,
-    };
-    let url = cursor.string()?;
-    let status_code = cursor.u16()?;
-    let expires_at = cursor.u64()?;
-    let stored_at = cursor.u64()?;
-    let content_type = cursor.string()?;
-    let etag = cursor.opt_string()?;
-    let last_modified = cursor.opt_string()?;
-    let partition_key = cursor.string()?;
-    let request_method = cursor.string()?;
-    let vary = cursor.map()?;
-    let headers = cursor.map()?;
-    if cursor.pos != meta.len() {
+    let mut entry = parse_metadata(meta)?;
+    entry.data = body.to_vec();
+    Some((entry, expected))
+}
+
+/// Read a header + metadata block, then map (or, on failure, read) just the
+/// body. Returns metadata, the owned body view and the verified checksum.
+fn read_entry_mapped(path: &Path) -> Option<(CacheEntry, MappedBody, u64)> {
+    let mut file = File::open(path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    if file_len < HEADER_LEN as u64 {
         return None;
     }
-    Some((
-        CacheEntry {
-            url,
-            content_type,
-            data: body.to_vec(),
-            status_code,
-            expires_at: (expires_at != 0).then_some(expires_at),
-            etag,
-            last_modified,
-            vary,
-            headers,
-            partition_key,
-            request_method,
-            stored_at,
-        },
-        expected,
-    ))
+    let mut head = [0u8; HEADER_LEN];
+    file.read_exact(&mut head).ok()?;
+    if &head[..4] != MAGIC || u32::from_le_bytes(head[4..8].try_into().ok()?) != VERSION {
+        return None;
+    }
+    let meta_len = u64::from_le_bytes(head[8..16].try_into().ok()?) as usize;
+    let body_len = u64::from_le_bytes(head[16..24].try_into().ok()?) as usize;
+    let expected = u64::from_le_bytes(head[24..32].try_into().ok()?);
+    if meta_len > MAX_META_LEN {
+        return None;
+    }
+    let body_start = HEADER_LEN.checked_add(meta_len)?;
+    let total = body_start.checked_add(body_len)?;
+    if total as u64 != file_len {
+        return None;
+    }
+
+    let mut meta_bytes = vec![0u8; meta_len];
+    file.seek(SeekFrom::Start(HEADER_LEN as u64)).ok()?;
+    file.read_exact(&mut meta_bytes).ok()?;
+    let meta = parse_metadata(&meta_bytes)?;
+    let mut checksum = fnv_fold(FNV_OFFSET, &meta_bytes);
+
+    let body = if body_len == 0 {
+        MappedBody::Owned(Vec::new())
+    } else if FORCED_MMAP_FALLBACK.load(Ordering::Relaxed) {
+        MappedBody::Owned(read_body(&mut file, body_start, body_len)?)
+    } else {
+        // Windows lock/AV cases: retry briefly, then fall back to read(). The
+        // next warm access tries mmap again — no permanent downgrade.
+        let mut mapped = None;
+        for attempt in 0..3 {
+            match mmap::map_read_only(&file, body_start as u64, body_len) {
+                Ok(map) => {
+                    mapped = Some(map);
+                    break;
+                }
+                Err(error) if is_lock_error(&error) && attempt < 2 => {
+                    std::thread::sleep(Duration::from_millis(2 * (attempt + 1)));
+                }
+                Err(_) => break,
+            }
+        }
+        match mapped {
+            Some(map) => {
+                checksum = fnv_fold(checksum, &map[..]);
+                MappedBody::Mapped(map)
+            }
+            None => MappedBody::Owned(read_body(&mut file, body_start, body_len)?),
+        }
+    };
+    if !matches!(body, MappedBody::Mapped(_)) {
+        checksum = fnv_fold(checksum, body.as_bytes());
+    }
+    if checksum != expected {
+        return None;
+    }
+    Some((meta, body, expected))
+}
+
+fn read_body(file: &mut File, offset: usize, len: usize) -> Option<Vec<u8>> {
+    let mut bytes = vec![0u8; len];
+    file.seek(SeekFrom::Start(offset as u64)).ok()?;
+    file.read_exact(&mut bytes).ok()?;
+    Some(bytes)
 }
 
 struct Cursor<'a> {
@@ -616,16 +996,7 @@ fn is_lock_error(error: &std::io::Error) -> bool {
         || error.raw_os_error() == Some(33) // ERROR_LOCK_VIOLATION
 }
 
-fn write_temp_and_rename(temp: &Path, target: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut file = File::create(temp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    // std::fs::rename uses MOVEFILE_REPLACE_EXISTING on Windows.
-    fs::rename(temp, target)
-}
-
-fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), CacheError> {
+fn temp_path_for(target: &Path) -> Result<PathBuf, CacheError> {
     let dir = target
         .parent()
         .ok_or_else(|| CacheError::Io("no parent".into()))?;
@@ -635,21 +1006,39 @@ fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), CacheError> {
         .and_then(|n| n.to_str())
         .ok_or_else(|| CacheError::Io("bad name".into()))?;
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let temp = dir.join(format!("{name}.tmp-{}-{n}", std::process::id()));
+    Ok(dir.join(format!("{name}.tmp-{}-{n}", std::process::id())))
+}
+
+/// std::fs::rename uses MOVEFILE_REPLACE_EXISTING on Windows. Lock/AV hiccups
+/// get the same bounded backoff as before; the caller discards the temp file.
+fn rename_temp_with_retry(temp: &Path, target: &Path) -> Result<(), CacheError> {
     for attempt in 0..6 {
-        match write_temp_and_rename(&temp, target, bytes) {
+        match fs::rename(temp, target) {
             Ok(()) => return Ok(()),
             Err(error) if is_lock_error(&error) && attempt < 5 => {
                 std::thread::sleep(Duration::from_millis(5 * (attempt + 1)));
-                let _ = fs::remove_file(&temp);
             }
             Err(error) => {
-                let _ = fs::remove_file(&temp);
+                let _ = fs::remove_file(temp);
                 return Err(CacheError::Io(error.to_string()));
             }
         }
     }
     Err(CacheError::Io("rename retries exhausted".into()))
+}
+
+fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), CacheError> {
+    let temp = temp_path_for(target)?;
+    let write = (|| -> std::io::Result<()> {
+        let mut file = File::create(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    })();
+    if let Err(error) = write {
+        let _ = fs::remove_file(&temp);
+        return Err(CacheError::Io(error.to_string()));
+    }
+    rename_temp_with_retry(&temp, target)
 }
 
 #[cfg(test)]
@@ -681,8 +1070,11 @@ impl Clock for FakeClock {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::time::Instant;
 
     static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
+    /// Serialize tests that touch the global forced-fallback flag.
+    static MMAP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct TempCache {
         root: PathBuf,
@@ -924,11 +1316,32 @@ mod tests {
         headers.insert("etag".into(), "\"v2\"".into());
         headers.insert("cache-control".into(), "max-age=60".into());
         headers.insert("set-cookie".into(), "secret=1".into());
-        e.merge_headers(&headers, &clock);
+        e.merge_headers(&headers, &BTreeMap::new(), &clock);
         assert_eq!(e.data, b"body");
         assert_eq!(e.etag.as_deref(), Some("\"v2\""));
         assert!(!e.headers.contains_key("set-cookie"));
         assert_eq!(e.stored_at, 1_000);
+    }
+
+    #[test]
+    fn merge_304_updates_the_vary_selection() {
+        let clock = FakeClock::new(1_000);
+        let mut e = entry(b"body", "text/plain");
+        e.vary.insert("accept-encoding".into(), "gzip".into());
+        let mut headers = BTreeMap::new();
+        headers.insert("vary".into(), "Accept-Language".into());
+        let mut request = BTreeMap::new();
+        request.insert("accept-language".into(), "en-GB".into());
+        request.insert("accept-encoding".into(), "br".into());
+        e.merge_headers(&headers, &request, &clock);
+        assert_eq!(
+            e.vary.get("accept-language").map(String::as_str),
+            Some("en-GB")
+        );
+        assert!(
+            !e.vary.contains_key("accept-encoding"),
+            "stale Vary selection must be replaced"
+        );
     }
 
     #[test]
@@ -948,5 +1361,171 @@ mod tests {
             let _ = read_entry_file(&path);
         }
         assert!(t.cache.get(&k).is_none());
+    }
+
+    // --- mmap warm reads ---------------------------------------------------
+
+    #[test]
+    fn mapped_body_roundtrip_is_zero_copy() {
+        let _guard = MMAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut t = TempCache::new(8 * 1024 * 1024);
+        let k = key("https://x/big.html");
+        let body = vec![b'x'; 512 * 1024];
+        let mut e = entry(&body, "text/html");
+        e.url = k.url.clone();
+        t.cache.put(&k, &e).unwrap();
+
+        let mapped = t.cache.get_mapped(&k).unwrap();
+        assert!(
+            mapped.is_mapped(),
+            "expected the mmap path on this platform"
+        );
+        assert_eq!(mapped.mapped_body(), body);
+        assert_eq!(mapped.metadata().content_type, "text/html");
+        assert!(
+            mapped.metadata().data.is_empty(),
+            "metadata must not carry the body"
+        );
+        assert_eq!(mapped.into_owned().data, body);
+        assert_eq!(t.cache.stats().hits, 1);
+    }
+
+    #[test]
+    fn forced_mmap_failure_falls_back_to_read() {
+        let _guard = MMAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut t = TempCache::new(8 * 1024 * 1024);
+        let k = key("https://x/fallback");
+        let body = vec![b'y'; 128 * 1024];
+        t.cache.put(&k, &entry(&body, "text/plain")).unwrap();
+
+        set_forced_mmap_fallback(true);
+        let mapped = t.cache.get_mapped(&k).unwrap();
+        assert!(!mapped.is_mapped(), "forced failure must use read()");
+        assert_eq!(mapped.mapped_body(), body);
+        set_forced_mmap_fallback(false);
+
+        // A later access retries mmap and succeeds again.
+        assert!(t.cache.get_mapped(&k).unwrap().is_mapped());
+    }
+
+    #[test]
+    fn eviction_with_live_mapping_reaps_orphan_on_open() {
+        let _guard = MMAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut t = TempCache::new(8 * 1024 * 1024);
+        let k = key("https://x/mapped-evict");
+        t.cache
+            .put(&k, &entry(&vec![b'm'; 4096], "text/plain"))
+            .unwrap();
+        let path = t.path_for(&k);
+        let mapped = t.cache.get_mapped(&k).unwrap();
+        assert!(mapped.is_mapped());
+        t.cache.invalidate(&k);
+        // Windows may keep the file alive behind the mapping (tombstoned);
+        // Unix unlinks it immediately. Either way reopen must see no orphan.
+        drop(mapped);
+        let reopened = DiskCache::open(&t.root, 8 * 1024 * 1024).unwrap();
+        assert_eq!(reopened.len(), 0);
+        assert!(!path.exists(), "evicted file must not survive reopen");
+    }
+
+    #[test]
+    fn crash_left_temp_files_are_reaped_on_open() {
+        let t = TempCache::new(4096);
+        let k = key("https://x/temp");
+        let shard = t
+            .root
+            .join("cache")
+            .join(&format!("{:016x}", k.hash())[..2]);
+        fs::create_dir_all(&shard).unwrap();
+        let temp = shard.join(format!("{:016x}.tmp-{}-999", k.hash(), std::process::id()));
+        fs::write(&temp, b"partial").unwrap();
+        assert!(temp.exists());
+        let reopened = DiskCache::open(&t.root, 4096).unwrap();
+        assert_eq!(reopened.len(), 0);
+        assert!(!temp.exists(), "unlinked temp must be reaped on open");
+        drop(reopened);
+    }
+
+    // --- streaming write-through ------------------------------------------
+
+    #[test]
+    fn stream_writer_commits_a_2mib_body_in_64k_chunks() {
+        let _guard = MMAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut t = TempCache::new(8 * 1024 * 1024);
+        let k = key("https://x/stream.bin");
+        let body = vec![0x5a; 2 * 1024 * 1024];
+        let mut e = entry(&[], "application/octet-stream");
+        e.url = k.url.clone();
+
+        let mut writer = t.cache.stream_put(&k, &e).unwrap();
+        for chunk in body.chunks(STREAM_CHUNK_LEN) {
+            assert!(chunk.len() <= STREAM_CHUNK_LEN);
+            writer.write(chunk).unwrap();
+        }
+        writer.commit().unwrap();
+
+        assert_eq!(t.cache.len(), 1);
+        assert_eq!(t.cache.total_bytes(), MAX_ENTRY_BYTES);
+        let got = t.cache.get(&k).unwrap();
+        assert_eq!(got.data, body);
+        assert_eq!(got.content_type, "application/octet-stream");
+        // The committed file is also readable through the mmap warm path.
+        assert_eq!(t.cache.get_mapped(&k).unwrap().mapped_body(), body);
+    }
+
+    #[test]
+    fn stream_writer_over_cap_is_rejected_and_temp_removed() {
+        let mut t = TempCache::new(8 * 1024 * 1024);
+        let k = key("https://x/too-big");
+        let mut writer = t.cache.stream_put(&k, &entry(&[], "text/plain")).unwrap();
+        assert!(matches!(
+            writer.write(&[0u8; (MAX_ENTRY_BYTES + 1) as usize]),
+            Err(CacheError::TooLarge)
+        ));
+        drop(writer);
+        assert!(t.cache.is_empty());
+        assert_eq!(
+            fs::read_dir(
+                t.root
+                    .join("cache")
+                    .join(&format!("{:016x}", k.hash())[..2])
+            )
+            .unwrap()
+            .count(),
+            0
+        );
+    }
+
+    // --- warm-hit perf: big-doc corpus pattern -----------------------------
+
+    #[test]
+    fn warm_hit_mmap_vs_read_perf() {
+        let _guard = MMAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut t = TempCache::new(8 * 1024 * 1024);
+        let k = key("https://x/big-doc");
+        let body = vec![b'a'; 2 * 1024 * 1024];
+        t.cache.put(&k, &entry(&body, "text/html")).unwrap();
+        // Warm the OS page cache and the mapping tables first.
+        for _ in 0..20 {
+            let _ = t.cache.get(&k);
+            let _ = t.cache.get_mapped(&k);
+        }
+        const N: u32 = 200;
+        let start = Instant::now();
+        for _ in 0..N {
+            let e = t.cache.get(&k).unwrap();
+            std::hint::black_box(std::str::from_utf8(&e.data).unwrap().len());
+        }
+        let read_us = start.elapsed().as_secs_f64() * 1_000_000.0 / f64::from(N);
+        let start = Instant::now();
+        for _ in 0..N {
+            let e = t.cache.get_mapped(&k).unwrap();
+            std::hint::black_box(std::str::from_utf8(e.mapped_body()).unwrap().len());
+        }
+        let mmap_us = start.elapsed().as_secs_f64() * 1_000_000.0 / f64::from(N);
+        eprintln!(
+            "warm 2 MiB doc: read {read_us:.1} us/hit vs mmap {mmap_us:.1} us/hit ({:.2}x)",
+            read_us / mmap_us
+        );
     }
 }
