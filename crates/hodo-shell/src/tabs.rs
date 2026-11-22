@@ -509,6 +509,18 @@ impl App {
         self.page_js.as_ref().is_some_and(PageContext::has_timers)
     }
 
+    /// Mirror a script-assigned `document.title` into the active tab's title.
+    /// Empty means no page script ever assigned it, so the parsed `<title>` wins.
+    fn sync_page_title(&mut self) {
+        let Some(title) = self.page_js.as_ref().map(PageContext::document_title) else {
+            return;
+        };
+        let tab = &mut self.tabs[self.active];
+        if !title.is_empty() && tab.title != title {
+            tab.title = title;
+        }
+    }
+
     /// One idle tick: deliver page tasks, then re-pipe only if JS mutated the
     /// DOM. Returns true when the painted list changed.
     pub(crate) fn page_js_tick(&mut self, viewport: Size) -> bool {
@@ -516,6 +528,7 @@ impl App {
             Some(ctx) => ctx.tick(viewport),
             None => None,
         };
+        self.sync_page_title();
         let Some(list) = changed else {
             return false;
         };
@@ -535,6 +548,7 @@ impl App {
             Some(ctx) => ctx.dispatch(node, kind, payload, viewport),
             None => None,
         };
+        self.sync_page_title();
         let Some(list) = changed else {
             return false;
         };

@@ -711,7 +711,23 @@ const MAX_PAGE_SCRIPTS: usize = hodo_types::limits::MAX_EXT_CONTEXTS;
 const MAX_SCRIPT_BYTES: usize = hodo_types::limits::MAX_RESOURCE_BYTES;
 /// Wall budget for a *series* of script evals. A single script is still bounded
 /// by hodo-js's loop (1e6) and recursion (256) runtime limits.
-const PAGE_SCRIPT_BUDGET: Duration = Duration::from_millis(50);
+///
+/// The GUI keeps 50 ms so navigation stays snappy; headless CLI runs
+/// (`--screenshot`, and the future `--eval`/`--dump-dom`) use 250 ms so a
+/// large real-world bundle finishes instead of truncating at the first 50 ms.
+/// Both flow through `page_script_budget_or`, so an explicit
+/// `HODO_JS_BUDGET_MS` still overrides either default.
+const GUI_PAGE_SCRIPT_BUDGET_MS: u64 = 50;
+const HEADLESS_PAGE_SCRIPT_BUDGET_MS: u64 = 250;
+
+fn page_script_budget(headless: bool) -> Duration {
+    let default_ms = if headless {
+        HEADLESS_PAGE_SCRIPT_BUDGET_MS
+    } else {
+        GUI_PAGE_SCRIPT_BUDGET_MS
+    };
+    hodo_js::page_script_budget_or(default_ms)
+}
 
 /// `HODO_NO_PAGE_JS=1` disables the whole page-JS path, including collection:
 /// no realm is built and no extra work is done on script-free pages.
@@ -829,6 +845,12 @@ impl PageContext {
         self.dom.borrow().root()
     }
 
+    /// Last `document.title` assigned by a page script (empty until one does).
+    /// hodo-js has no shell dependency, so the host mirrors this into the tab.
+    pub(crate) fn document_title(&self) -> String {
+        self.runtime.document_title()
+    }
+
     /// Drain timers/promises/queued events, then relayout only if a native
     /// actually changed the DOM. One fingerprint check per frame, so changes
     /// from several tasks coalesce into one relayout.
@@ -910,6 +932,7 @@ fn load_page_with_flag(
     url: &str,
     viewport: Size,
     js_enabled: bool,
+    budget: Duration,
 ) -> (String, DisplayList, Option<PageContext>) {
     // A local directory is a site shorthand (`--screenshot examples/js-site`);
     // resolve it before loading so relative script/src URLs get the right base.
@@ -940,7 +963,11 @@ fn load_page_with_flag(
     // The load above may have followed redirects; every relative URL below
     // must resolve against the URL that actually served this body.
     let base_url = final_base_url(url);
-    let dom = Rc::new(RefCell::new(hodo_html::parse_document(&html)));
+    // Parse with the same scripting flag the rest of the pipeline uses: with
+    // HODO_NO_PAGE_JS=1 `<noscript>` content becomes real, renderable markup.
+    let dom = Rc::new(RefCell::new(hodo_html::parse_document_with(
+        js_enabled, &html,
+    )));
     // Layout has no base-URL parameter, so a relative img[src] would resolve
     // against the process CWD. Rewrite it against the final page URL.
     {
@@ -977,7 +1004,9 @@ fn load_page_with_flag(
         None
     } else {
         let root = dom.borrow().root();
-        let mut runtime = ExtScriptRuntime::new_page(Rc::clone(&dom));
+        // Thread the final (post-redirect) URL so `window.location.href` reports
+        // the page the user actually navigated to, not a `<base>` hint.
+        let mut runtime = ExtScriptRuntime::new_page_with_url(Rc::clone(&dom), base_url.clone());
         let fetch_base = base_url.clone();
         runtime.set_fetch_hook(Rc::new(move |call| page_fetch_hook(call, &fetch_base)));
         // Page scripts cannot exchange extension messages, but drain replies
@@ -985,7 +1014,7 @@ fn load_page_with_flag(
         runtime.set_message_reply_hook(Some(Rc::new(|_: &Value, _: &Value| {})));
         let started = Instant::now();
         for script in scripts {
-            if started.elapsed() > PAGE_SCRIPT_BUDGET {
+            if started.elapsed() > budget {
                 eprintln!("hodo: page script budget exceeded on {url}");
                 break;
             }
@@ -1016,7 +1045,7 @@ pub(crate) fn load_page_live(
     url: &str,
     viewport: Size,
 ) -> (String, DisplayList, Option<PageContext>) {
-    load_page_with_flag(url, viewport, page_js_enabled())
+    load_page_with_flag(url, viewport, page_js_enabled(), page_script_budget(false))
 }
 
 /// Run the whole pipeline for one URL and return `(title, display_list)`.
@@ -1025,7 +1054,9 @@ pub(crate) fn load_page_live(
 /// the mutations — are local to this function and dropped before it returns.
 /// Headless screenshot mode uses this path.
 pub fn load_page(url: &str, viewport: Size) -> (String, DisplayList) {
-    let (title, display_list, _) = load_page_live(url, viewport);
+    // Headless has no frame deadline, so give scripts the longer budget.
+    let (title, display_list, _) =
+        load_page_with_flag(url, viewport, page_js_enabled(), page_script_budget(true));
     (title, display_list)
 }
 
@@ -1057,9 +1088,24 @@ pub fn premultiply_rgba(rgba: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Only classic JavaScript executes: no `type`, an empty `type`, or a JS MIME
+/// type. Per the HTML spec every other value (including `module`, data blocks
+/// like `application/json`, `importmap`, and unknown types) is NOT JavaScript
+/// and must not be eval'd — feeding JSON to the JS parser yields SyntaxErrors.
+fn is_js_script_type(kind: Option<&str>) -> bool {
+    match kind {
+        None => true,
+        Some(value) => {
+            let value = value.trim();
+            value.is_empty()
+                || value.eq_ignore_ascii_case("text/javascript")
+                || value.eq_ignore_ascii_case("application/javascript")
+        }
+    }
+}
+
 /// One walk for the page title and its script sources. Inline text and
-/// `src=` URLs are collected in document order; `type=module` is skipped
-/// (module graph loading is not part of this substrate).
+/// `src=` URLs are collected in document order; non-JS `type`s are skipped.
 fn scan_document(dom: &Dom, js_enabled: bool) -> (String, Vec<ScriptSource>) {
     let mut title = String::new();
     let mut found_title = false;
@@ -1077,10 +1123,7 @@ fn scan_document(dom: &Dom, js_enabled: bool) -> (String, Vec<ScriptSource>) {
         if !js_enabled || dom.tag(id) != Some("script") {
             return;
         }
-        if dom
-            .attr(id, "type")
-            .is_some_and(|kind| kind.eq_ignore_ascii_case("module"))
-        {
+        if !is_js_script_type(dom.attr(id, "type")) {
             return;
         }
         if let Some(src) = dom.attr(id, "src") {
@@ -1144,6 +1187,8 @@ pub(crate) fn collect_styles(dom: &Dom, page_url: &str, viewport: Size) -> Style
         height: viewport.h.round().max(1.0) as u32,
         media_type: hodo_css::MediaType::Screen,
         scripting_enabled: true,
+        // Integrator hook: the chrome dark flag drives prefers-color-scheme.
+        dark: crate::hpages::read_dark_enabled(),
     };
     let mut rules = Vec::new();
     for source in sources {
@@ -1214,7 +1259,7 @@ pub(crate) mod tests {
         let page = dir.join("index.html").to_string_lossy().into_owned();
         let html =
             format!("<html><head>{head}</head><body><p class=\"target\">x</p></body></html>");
-        let dom = hodo_html::parse_document(&html);
+        let dom = hodo_html::parse_document_with(page_js_enabled(), &html);
         let stylesheet = collect_styles(&dom, &page, viewport);
         let styles = hodo_style::compute_styles(&dom, &[stylesheet]);
         let mut target = None;
@@ -1304,7 +1349,7 @@ pub(crate) mod tests {
         let page = dir.join("index.html").to_string_lossy().into_owned();
         let html = "<html><head><link rel=\"stylesheet\" href=\"missing.css\"></head>\
                     <body><p>still here</p></body></html>";
-        let dom = hodo_html::parse_document(html);
+        let dom = hodo_html::parse_document_with(page_js_enabled(), html);
         let stylesheet = collect_styles(&dom, &page, DEFAULT_VIEWPORT);
         let styles = hodo_style::compute_styles(&dom, &[stylesheet]);
         let list = hodo_layout::layout(&dom, &styles, DEFAULT_VIEWPORT);
@@ -1783,7 +1828,12 @@ pub(crate) mod tests {
         let bench = |enabled: bool| {
             let start = Instant::now();
             for _ in 0..24 {
-                let _ = load_page_with_flag(&demo, DEFAULT_VIEWPORT, enabled);
+                let _ = load_page_with_flag(
+                    &demo,
+                    DEFAULT_VIEWPORT,
+                    enabled,
+                    page_script_budget(false),
+                );
             }
             start.elapsed().as_secs_f64()
         };
@@ -1850,6 +1900,54 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn non_js_script_types_are_not_executed() {
+        let _guard = PAGE_JS_ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("hodo-js-site-types-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Every script writes a distinct sentinel into its own element, so a
+        // data block that was wrongly eval'd is observable even if another
+        // script runs later.
+        let mut html = String::from(
+            "<div id='none'>none0</div><div id='empty'>empty0</div>\
+             <div id='textjs'>textjs0</div><div id='appjs'>appjs0</div>\
+             <div id='json'>json0</div><div id='ldjson'>ldjson0</div>\
+             <div id='importmap'>importmap0</div><div id='spec'>spec0</div>\
+             <div id='unknown'>unknown0</div><div id='module'>module0</div>",
+        );
+        let cases = [
+            ("", "none", "NONE-RAN"),
+            (" type=\"\"", "empty", "EMPTY-RAN"),
+            (" type=\"text/javascript\"", "textjs", "TEXTJS-RAN"),
+            (" type=\"application/javascript\"", "appjs", "APPJS-RAN"),
+            (" type=\"application/json\"", "json", "JSON-RAN"),
+            (" type=\"application/ld+json\"", "ldjson", "LDJSON-RAN"),
+            (" type=\"importmap\"", "importmap", "IMPORTMAP-RAN"),
+            (" type=\"speculationrules\"", "spec", "SPEC-RAN"),
+            (" type=\"x/unknown\"", "unknown", "UNKNOWN-RAN"),
+            (" type=\"module\"", "module", "MODULE-RAN"),
+        ];
+        for (attr, id, marker) in cases {
+            html.push_str(&format!(
+                "<script{attr}>document.getElementById('{id}').textContent='{marker}';</script>"
+            ));
+        }
+        let path = dir.join("index.html");
+        std::fs::write(&path, html).unwrap();
+        let url = path.to_string_lossy().into_owned();
+        let (_, list, ctx) = load_page_live(&url, DEFAULT_VIEWPORT);
+        assert!(ctx.is_some(), "classic scripts declare a realm");
+        // Classic JS types run.
+        for marker in ["NONE-RAN", "EMPTY-RAN", "TEXTJS-RAN", "APPJS-RAN"] {
+            assert!(list_has(&list, marker), "{marker} must execute");
+        }
+        // Data blocks (and module) are skipped silently.
+        for (_, _, marker) in cases.iter().skip(4) {
+            assert!(!list_has(&list, marker), "{marker} must NOT execute");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn directory_url_loads_index_html_and_runs_scripts() {
         let _guard = PAGE_JS_ENV_LOCK.lock().unwrap();
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1867,7 +1965,8 @@ pub(crate) mod tests {
         let _guard = PAGE_JS_ENV_LOCK.lock().unwrap();
         let url = js_site_url();
         let (_, js_list, _) = load_page_live(&url, DEFAULT_VIEWPORT);
-        let (_, raw_list, _) = load_page_with_flag(&url, DEFAULT_VIEWPORT, false);
+        let (_, raw_list, _) =
+            load_page_with_flag(&url, DEFAULT_VIEWPORT, false, page_script_budget(false));
         let mut js_frame = hodo_render::render(&js_list, DEFAULT_VIEWPORT);
         let mut raw_frame = hodo_render::render(&raw_list, DEFAULT_VIEWPORT);
         composite_over_white(&mut js_frame);
@@ -1926,5 +2025,97 @@ pub(crate) mod tests {
             "about:test",
         );
         assert_eq!(scripts, ["small"]);
+    }
+
+    // ---- shell seam wiring regressions -----------------------------------
+
+    #[test]
+    fn no_page_js_renders_noscript_content_to_pixels() {
+        let _guard = PAGE_JS_ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("hodo-noscript-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let page = dir.join("index.html");
+        std::fs::write(
+            &page,
+            "<html><body><noscript><p>NOSCRIPT-NOTICE-42</p></noscript></body></html>",
+        )
+        .unwrap();
+        let url = page.to_string_lossy().into_owned();
+
+        std::env::set_var("HODO_NO_PAGE_JS", "1");
+        let (_, off_list) = load_page(&url, DEFAULT_VIEWPORT);
+        std::env::remove_var("HODO_NO_PAGE_JS");
+        assert!(
+            list_has(&off_list, "NOSCRIPT-NOTICE-42"),
+            "with page scripting off, <noscript> content must be real markup"
+        );
+        let mut frame = hodo_render::render(&off_list, DEFAULT_VIEWPORT);
+        composite_over_white(&mut frame);
+        assert!(
+            frame.as_chunks::<4>().0.iter().any(|px| px[0] < 200),
+            "the noscript notice must reach painted pixels"
+        );
+
+        let (_, on_list) = load_page(&url, DEFAULT_VIEWPORT);
+        assert!(
+            !list_has(&on_list, "NOSCRIPT-NOTICE-42"),
+            "with page scripting on, <noscript> content stays hidden"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn page_script_sees_the_navigated_url_as_window_location_href() {
+        let _guard = PAGE_JS_ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("hodo-js-location-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let page = dir.join("index.html");
+        std::fs::write(
+            &page,
+            "<div id='out'>none</div>\
+             <script>document.getElementById('out').textContent = window.location.href;</script>",
+        )
+        .unwrap();
+        let url = page.to_string_lossy().into_owned();
+        let (_, list, ctx) = load_page_live(&url, DEFAULT_VIEWPORT);
+        assert!(ctx.is_some(), "the fixture declares a script");
+        assert!(
+            list_has(&list, "hodo-js-location-"),
+            "window.location.href must be the navigated page URL, not a <base> hint"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn page_script_document_title_mirrors_into_tab_title() {
+        let _guard = PAGE_JS_ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("hodo-js-title-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let page = dir.join("index.html");
+        std::fs::write(
+            &page,
+            "<html><head><title>Old title</title></head><body>\
+             <script>document.title = 'New';</script></body></html>",
+        )
+        .unwrap();
+        let url = page.to_string_lossy().into_owned();
+        let mut app = App::new(Some(&url));
+        assert_eq!(app.active_tab().title, "Old title");
+        app.page_js_tick(DEFAULT_VIEWPORT);
+        assert_eq!(
+            app.active_tab().title,
+            "New",
+            "a script-assigned document.title must reach the tab title"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn headless_page_script_budget_is_longer_than_gui() {
+        assert_eq!(GUI_PAGE_SCRIPT_BUDGET_MS, 50);
+        assert_eq!(HEADLESS_PAGE_SCRIPT_BUDGET_MS, 250);
     }
 }
