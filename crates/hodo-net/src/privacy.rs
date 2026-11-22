@@ -959,6 +959,28 @@ mod tests {
     }
 
     #[test]
+    fn already_https_redirect_targets_are_not_upgraded_again() {
+        let _guard = hsts_lock();
+        clear_hsts();
+        // Even with HSTS active for the host, an https target has no `http://`
+        // prefix to replace: re-upgrading must be a no-op, not a second hop.
+        observe_hsts("rust-lang.org", 1000, true, 1_700_000_000);
+        for url in [
+            "https://rust-lang.org/",
+            "https://www.rust-lang.org/",
+            "https://rust-lang.org/a?x=1",
+        ] {
+            let (same, did) = upgrade_redirect(url, false);
+            assert_eq!(same, url, "https target was rewritten");
+            assert!(!did, "https target must not be reported as upgraded: {url}");
+        }
+        let (same, did) = upgrade_redirect("https://www.rust-lang.org/", true);
+        assert_eq!(same, "https://www.rust-lang.org/");
+        assert!(!did, "private fetches must not re-upgrade either");
+        clear_hsts();
+    }
+
+    #[test]
     fn hsts_cap_evicts_the_soonest_expiring_entry() {
         let _guard = hsts_lock();
         clear_hsts();

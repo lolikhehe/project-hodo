@@ -41,6 +41,9 @@ pub enum FetchError {
     InvalidUrl,
     #[error("network: {0}")]
     Network(String),
+    /// A resolved hop pointed at a URL already seen in this chain.
+    #[error("network: too many redirects (cycle: {0})")]
+    RedirectLoop(String),
     #[error("resource exceeds cap")]
     TooLarge,
     #[error("io: {0}")]
@@ -830,6 +833,12 @@ pub(crate) struct Loaded {
 
 const MAX_REDIRECTS: usize = 5;
 
+/// When `HODO_DEBUG_REDIRECTS` is set, print every hop of the redirect chain
+/// to stderr. Kept permanently: redirect loops are otherwise invisible.
+fn debug_redirects() -> bool {
+    std::env::var_os("HODO_DEBUG_REDIRECTS").is_some()
+}
+
 pub(crate) fn fetch_network(
     url: &str,
     request_headers: &Headers,
@@ -842,9 +851,23 @@ pub(crate) fn fetch_network(
     let mut redirects = Vec::new();
     let mut set_cookies = Vec::new();
     let mut hsts = Vec::new();
-    for _ in 0..=MAX_REDIRECTS {
+    let trace = debug_redirects();
+    // Seeded with the start URL so a self-redirect (A -> A) and a cycle
+    // (A -> B -> A) both fail immediately instead of burning all five hops.
+    let mut visited: Vec<String> = vec![current.clone()];
+    for hop in 0..=MAX_REDIRECTS {
+        if trace {
+            eprintln!("[hodo-redirects] hop {hop}: GET {current}");
+        }
         let mut req = cache_agent().get(&current);
         for (name, value) in request_headers {
+            // `host` in request_headers belongs to the *original* URL. Sending
+            // it on later hops would pin a cross-host redirect to the wrong
+            // virtual host (www -> apex self-redirect loop). Let ureq set the
+            // Host from `current` on every request.
+            if name == "host" {
+                continue;
+            }
             req = req.header(name.as_str(), value.as_str());
         }
         let mut res = req.call().map_err(|e| FetchError::Network(e.to_string()))?;
@@ -864,13 +887,23 @@ pub(crate) fn fetch_network(
             }
             let (next, _) =
                 privacy::upgrade_redirect(&resolve_location(&current, &location)?, private);
+            if trace {
+                eprintln!("[hodo-redirects] hop {hop}: {status} Location: {location} -> {next}");
+            }
             if allowed_origin.is_some_and(|origin| !same_origin(origin, &next)) {
                 return Err(FetchError::Network(
                     "refusing cross-origin redirect on same-origin-only fetch".into(),
                 ));
             }
+            if visited.contains(&next) {
+                return Err(FetchError::RedirectLoop(next));
+            }
+            visited.push(next.clone());
             current = next;
             continue;
+        }
+        if trace {
+            eprintln!("[hodo-redirects] hop {hop}: {status} final {current}");
         }
         let data = read_capped(res.body_mut().as_reader(), |e| {
             FetchError::Network(e.to_string())
@@ -906,9 +939,21 @@ fn fetch_network_streaming(
     let mut redirects = Vec::new();
     let mut set_cookies = Vec::new();
     let mut hsts = Vec::new();
-    for _ in 0..=MAX_REDIRECTS {
+    let trace = debug_redirects();
+    let mut visited: Vec<String> = vec![current.clone()];
+    for hop in 0..=MAX_REDIRECTS {
+        if trace {
+            eprintln!("[hodo-redirects] stream hop {hop}: GET {current}");
+        }
         let mut req = cache_agent().get(&current);
         for (name, value) in request_headers {
+            // `host` in request_headers belongs to the *original* URL. Sending
+            // it on later hops would pin a cross-host redirect to the wrong
+            // virtual host (www -> apex self-redirect loop). Let ureq set the
+            // Host from `current` on every request.
+            if name == "host" {
+                continue;
+            }
             req = req.header(name.as_str(), value.as_str());
         }
         let mut res = req.call().map_err(|e| FetchError::Network(e.to_string()))?;
@@ -926,8 +971,22 @@ fn fetch_network_streaming(
             if matches!(status, 301 | 308) {
                 redirects.push((current.clone(), status, headers));
             }
-            current = privacy::upgrade_redirect(&resolve_location(&current, &location)?, private).0;
+            let next =
+                privacy::upgrade_redirect(&resolve_location(&current, &location)?, private).0;
+            if trace {
+                eprintln!(
+                    "[hodo-redirects] stream hop {hop}: {status} Location: {location} -> {next}"
+                );
+            }
+            if visited.contains(&next) {
+                return Err(FetchError::RedirectLoop(next));
+            }
+            visited.push(next.clone());
+            current = next;
             continue;
+        }
+        if trace {
+            eprintln!("[hodo-redirects] stream hop {hop}: {status} final {current}");
         }
 
         let declared_len = res
@@ -2220,6 +2279,7 @@ mod tests {
     struct RecordedRequest {
         method: String,
         path: String,
+        host: Option<String>,
         content_type: Option<String>,
         body: Vec<u8>,
     }
@@ -2244,6 +2304,7 @@ mod tests {
         let path = parts.next().unwrap_or_default().to_string();
         let mut content_length = 0usize;
         let mut content_type = None;
+        let mut host = None;
         for line in lines {
             let Some((name, value)) = line.split_once(':') else {
                 continue;
@@ -2251,6 +2312,7 @@ mod tests {
             match name.trim().to_ascii_lowercase().as_str() {
                 "content-length" => content_length = value.trim().parse().unwrap_or(0),
                 "content-type" => content_type = Some(value.trim().to_string()),
+                "host" => host = Some(value.trim().to_string()),
                 _ => {}
             }
         }
@@ -2264,6 +2326,7 @@ mod tests {
         RecordedRequest {
             method,
             path,
+            host,
             content_type,
             body: buf[header_end..end].to_vec(),
         }
@@ -2493,6 +2556,80 @@ mod tests {
             resolve_location("not a url", "/x"),
             Err(FetchError::InvalidUrl)
         ));
+    }
+
+    #[test]
+    fn redirect_cycle_fails_fast() {
+        // A -> B -> A: the second Location resolves to the start URL.
+        let server = ScriptedServer::start(vec![
+            (301, Some("/b".into()), ""),
+            (301, Some("/start".into()), ""),
+        ]);
+        let headers = our_request_headers(&server.url);
+        let err = fetch_network(&server.url, &headers, None, true)
+            .err()
+            .expect("expected a redirect-loop error");
+        assert!(
+            matches!(err, FetchError::RedirectLoop(ref url) if url == &server.url),
+            "{err:?}"
+        );
+        assert_eq!(server.requests().len(), 2, "must not burn the 5-hop budget");
+    }
+
+    #[test]
+    fn three_hop_redirect_chain_terminates() {
+        // rust-lang.org's shape: http apex -> https apex -> https www -> 200.
+        // The https upgrade itself is covered by upgrade_redirect's tests; the
+        // loopback server stands in for each host with distinct hop paths.
+        let server = ScriptedServer::start(vec![
+            (301, Some("/https".into()), ""),
+            (301, Some("/www".into()), ""),
+            (200, None, "final"),
+        ]);
+        let base = server.url.strip_suffix("/start").unwrap();
+        let headers = our_request_headers(&server.url);
+        let fetched = fetch_network(&server.url, &headers, None, true).unwrap();
+        assert_eq!(fetched.final_url, format!("{base}/www"));
+        assert_eq!(fetched.data, b"final");
+        assert_eq!(server.requests().len(), 3);
+    }
+
+    #[test]
+    fn long_distinct_redirect_chains_still_hit_the_five_hop_cap() {
+        let script: Vec<(u16, Option<String>, &'static str)> = (0..=MAX_REDIRECTS)
+            .map(|hop| (301, Some(format!("/hop{}", hop + 1)), ""))
+            .collect();
+        let server = ScriptedServer::start(script);
+        let headers = our_request_headers(&server.url);
+        let err = fetch_network(&server.url, &headers, None, true)
+            .err()
+            .expect("expected the redirect cap");
+        assert!(
+            matches!(err, FetchError::Network(ref msg) if msg == "too many redirects"),
+            "{err:?}"
+        );
+        assert_eq!(server.requests().len(), MAX_REDIRECTS + 1);
+    }
+
+    #[test]
+    fn redirect_hop_uses_the_new_host_not_the_original() {
+        // The server-side half of the rust-lang.org bug: reusing the initial
+        // `Host` on a cross-host redirect makes the apex redirect to itself.
+        let final_server = ScriptedServer::start(vec![(200, None, "ok")]);
+        let first_server = ScriptedServer::start(vec![(301, Some(final_server.url.clone()), "")]);
+        let headers = our_request_headers(&first_server.url);
+        let fetched = fetch_network(&first_server.url, &headers, None, true).unwrap();
+        assert_eq!(fetched.data, b"ok");
+
+        let final_host = final_server.url.split_once("://").unwrap().1;
+        let final_host = &final_host[..final_host.find('/').unwrap_or(final_host.len())];
+        let seen = final_server.requests();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].host.as_deref(),
+            Some(final_host),
+            "a redirect must send the new host, not the original one"
+        );
     }
 
     #[test]
