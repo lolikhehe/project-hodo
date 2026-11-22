@@ -278,6 +278,31 @@ fn union_rect(a: Rect, b: Rect) -> Rect {
     }
 }
 
+/// Advance a float's top past an earlier float on the opposite side whenever
+/// their margin boxes actually intersect in x and y. Opposite-side floats share
+/// one vertical band in CSS: a right float that stacks left of an earlier
+/// right float can land inside an earlier left float's band (EFF's third
+/// featured row). The check is geometric — real rect extents, not a sum of
+/// widths — so floats that merely touch edges still share the line.
+/// Bounded to 4 hops (matching M8b's `place_word` guard): the single rect kept
+/// per side settles in one hop, the cap is a defensive bound for future
+/// per-slot float stacks.
+fn clear_opposite_float(y: f32, x0: f32, x1: f32, other: Option<Rect>) -> f32 {
+    // Percentage widths round to ~0.001px at these coordinates; two floats
+    // meant to share an edge (EFF rows 1/2) can otherwise overlap by 0.0004px
+    // and get wrongly dropped. Ignore sub-pixel overlaps.
+    const EDGE_EPS: f32 = 0.01;
+    let mut y = y;
+    for _ in 0..4 {
+        let Some(r) = other else { break };
+        if x0 >= r.x + r.w - EDGE_EPS || x1 <= r.x + EDGE_EPS || y + EDGE_EPS >= r.y + r.h {
+            break;
+        }
+        y = r.y + r.h;
+    }
+    y
+}
+
 /// Record a floated child's margin box on the containing flow. Its consumed
 /// height is deliberately not added to `flow.y`: following line boxes wrap
 /// around it instead. Later floats on the same side union with the first.
@@ -439,7 +464,7 @@ fn layout_child_inner(
                     | Display::InlineTable
             );
             let float_band = crate::inline::float_bounds(flow);
-            let avail = Avail {
+            let mut avail = Avail {
                 x: if is_float && float_kind == Float::Right {
                     // Right floats hug the content edge minus their margins,
                     // then stack left of any earlier right float's margin box.
@@ -475,6 +500,37 @@ fn layout_child_inner(
                     flow.right - flow.left
                 },
             };
+            if is_float {
+                // Same-side placement already advances x; this adds the missing
+                // cross-side vertical negotiation. `float_l`/`float_r` hold the
+                // union of earlier margin boxes on each side (their bottoms are
+                // the same values `clear` uses), so the other side's rect is the
+                // band boundary this float must clear.
+                let other = match float_kind {
+                    Float::Right => flow.float_l,
+                    Float::Left => flow.float_r,
+                    Float::None => None,
+                };
+                let (bx0, bx1) = if tag.eq_ignore_ascii_case("img") {
+                    // Image floats size from their width attribute, not the
+                    // resolved CSS width used for other floats; match the
+                    // margin box the img branch records below.
+                    let iw = ctx
+                        .dom
+                        .attr(child, "width")
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .unwrap_or(64.0);
+                    let x = if float_kind == Float::Right {
+                        flow.right - fm.right - iw - fm.left
+                    } else {
+                        avail.x
+                    };
+                    (x, x + iw + fm.left + fm.right)
+                } else {
+                    (avail.x, avail.x + float_w + fm.left + fm.right)
+                };
+                avail.y = clear_opposite_float(avail.y, bx0, bx1, other);
+            }
 
             if crate::forms::is_form_control(tag) {
                 // Form controls are atomic replaced elements (M7.3): one
@@ -1646,6 +1702,157 @@ mod tests {
             "container height must equal the tallest column: {:?}",
             pane_bg[0]
         );
+    }
+
+    #[test]
+    fn cross_side_float_collision_drops_right_below_left() {
+        // 60% width + 10% right margin puts the left margin box at x=0..700;
+        // a 40% right float sits at x=600..1000, so the two overlap by 100px.
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let pane = elem(&mut dom, root, "div", &[("style", "width:1000px")]);
+        elem(
+            &mut dom,
+            pane,
+            "div",
+            &[(
+                "style",
+                "float:left; width:60%; margin-right:10%; height:40px; background:#ff0000",
+            )],
+        );
+        elem(
+            &mut dom,
+            pane,
+            "div",
+            &[(
+                "style",
+                "float:right; width:40%; height:30px; background:#00ff00",
+            )],
+        );
+        let list = layout(&dom, &compute_styles(&dom, &[]), viewport(1000.0));
+        let red = colored_rects(&list, Color::rgb(255, 0, 0));
+        let green = colored_rects(&list, Color::rgb(0, 255, 0));
+        assert_eq!((red.len(), green.len()), (1, 1));
+        assert!(
+            (red[0].y).abs() < 0.01,
+            "left float starts at the top: {:?}",
+            red[0]
+        );
+        assert!(
+            (green[0].y - 40.0).abs() < 0.01,
+            "right float must drop below the left float's bottom: {:?}",
+            green[0]
+        );
+    }
+
+    #[test]
+    fn cross_side_floats_with_a_gap_share_the_line() {
+        // 40% + 40% leaves a 200px gutter: no geometric overlap, so the right
+        // float must NOT be dropped (the check is rect-based, not a width sum).
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let pane = elem(&mut dom, root, "div", &[("style", "width:1000px")]);
+        elem(
+            &mut dom,
+            pane,
+            "div",
+            &[(
+                "style",
+                "float:left; width:40%; height:40px; background:#ff0000",
+            )],
+        );
+        elem(
+            &mut dom,
+            pane,
+            "div",
+            &[(
+                "style",
+                "float:right; width:40%; height:30px; background:#00ff00",
+            )],
+        );
+        let list = layout(&dom, &compute_styles(&dom, &[]), viewport(1000.0));
+        let red = colored_rects(&list, Color::rgb(255, 0, 0));
+        let green = colored_rects(&list, Color::rgb(0, 255, 0));
+        assert_eq!((red.len(), green.len()), (1, 1));
+        assert!(
+            green[0].y.abs() < 0.01 && red[0].y.abs() < 0.01,
+            "side-by-side floats stay on the same line: {red:?} {green:?}"
+        );
+        assert!(
+            red[0].x + red[0].w < green[0].x,
+            "the gap stays open: {red:?} {green:?}"
+        );
+    }
+
+    #[test]
+    fn clear_left_still_drops_a_block_below_the_left_float() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let c = elem(&mut dom, root, "div", &[("style", "width:200px")]);
+        elem(
+            &mut dom,
+            c,
+            "div",
+            &[(
+                "style",
+                "float:left; width:60px; height:40px; background:#99ccff",
+            )],
+        );
+        let cleared = elem(
+            &mut dom,
+            c,
+            "div",
+            &[("style", "clear:left; height:10px; background:#ddd0e8")],
+        );
+        text_node(&mut dom, cleared, "below");
+        let list = layout(&dom, &compute_styles(&dom, &[]), viewport(200.0));
+        let purple = colored_rects(&list, Color::rgb(0xdd, 0xd0, 0xe8));
+        assert_eq!(purple.len(), 1);
+        assert!(
+            (purple[0].y - 40.0).abs() < 0.01,
+            "clear:left must still use the left float bottom: {:?}",
+            purple[0]
+        );
+    }
+
+    #[test]
+    fn many_alternating_floats_terminate_with_valid_geometry() {
+        // Pathological stack: every float overlaps the opposite side's union
+        // band, so each one hops. The 4-hop guard must keep this bounded.
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let pane = elem(&mut dom, root, "div", &[("style", "width:1000px")]);
+        for i in 0..100 {
+            let side = if i % 2 == 0 { "left" } else { "right" };
+            elem(
+                &mut dom,
+                pane,
+                "div",
+                &[(
+                    "style",
+                    &format!("float:{side}; width:45%; height:10px; background:#ff0000"),
+                )],
+            );
+        }
+        let list = layout(&dom, &compute_styles(&dom, &[]), viewport(1000.0));
+        let rects = colored_rects(&list, Color::rgb(255, 0, 0));
+        assert_eq!(rects.len(), 100, "every float still paints");
+        for (i, r) in rects.iter().enumerate() {
+            assert!(
+                r.x.is_finite() && r.y.is_finite() && r.w.is_finite() && r.h.is_finite(),
+                "float {i} has non-finite geometry: {r:?}"
+            );
+        }
+        for (i, a) in rects.iter().enumerate() {
+            for (j, b) in rects.iter().enumerate().skip(i + 1) {
+                let overlap_x = a.x + 0.01 < b.x + b.w && b.x + 0.01 < a.x + a.w;
+                let overlap_y = a.y + 0.01 < b.y + b.h && b.y + 0.01 < a.y + a.h;
+                assert!(
+                    !(overlap_x && overlap_y),
+                    "floats {i} and {j} overlap: {a:?} {b:?}"
+                );
+            }
+        }
     }
 
     #[test]

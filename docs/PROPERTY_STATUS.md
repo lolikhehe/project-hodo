@@ -1,5 +1,15 @@
 # CSS property / feature status (Wave A baseline, plus current-tree verification)
 
+> **WAVE 4 LANDED:** the wave-4 tree was gated (fmt + clippy `-D warnings` +
+> 837 workspace tests green; bigdoc perf PASS inside every 1.10× pin, no re-pin)
+> and committed. Newly verified below: `float` now drops a float below an
+> opposite-side float whose margin box it geometrically intersects (0.01px edge
+> epsilon, 4-hop cap) — `clear_opposite_float` at
+> `crates/hodo-layout/src/block.rs:281-302`, applied at `block.rs:500-531`; this
+> puts EFF's third featured row below the first row's float band. Every status
+> flip below was verified by reading current code (`file:line` evidence), not
+> `git log`; re-check before using this as a release gate.
+
 > **WAVE 3 LANDED:** the wave-3 tree was integrated, gated (fmt + clippy
 > `-D warnings` + 826 workspace tests green) and committed. Newly verified below:
 > `@layer` cascade semantics with `!important` order inversion, CSS custom
@@ -70,7 +80,7 @@ on layout.
 | Grid: `display: grid` / `inline-grid`, `grid-template-columns/rows`, `gap`, auto-placement, `grid-column/row` | ✓ | ✓ | ✓ | `crates/hodo-layout/src/grid.rs:302` (`layout_grid`), wired at `block.rs:521`; items go through `layout_child` and emit `DisplayItem`s. Limit: percent/`fr` rows fall back to metric height (`grid.rs:394-395`). |
 | Tables: `display: table*`, `border-spacing`, anonymous table boxes, `colspan`/`rowspan` | ✓ | ✓ | ✓ | `crates/hodo-layout/src/table.rs:274` (`layout_table`), wired at `block.rs:522`; cells emit rect/text items. Limit: `border-collapse` is parsed (`crates/hodo-style/src/lib.rs:1037`) but degrades to `separate` in layout (`table.rs:11,281-282`). |
 | `position: static` / `relative` / `absolute` / `fixed` | ✓ | ✓ | ✓ except `fixed`: 🟡 | `relative` offsets `crates/hodo-layout/src/block.rs:391-395`; `absolute` box `block.rs:362,402-417`; `fixed` routes to `DisplayList::fixed_items` (`block.rs:298-322`, `lib.rs:108`) but shell painting is unwired (`lib.rs:99-107`, `TODO(integrator)`) — emitted, not painted. |
-| `float` / `clear` | ✓ | ✓ | ✓ | Float boxes recorded in `crates/hodo-layout/src/block.rs:363-385,428-435`, `clear` at `block.rs:365-375`; line boxes wrap via `inline.rs:128-134,400-433`. Limit: one rect per side, no shrink-to-fit (`block.rs:273-275,378-379`). |
+| `float` / `clear` | ✓ | ✓ | ✓ | Float boxes recorded in `crates/hodo-layout/src/block.rs:363-385,428-435`, `clear` at `block.rs:365-375`; line boxes wrap via `inline.rs:128-134,400-433`. Wave 4: cross-side collision — `clear_opposite_float` (`block.rs:281-302`, applied at `block.rs:500-531`) drops a float below an opposite-side float whose margin box it intersects (0.01px edge epsilon so touching edges still share a line, 4-hop cap); fixes EFF row 3. Limit: one rect per side, no shrink-to-fit (`block.rs:273-275,378-379`). |
 | `overflow: visible` / `hidden` / `clip` | ✓ | ✓ | ✓ | `clip_items` intersects rect/image items and drops whole text runs (`crates/hodo-layout/src/block.rs:133-170`); applied from `block.rs:389-390`. |
 | `width` / `height`, `min-width` / `min-height` / `max-width` / `max-height` | ✓ | ✓ | ✓ | Parsed `crates/hodo-style/src/lib.rs:1081-1086`; clamped `crates/hodo-layout/src/block.rs:381-385,604-605,703-705`. Limit: widthless floats take the full content width (`block.rs:378-379`). |
 | `width` / `height` percentages + `margin` / `padding` percentages (floats & in-flow blocks) | ✓ | ✓ | ✓ | Wave 3: raw percentages kept at parse time in `width_percent`/`margin_percent`/`padding_percent` (`crates/hodo-style/src/lib.rs:261-265,1191-1216`; `parse_length_or_percent` at `1541-1552`) and resolved against the containing-block width in layout (`crates/hodo-layout/src/block.rs:388-402,688-706`). Floats form side-by-side columns (`block.rs:1598`); floats also raise a parent's auto-height (BFC fix, `block.rs:1731`). |
