@@ -321,10 +321,16 @@ fn expand(
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'@' && bytes.get(i + 1) == Some(&b'@') {
-            if let Some(name) = PREDEFINED
-                .iter()
-                .find(|name| text[i + 2..].starts_with(**name))
-            {
+            if let Some(name) = PREDEFINED.iter().find(|name| {
+                let rest = &text[i + 2..];
+                rest.starts_with(**name)
+                    // A predefined token must end at a boundary. Without this,
+                    // `@@bidi_direction` matches the `bidi_dir` prefix and is
+                    // mangled into "ltr" + "ection".
+                    && rest[name.len()..].chars().next().is_none_or(|ch| {
+                        !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+                    })
+            }) {
                 let end = i + 2 + name.len();
                 if let Some(value) = resolve_special(&text[i..end]) {
                     out.push_str(&value);
@@ -535,6 +541,20 @@ mod tests {
         assert_eq!(
             messages.get_message("bidi", &[]),
             "dir=ltr loc=uk-ua id=ext@example.com"
+        );
+    }
+
+    #[test]
+    fn unknown_double_at_prefix_stays_literal() {
+        let dir = TempDir::new();
+        dir.write_locale(
+            "en",
+            &msg("raw=@@bidi_direction dir=@@bidi_dir tail=@@bidi_directionX"),
+        );
+        let messages = load_locales(&dir.0, Some("en"), "en").expect("locales load");
+        assert_eq!(
+            messages.get_message("k", &[]),
+            "raw=@@bidi_direction dir=ltr tail=@@bidi_directionX"
         );
     }
 

@@ -1,0 +1,29 @@
+[package]
+name = "hodo-ext-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hodo-ext-worker"
+path = "src/main.rs"
+
+[dependencies]
+hodo-ext-api.workspace = true
+hodo-ext-ipc.workspace = true
+hodo-js.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+hodo-ext-host.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "=0.4.8"
+seccompiler = "=0.5.0"
+# rlimits (setrlimit) live under the `process` feature in rustix 1.1.6; there is
+# no `resource` feature at this version.
+rustix = { version = "=1.1.6", features = ["process"] }
+
+[lints]
+workspace = true

@@ -4,8 +4,10 @@
 //! need for M2.1: clocks, runtime configuration, storage and alarms.
 
 use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use hodo_ext_i18n::Messages;
 use serde_json::{json, Value};
 
 /// Injectable time source. Tests use [`FakeClock`] and never sleep.
@@ -179,6 +181,19 @@ pub enum ApiCall {
         title: String,
         message: String,
     },
+    /// PURE read: localized message. Answered from the loaded locale tables.
+    I18nGetMessage {
+        key: String,
+        substitutions: Vec<String>,
+    },
+    /// PURE read: resolve an in-package path against the extension's URL base.
+    RuntimeGetUrl {
+        path: String,
+    },
+    /// PURE read: the extension's manifest as JSON.
+    RuntimeGetManifest,
+    /// PURE read: the extension id.
+    RuntimeId,
 }
 
 #[derive(Debug, Clone)]
@@ -211,8 +226,20 @@ pub enum ExtEvent {
     },
 }
 
+/// Immutable per-extension data behind the four PURE `runtime.*`/`i18n.*`
+/// reads. The host installs it from the loaded manifest and locale tables;
+/// reads never mutate it, so the JS memo may cache them for a whole tick.
+#[derive(Debug, Default)]
+pub struct RuntimeInfo {
+    pub id: String,
+    pub url_base: String,
+    pub manifest: Value,
+    pub messages: Option<Messages>,
+}
+
 #[derive(Debug, Default)]
 pub struct ApiRegistry {
+    info: Rc<RuntimeInfo>,
     storage: HashMap<String, serde_json::Value>,
     storage_sync: HashMap<String, serde_json::Value>,
     /// RAM only: dropped when the host session ends.
@@ -234,6 +261,12 @@ struct Alarm {
 impl ApiRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Install the static context served by the PURE reads. The shared
+    /// registry is re-pointed before each extension's dispatch in the host.
+    pub fn set_runtime_info(&mut self, info: Rc<RuntimeInfo>) {
+        self.info = info;
     }
 
     /// Take all events queued since the last drain.
@@ -404,6 +437,21 @@ impl ApiRegistry {
                 });
                 ApiResult::Ok(json!({ "notificationId": notification_id }))
             }
+            ApiCall::I18nGetMessage { key, substitutions } => ApiResult::Ok(Value::String(
+                self.info
+                    .messages
+                    .as_ref()
+                    .map_or_else(String::new, |m| m.get_message(key, substitutions)),
+            )),
+            ApiCall::RuntimeGetUrl { path } => {
+                let base = self.info.url_base.trim_end_matches('/');
+                ApiResult::Ok(Value::String(format!(
+                    "{base}/{}",
+                    path.trim_start_matches('/')
+                )))
+            }
+            ApiCall::RuntimeGetManifest => ApiResult::Ok(self.info.manifest.clone()),
+            ApiCall::RuntimeId => ApiResult::Ok(Value::String(self.info.id.clone())),
         }
     }
 
@@ -753,6 +801,42 @@ mod tests {
         assert_eq!(clock.now_ms(), 5);
         shared.advance_ms(7);
         assert_eq!(clock.now_ms(), 12);
+    }
+
+    #[test]
+    fn pure_runtime_and_i18n_variants_serve_static_info() {
+        let messages =
+            hodo_ext_i18n::load_locales(std::path::Path::new("__no_locales__"), None, "en-US")
+                .unwrap()
+                .with_extension_id("ext-42");
+        let mut registry = ApiRegistry::new();
+        registry.set_runtime_info(Rc::new(RuntimeInfo {
+            id: "ext-42".into(),
+            url_base: "moz-extension://ext-42".into(),
+            manifest: json!({ "name": "Demo" }),
+            messages: Some(messages),
+        }));
+        assert_eq!(
+            unwrap_ok(registry.dispatch(&ApiCall::RuntimeId)),
+            json!("ext-42")
+        );
+        assert_eq!(
+            unwrap_ok(registry.dispatch(&ApiCall::RuntimeGetUrl {
+                path: "/popup.html".into()
+            })),
+            json!("moz-extension://ext-42/popup.html")
+        );
+        assert_eq!(
+            unwrap_ok(registry.dispatch(&ApiCall::RuntimeGetManifest)),
+            json!({ "name": "Demo" })
+        );
+        assert_eq!(
+            unwrap_ok(registry.dispatch(&ApiCall::I18nGetMessage {
+                key: "@@extension_id".into(),
+                substitutions: vec![],
+            })),
+            json!("ext-42")
+        );
     }
 
     #[test]

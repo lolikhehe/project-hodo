@@ -19,6 +19,13 @@ members = [
   "crates/hodo-js",
   "crates/hodo-fuzz",
   "crates/hodo-cache",
+  "crates/hodo-ext-ipc",
+  "crates/hodo-ext-worker",
+  "crates/hodo-cookie",
+  "crates/hodo-adblock",
+  "crates/hodo-a11y",
+  "crates/hodo-ui",
+  "crates/hodo-icons",
 ]
 
 [workspace.package]
@@ -37,9 +44,14 @@ hodo-layout = { path = "crates/hodo-layout", version = "0.1.0" }
 hodo-render = { path = "crates/hodo-render", version = "0.1.0" }
 hodo-net = { path = "crates/hodo-net", version = "0.1.0" }
 hodo-ext-manifest = { path = "crates/hodo-ext-manifest", version = "0.1.0" }
+hodo-ext-i18n = { path = "crates/hodo-ext-i18n", version = "0.1.0" }
 hodo-ext-api = { path = "crates/hodo-ext-api", version = "0.1.0" }
 hodo-ext-host = { path = "crates/hodo-ext-host", version = "0.1.0" }
 hodo-js = { path = "crates/hodo-js", version = "0.1.0" }
+hodo-ext-ipc = { path = "crates/hodo-ext-ipc", version = "0.1.0" }
+hodo-ext-worker = { path = "crates/hodo-ext-worker", version = "0.1.0" }
+hodo-cookie = { path = "crates/hodo-cookie", version = "0.1.0" }
+hodo-adblock = { path = "crates/hodo-adblock", version = "0.1.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

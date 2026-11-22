@@ -7,7 +7,9 @@ license.workspace = true
 [dependencies]
 hodo-types.workspace = true
 hodo-ext-manifest.workspace = true
+hodo-ext-i18n.workspace = true
 hodo-ext-api.workspace = true
+hodo-ext-ipc.workspace = true
 hodo-js.workspace = true
 hodo-net.workspace = true
 serde_json.workspace = true
@@ -15,6 +17,14 @@ thiserror.workspace = true
 # POST is not exposed by hodo-net 0.1's `load`/`load_with` (GET only); the host
 # uses the same pinned ureq version already in the workspace for POST bodies.
 ureq = "=3.5.2"
+sysinfo = "=0.40.4"
+
+[target.'cfg(windows)'.dependencies]
+win32job = "=2.1.0"
+
+[[bin]]
+name = "hodo-ext-fake-worker"
+path = "src/bin/fake_worker.rs"
 
 [lints]
 workspace = true
