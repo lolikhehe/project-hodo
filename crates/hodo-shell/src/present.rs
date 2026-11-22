@@ -7,7 +7,6 @@
 //! present. Bars are never blitted.
 
 use std::num::NonZeroU32;
-use std::sync::OnceLock;
 
 use hodo_layout::{DisplayItem, DisplayList};
 use hodo_render::{diff_display_lists, render_into, rgba_rows, Damage, IntRect, DAMAGE_PAD};
@@ -28,13 +27,17 @@ fn env_flag(name: &str) -> bool {
 }
 
 fn force_full_flag() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| env_flag("HODO_FORCE_FULL"))
+    if std::env::var_os("HODO_FORCE_FULL").is_some() {
+        return env_flag("HODO_FORCE_FULL");
+    }
+    crate::settings::current().force_full_repaint
 }
 
 fn debug_damage_flag() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| env_flag("HODO_DEBUG_DAMAGE"))
+    if std::env::var_os("HODO_DEBUG_DAMAGE").is_some() {
+        return env_flag("HODO_DEBUG_DAMAGE");
+    }
+    crate::settings::current().debug_damage
 }
 
 // BEGIN CHROME DRAW (no raw hex: every color comes from ThemeAccess)

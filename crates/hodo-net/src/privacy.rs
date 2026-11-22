@@ -5,7 +5,7 @@ use super::*;
 use hodo_adblock::BlockDecision;
 use hodo_cookie::{partition_key, CookieJar};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Advisory events surfaced by [`fetch`].
@@ -92,6 +92,33 @@ fn hsts_map() -> &'static Mutex<HashMap<String, HstsEntry>> {
 
 static WARN_COUNT: AtomicU64 = AtomicU64::new(0);
 static WARN_URLS: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
+
+/// Live privacy toggles, pushed by the shell from persisted settings. Atomicals
+/// (not OnceLock) so a settings toggle is honoured by the very next fetch.
+static HTTPS_ONLY: AtomicBool = AtomicBool::new(true);
+static REFERRER_STRIP: AtomicBool = AtomicBool::new(true);
+static HSTS_ENABLE: AtomicBool = AtomicBool::new(true);
+
+pub fn set_https_only(enabled: bool) {
+    HTTPS_ONLY.store(enabled, Ordering::Relaxed);
+}
+
+pub fn set_referrer_strip(enabled: bool) {
+    REFERRER_STRIP.store(enabled, Ordering::Relaxed);
+}
+
+pub fn set_hsts_enable(enabled: bool) {
+    HSTS_ENABLE.store(enabled, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn privacy_toggles() -> (bool, bool, bool) {
+    (
+        HTTPS_ONLY.load(Ordering::Relaxed),
+        REFERRER_STRIP.load(Ordering::Relaxed),
+        HSTS_ENABLE.load(Ordering::Relaxed),
+    )
+}
 fn warned_urls_ring() -> &'static Mutex<VecDeque<String>> {
     WARN_URLS.get_or_init(|| Mutex::new(VecDeque::with_capacity(MAX_WARN_SAMPLE)))
 }
@@ -261,7 +288,8 @@ fn upgrade_target(url: &str, host: &str, hsts_forces: bool) -> Option<String> {
 /// Private fetches never consult the global HSTS map (empty local view).
 pub(crate) fn upgrade_redirect(url: &str, private: bool) -> (String, bool) {
     let host = host_of(url);
-    let hsts_forces = !private && hsts_applies(&host, now_unix());
+    let hsts_forces =
+        HSTS_ENABLE.load(Ordering::Relaxed) && !private && hsts_applies(&host, now_unix());
     match upgrade_target(url, &host, hsts_forces) {
         Some(https) => (https, true),
         None => (url.to_string(), false),
@@ -354,7 +382,7 @@ fn observe_hsts(host: &str, max_age: u64, include_subdomains: bool, now: u64) {
 /// which must already see hop-1's policy. Private fetches never consult or
 /// mutate the process-wide map.
 pub(crate) fn observe_hsts_header(url: &str, header: &str, private: bool) {
-    if private {
+    if private || !HSTS_ENABLE.load(Ordering::Relaxed) {
         return;
     }
     if let Some((max_age, include_subdomains)) = parse_hsts(header) {
@@ -403,14 +431,19 @@ pub fn fetch(
         }
     }
 
-    // 3/4. HSTS check + HTTPS upgrade.
+    // 3/4. HSTS check + HTTPS upgrade. Both are live settings: toggling either
+    // changes the very next fetch, no restart and no OnceLock re-init.
     let host = host_of(&stripped);
-    let hsts_forces = !opts.private && hsts_applies(&host, started_at);
+    let hsts_forces =
+        HSTS_ENABLE.load(Ordering::Relaxed) && !opts.private && hsts_applies(&host, started_at);
     let original = stripped.clone();
     let mut current = stripped;
     let mut upgraded = false;
     // HSTS forces the upgrade even for otherwise-exempt loopback hosts.
-    let target = upgrade_target(&current, &host, hsts_forces);
+    let target = HTTPS_ONLY
+        .load(Ordering::Relaxed)
+        .then(|| upgrade_target(&current, &host, hsts_forces))
+        .flatten();
     if let Some(https) = target {
         if opts.secure_context {
             warnings.push(Warning::MixedContent(original.clone()));
@@ -432,7 +465,12 @@ pub fn fetch(
             headers.insert("cookie".into(), cookies);
         }
     }
-    if let Some(referer) = referer_header(&current, opts.referer.as_deref()) {
+    let referer = if REFERRER_STRIP.load(Ordering::Relaxed) {
+        referer_header(&current, opts.referer.as_deref())
+    } else {
+        opts.referer.clone()
+    };
+    if let Some(referer) = referer {
         headers.insert("referer".into(), referer);
     }
 
@@ -456,13 +494,15 @@ pub fn fetch(
                 .unwrap_or_else(|e| e.into_inner())
                 .store(set_cookie, &loaded.final_url, &cookie_partition, started_at);
         }
-        // A warm cache replay carries the entry's stored_at so a replayed
-        // max-age is measured from when the header was first seen, not from
-        // every request that happens to hit the cache.
-        let hsts_at = loaded.hsts_observed_at.unwrap_or(started_at);
-        for (hop_url, header) in &loaded.hsts {
-            if let Some((max_age, include_subdomains)) = parse_hsts(header) {
-                observe_hsts(&host_of(hop_url), max_age, include_subdomains, hsts_at);
+        if HSTS_ENABLE.load(Ordering::Relaxed) {
+            // A warm cache replay carries the entry's stored_at so a replayed
+            // max-age is measured from when the header was first seen, not from
+            // every request that happens to hit the cache.
+            let hsts_at = loaded.hsts_observed_at.unwrap_or(started_at);
+            for (hop_url, header) in &loaded.hsts {
+                if let Some((max_age, include_subdomains)) = parse_hsts(header) {
+                    observe_hsts(&host_of(hop_url), max_age, include_subdomains, hsts_at);
+                }
             }
         }
     }
@@ -825,6 +865,38 @@ mod tests {
         revoke_site("doubleclick.net");
         assert!(!is_site_allowed("doubleclick.net"));
         set_adblock_enabled(true);
+    }
+
+    #[test]
+    fn privacy_toggles_are_live_on_the_next_fetch() {
+        let _guard = ADBLOCK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let server = OneShot::start("");
+        let opts = FetchOptions::default();
+
+        // Off -> on without any restart changes the very next decision.
+        set_adblock_enabled(false);
+        assert!(check_adblock("https://doubleclick.net/banner", &opts).is_ok());
+        set_adblock_enabled(true);
+        assert!(matches!(
+            check_adblock("https://doubleclick.net/banner", &opts),
+            Err(FetchError::Blocked { .. })
+        ));
+        // A loopback fetch in the same process still works after the toggle.
+        let mut cache = temp_cache();
+        let mut jar = CookieJar::new();
+        assert!(fetch(&server.url, &opts, &mut cache, &mut jar)
+            .unwrap()
+            .resource
+            .is_some());
+
+        set_https_only(false);
+        set_referrer_strip(false);
+        set_hsts_enable(false);
+        assert_eq!(privacy_toggles(), (false, false, false));
+        set_https_only(true);
+        set_referrer_strip(true);
+        set_hsts_enable(true);
+        assert_eq!(privacy_toggles(), (true, true, true));
     }
 
     #[test]

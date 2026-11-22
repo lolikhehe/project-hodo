@@ -134,8 +134,6 @@ pub fn restore_sessions() -> Vec<SessionTab> {
 // Inactive-tab display-list spill
 // ---------------------------------------------------------------------------
 
-/// Default cap on live display lists kept in RAM.
-const DEFAULT_SPILL_THRESHOLD: usize = 8;
 /// Refuse to allocate more than this for a decompressed spill payload.
 const MAX_SPILL_BYTES: usize = 256 * 1024 * 1024;
 /// Bump when the on-disk format changes; older versions are ignored/reloaded.
@@ -148,7 +146,7 @@ pub(crate) fn spill_threshold() -> usize {
     std::env::var("HODO_SPILL_THRESHOLD")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_SPILL_THRESHOLD)
+        .unwrap_or_else(|| crate::settings::current().spill_threshold)
 }
 
 #[cfg(test)]

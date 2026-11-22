@@ -583,6 +583,19 @@ pub fn is_site_allowed(top_site: &str) -> bool {
         .contains(&top_site.to_ascii_lowercase())
 }
 
+/// Sorted allowlist snapshot for the read-only settings page and revoke buttons.
+pub fn allowed_sites() -> Vec<String> {
+    let mut sites: Vec<String> = global()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .allow_sites
+        .iter()
+        .cloned()
+        .collect();
+    sites.sort();
+    sites
+}
+
 pub fn blocked_count() -> u64 {
     BLOCKED_COUNT.load(Ordering::Relaxed)
 }

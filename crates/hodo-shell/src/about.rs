@@ -54,8 +54,10 @@ pub fn about_hodo_html() -> String {
          <li>Scroll, PageUp / PageDown and Home / End move the page.</li>\
          <li>Cache: {} hits, {} misses, {} bytes, {} evictions.</li>\
          <li>Repaint: {} full, {} partial, {} scroll blits; last {} damage rects / {} px; {} px painted.</li>\
+         <li>Settings loaded from: {}</li>\
          </ul></body></html>",
-        stats.hits, stats.misses, stats.bytes, stats.evictions, full, partial, scroll, rects, area, pixels
+        stats.hits, stats.misses, stats.bytes, stats.evictions, full, partial, scroll, rects, area, pixels,
+        crate::settings::settings_path().display()
     )
 }
 

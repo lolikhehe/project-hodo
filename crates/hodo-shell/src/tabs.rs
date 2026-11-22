@@ -125,9 +125,9 @@ fn set_load_context(tab: &Tab) {
     VISITED_HREFS.with(|set| *set.borrow_mut() = tab.history.iter().cloned().collect());
 }
 
-/// True when hodo was launched with `--private`.
+/// True when hodo was launched with `--private` or the persisted default is on.
 fn startup_private() -> bool {
-    std::env::args().any(|arg| arg == "--private")
+    crate::settings::current().private_by_default || std::env::args().any(|arg| arg == "--private")
 }
 
 /// Build the display list and page height for a restored tab without adding

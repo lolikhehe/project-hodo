@@ -74,6 +74,8 @@
   --md-sys-motion-popup-open-easing: cubic-bezier(0.31, 0.94, 0.34, 1.0);
   --md-sys-motion-press-duration: 50ms;
   --md-sys-motion-press-easing: cubic-bezier(0.31, 0.94, 0.34, 1.0);
+  --md-sys-motion-switch-duration: 150ms;
+  --md-sys-motion-switch-easing: cubic-bezier(0.31, 0.94, 0.34, 1.0);
   --md-sys-shape-corner-0: 0px;
   --md-sys-shape-corner-1: 4px;
   --md-sys-shape-corner-2: 8px;
@@ -88,6 +90,10 @@
   --md-sys-state-focus: 0.1;
   --md-sys-state-hover: 0.08;
   --md-sys-state-pressed: 0.1;
+  --md-sys-switch-thumb: 28.0px;
+  --md-sys-switch-touch-target: 44.0px;
+  --md-sys-switch-track-height: 32.0px;
+  --md-sys-switch-track-width: 52.0px;
   --md-sys-type-about-line-height: 32px;
   --md-sys-type-about-size: 24px;
   --md-sys-type-about-weight: 400;

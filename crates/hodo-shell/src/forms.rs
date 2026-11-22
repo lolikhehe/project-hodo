@@ -145,7 +145,13 @@ impl ControlRegistry {
         self.focus = Some(index);
         match kind {
             ControlKind::Checkbox => {
-                self.controls[index].checked = !checked;
+                let now = !checked;
+                self.controls[index].checked = now;
+                // Settings switches carry their state in `value` so the
+                // renderer can paint the thumb without a new display-list field.
+                if name.starts_with("setting:") {
+                    self.controls[index].value = if now { "on" } else { "off" }.into();
+                }
                 changed = true;
             }
             ControlKind::Radio if !checked => {
@@ -275,6 +281,8 @@ impl ControlRegistry {
 pub(crate) enum FormAction {
     /// GET: a normal navigation with the query string attached.
     Navigate(String),
+    /// Re-render the current page in place (settings actions; no history entry).
+    Reload,
     /// POST: the response body already run through the page pipeline.
     Response {
         title: String,
@@ -391,10 +399,16 @@ pub(crate) struct FormPage {
 impl FormPage {
     /// Load a page that actually has controls; `None` for every other page.
     pub(crate) fn load(url: &str, viewport: Size) -> Option<Self> {
-        let html = match crate::app::load_resource(url) {
-            Ok(Resource::Html(text)) => text,
-            Ok(Resource::Other { data, .. }) => String::from_utf8_lossy(&data).into_owned(),
-            Err(_) => return None,
+        // Synthetic hodo:// pages never reach the network loader; build their
+        // HTML the same way the page pipeline does so their controls register.
+        let html = if let Some(page) = crate::hpages::hodo_page_html(url) {
+            page
+        } else {
+            match crate::app::load_resource(url) {
+                Ok(Resource::Html(text)) => text,
+                Ok(Resource::Other { data, .. }) => String::from_utf8_lossy(&data).into_owned(),
+                Err(_) => return None,
+            }
         };
         Self::from_html(&html, url, viewport)
     }
@@ -535,12 +549,30 @@ impl FormPage {
     pub(crate) fn click(&mut self, x: f32, y: f32, scroll: f32) -> Option<FormAction> {
         let rects: Vec<Rect> = self.registry.controls.iter().map(|c| c.rect).collect();
         let index = crate::ui::hit_test_control(&rects, x, y + scroll)?;
-        let submit = self.registry.controls.get(index).is_some_and(|c| c.submit);
+        let control = self.registry.controls.get(index)?;
+        let name = control.name.clone();
+        let value = control.value.clone();
+        let submit = control.submit;
+        let Some(key) = name.strip_prefix("setting:") else {
+            let _ = self.registry.click(index);
+            return if submit { self.submit() } else { None };
+        };
+        // Settings controls are owned by the settings module, not by form
+        // submission. Buttons/actions refresh the page; switches repaint in place.
         let _ = self.registry.click(index);
-        if submit {
-            self.submit()
-        } else {
+        let checked = self
+            .registry
+            .controls
+            .get(index)
+            .is_some_and(|control| control.checked);
+        crate::settings::apply_control(key, checked, &value);
+        if matches!(
+            self.registry.controls[index].kind,
+            hodo_layout::ControlKind::Checkbox | hodo_layout::ControlKind::Radio
+        ) {
             None
+        } else {
+            Some(FormAction::Reload)
         }
     }
 
@@ -903,6 +935,30 @@ mod tests {
             assert!(opaque >= 4, "control box must be painted: {r:?}");
             assert!(ink >= 2, "control border/glyph must be visible: {r:?}");
         }
+    }
+
+    #[test]
+    fn hodo_settings_controls_register_and_click_applies_setting() {
+        let _guard = crate::hpages::tests::page_lock();
+        let url = crate::hpages::HODO_SETTINGS_URL;
+        let mut page = FormPage::load(url, crate::app::DEFAULT_VIEWPORT)
+            .expect("synthetic settings page must register controls");
+        let index = page
+            .registry
+            .controls
+            .iter()
+            .position(|control| control.name == "setting:adblock")
+            .expect("adblock switch is registered");
+        let before = crate::settings::current().adblock;
+        let rect = page.registry.controls[index].rect;
+        assert!(page.hit(rect.x + 1.0, rect.y + 1.0, 0.0));
+        assert!(page.click(rect.x + 1.0, rect.y + 1.0, 0.0).is_none());
+        assert_eq!(crate::settings::current().adblock, !before);
+        assert_eq!(
+            page.registry.controls[index].value,
+            if before { "off" } else { "on" }
+        );
+        crate::settings::set_bool("adblock", before);
     }
 
     // ---- loopback submit e2e ------------------------------------------------

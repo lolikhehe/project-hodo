@@ -72,7 +72,27 @@ struct AtlasState {
 
 /// 1 MiB of A8 coverage masks. At 16 px DejaVu a glyph averages ~150 B, so
 /// this holds several thousand unique glyphs — far more than a typical page.
-const ATLAS_CAP_BYTES: usize = 1024 * 1024;
+const DEFAULT_ATLAS_CAP_BYTES: usize = 1024 * 1024;
+
+/// Live cap, set from the persisted glyph-cache setting. Eviction re-reads it
+/// on every insertion, so a change takes effect on the next frame's glyph work.
+static ATLAS_CAP_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_ATLAS_CAP_BYTES);
+
+/// Set the glyph atlas cap in MiB; applied on the next glyph insertion (frame).
+/// Zero/oversized values fall back to the 1 MiB default.
+pub fn set_glyph_cache_cap_mb(mb: f32) {
+    let bytes = if mb.is_finite() && mb > 0.0 && mb <= 64.0 {
+        (mb * 1024.0 * 1024.0) as usize
+    } else {
+        DEFAULT_ATLAS_CAP_BYTES
+    };
+    ATLAS_CAP_BYTES.store(bytes.max(1), Ordering::Relaxed);
+}
+
+/// Current atlas cap in bytes (test/telemetry accessor).
+pub fn glyph_cache_cap_bytes() -> usize {
+    ATLAS_CAP_BYTES.load(Ordering::Relaxed)
+}
 
 static GLYPH_ATLAS: OnceLock<RwLock<AtlasState>> = OnceLock::new();
 static ATLAS_TICK: AtomicU64 = AtomicU64::new(1);
@@ -177,7 +197,7 @@ fn glyph_cached(font: &Font, ch: char, font_size: f32) -> Arc<GlyphBitmap> {
     // kept: dropping it mid-blit would be invalid. A working set larger than
     // the cap (e.g. a 2 MiB CJK page) thrashes by design — the cap is the RAM
     // promise, not a guarantee that every glyph stays resident.
-    while state.bytes > ATLAS_CAP_BYTES && state.map.len() > 1 {
+    while state.bytes > ATLAS_CAP_BYTES.load(Ordering::Relaxed) && state.map.len() > 1 {
         let Some(lru) = state
             .map
             .iter()
@@ -211,7 +231,7 @@ pub fn glyph_atlas_stats() -> GlyphAtlasStats {
     GlyphAtlasStats {
         entries: state.map.len(),
         bytes: state.bytes,
-        capacity: ATLAS_CAP_BYTES,
+        capacity: glyph_cache_cap_bytes(),
         hits: ATLAS_HITS.load(Ordering::Relaxed),
         misses: ATLAS_MISSES.load(Ordering::Relaxed),
         has_glyph_probes: ATLAS_HAS_GLYPH_PROBES.load(Ordering::Relaxed),
@@ -542,11 +562,13 @@ fn draw_item(pixmap: &mut Pixmap, item: &DisplayItem) {
             rect,
             kind,
             text,
-            name: _,
+            name,
             masked,
             disabled,
             readonly,
-        } => draw_control(pixmap, rect, kind, text, *masked, *disabled, *readonly),
+        } => draw_control(
+            pixmap, rect, kind, text, name, *masked, *disabled, *readonly,
+        ),
     }
 }
 
@@ -748,17 +770,96 @@ fn fill_rect(pixmap: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, color: Color) 
     }
 }
 
+/// Solid pill (two end caps + middle rect). Winding fill unions the subpaths.
+fn fill_pill(pixmap: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, color: Color) {
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let r = h * 0.5;
+    let mut path = PathBuilder::new();
+    path.push_circle(x + r, y + r, r);
+    path.push_circle(x + w - r, y + r, r);
+    path.push_rect(SkRect::from_xywh(x + r, y, (w - h).max(0.0), h).unwrap());
+    if let Some(path) = path.finish() {
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(color.r, color.g, color.b, color.a);
+        paint.anti_alias = true;
+        pixmap.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+    }
+}
+
+fn fill_circle(pixmap: &mut Pixmap, cx: f32, cy: f32, r: f32, color: Color) {
+    if let Some(path) = PathBuilder::from_circle(cx, cy, r) {
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(color.r, color.g, color.b, color.a);
+        paint.anti_alias = true;
+        pixmap.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+    }
+}
+
+fn ui_color(c: hodo_ui::Color) -> Color {
+    Color::rgba(c.r, c.g, c.b, c.a)
+}
+
+/// M3 Expressive switch for settings controls. `text` carries "on"/"off" from
+/// the form registry, which is repainted on the next tick after a click.
+// shortcut: static switch visual — hover/press state layers and the
+// spring::DEFAULT_SPATIAL thumb animation (tokens::MOTION_SWITCH_MS) need a
+// per-frame animated control path; upgrade when the present path animates.
+fn draw_switch(pixmap: &mut Pixmap, rect: &hodo_types::Rect, text: &str, disabled: bool) {
+    use hodo_ui::tokens;
+
+    let track_w = tokens::SWITCH_TRACK_WIDTH;
+    let track_h = tokens::SWITCH_TRACK_HEIGHT;
+    let thumb = tokens::SWITCH_THUMB;
+    let tx = rect.x + (rect.w - track_w) * 0.5;
+    let ty = rect.y + (rect.h - track_h) * 0.5;
+    let on = text == "on";
+    let track = if disabled {
+        ui_color(tokens::LIGHT.surface_container_highest)
+    } else if on {
+        ui_color(tokens::LIGHT.primary)
+    } else {
+        ui_color(tokens::LIGHT.outline)
+    };
+    fill_pill(pixmap, tx, ty, track_w, track_h, track);
+    let cx = if on {
+        tx + track_w - thumb * 0.5 - 2.0
+    } else {
+        tx + thumb * 0.5 + 2.0
+    };
+    fill_circle(pixmap, cx, ty + track_h * 0.5, thumb * 0.5, Color::WHITE);
+}
+
 /// Draw one form control: a surface-tone box with a 1px border, a label, and a
-/// glyph box for checkable kinds. `name` is semantic only and is not painted.
+/// glyph box for checkable kinds. `name` selects the settings-switch visual.
+#[allow(clippy::too_many_arguments)]
 fn draw_control(
     pixmap: &mut Pixmap,
     rect: &hodo_types::Rect,
     kind: &ControlKind,
     text: &str,
+    name: &str,
     masked: bool,
     disabled: bool,
     readonly: bool,
 ) {
+    if name.starts_with("setting:") && matches!(kind, ControlKind::Checkbox) {
+        draw_switch(pixmap, rect, text, disabled);
+        return;
+    }
     let ink = if disabled {
         Color::rgb(140, 140, 140)
     } else {

@@ -162,12 +162,19 @@ pub const STATE_DRAGGED: f32 = 0.16;
 pub const SHAPE_CORNER_STEPS: [f32; 9] = [0.0, 4.0, 8.0, 12.0, 16.0, 20.0, 24.0, 28.0, 36.0];
 pub const SHAPE_FULL: f32 = -1.0;
 
+pub const SWITCH_TOUCH_TARGET: f32 = 44.0;
+pub const SWITCH_TRACK_WIDTH: f32 = 52.0;
+pub const SWITCH_TRACK_HEIGHT: f32 = 32.0;
+pub const SWITCH_THUMB: f32 = 28.0;
+
 pub const MOTION_HOVER_MS: u32 = 100;
 pub const MOTION_HOVER_EASING: [f32; 4] = [0.31, 0.94, 0.34, 1.0];
 pub const MOTION_POPUP_OPEN_MS: u32 = 150;
 pub const MOTION_POPUP_OPEN_EASING: [f32; 4] = [0.31, 0.94, 0.34, 1.0];
 pub const MOTION_PRESS_MS: u32 = 50;
 pub const MOTION_PRESS_EASING: [f32; 4] = [0.31, 0.94, 0.34, 1.0];
+pub const MOTION_SWITCH_MS: u32 = 150;
+pub const MOTION_SWITCH_EASING: [f32; 4] = [0.31, 0.94, 0.34, 1.0];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WindowClass {

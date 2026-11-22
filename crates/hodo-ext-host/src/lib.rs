@@ -15,6 +15,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use hodo_ext_api::{
     canonical_namespace, ApiCall, ApiDialect, ApiRegistry, ApiResult, Clock, ExtEvent,
@@ -105,7 +106,7 @@ pub struct HostBuilder {
 impl Default for HostBuilder {
     fn default() -> Self {
         Self {
-            isolated: !env_flag("HODO_NO_ISOLATION"),
+            isolated: ISOLATION_ENABLED.load(Ordering::Relaxed) && !env_flag("HODO_NO_ISOLATION"),
             clock: Rc::new(SystemClock),
             worker_path: None,
             worker_env: Vec::new(),
@@ -115,6 +116,14 @@ impl Default for HostBuilder {
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|value| value == "1")
+}
+
+/// Process-wide isolation preference pushed from the persisted setting at
+/// startup (restart-only knob). `HODO_NO_ISOLATION=1` still wins.
+static ISOLATION_ENABLED: AtomicBool = AtomicBool::new(true);
+
+pub fn set_isolation_enabled(enabled: bool) {
+    ISOLATION_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
 impl HostBuilder {
@@ -151,7 +160,9 @@ impl HostBuilder {
 
     #[must_use]
     pub fn build(self) -> Host {
-        let isolated = self.isolated && !env_flag("HODO_NO_ISOLATION");
+        let isolated = self.isolated
+            && ISOLATION_ENABLED.load(Ordering::Relaxed)
+            && !env_flag("HODO_NO_ISOLATION");
         let mut host = Host::with_clock(self.clock);
         host.isolated = isolated;
         if isolated {

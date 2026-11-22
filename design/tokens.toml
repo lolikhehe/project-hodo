@@ -125,6 +125,18 @@ focus = 0.10
 pressed = 0.10
 dragged = 0.16
 
+# M3 Expressive switch geometry (dp). Track/thumb are painted centered in the
+# touch target; corners use shape.full. Motion uses spring::EXPRESSIVE_SPATIAL.
+[switch]
+touch_target = 44
+track_width = 52
+track_height = 32
+thumb = 28
+
+[motion.eased.switch]
+duration_ms = 150
+easing = [0.31, 0.94, 0.34, 1.00]
+
 [motion.eased.popup_open]
 duration_ms = 150
 easing = [0.31, 0.94, 0.34, 1.00]

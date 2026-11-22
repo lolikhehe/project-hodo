@@ -1303,6 +1303,7 @@ dependencies = [
  "hodo-layout",
  "hodo-net",
  "hodo-types",
+ "hodo-ui",
  "image-webp",
  "jpeg-decoder",
  "png",

@@ -18,6 +18,7 @@ mod modules;
 mod popup;
 mod present;
 mod sessions;
+mod settings;
 mod tabs;
 mod ui;
 
@@ -86,7 +87,13 @@ fn screenshot(url: &str, out: &str, viewport: hodo_types::Size, wait_ms: u64) {
     hodo_js::drop_primed_page_prelude();
 }
 
-fn run_gui(initial_url: Option<&str>) {
+fn run_gui(initial_url: Option<&str>, private: bool) {
+    // Load persisted settings (env > file > default) and push them into the
+    // engine before the first navigation.
+    settings::load();
+    if private {
+        settings::set_runtime_private_by_default(true);
+    }
     // Prime the STATIC page-prelude parse ahead of the first navigation so it
     // overlaps the host's network fetch. GUI thread only: boa Context is !Send.
     hodo_js::prime_page_prelude();
@@ -165,7 +172,10 @@ fn parse_wait_ms(spec: &str) -> Result<u64, String> {
 /// Parsed argv, kept separate from `main` so the flags can be unit-tested.
 #[derive(Debug)]
 enum Action {
-    Gui(Option<String>),
+    Gui {
+        url: Option<String>,
+        private: bool,
+    },
     Screenshot {
         url: String,
         out: String,
@@ -231,14 +241,29 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
             })
         }
         "--private" => match (rest.next(), rest.next()) {
-            (None, None) => Ok(Action::Gui(None)),
-            (Some(url), None) => Ok(Action::Gui(Some(url.clone()))),
+            (None, None) => Ok(Action::Gui {
+                url: None,
+                private: true,
+            }),
+            (Some(url), None) => Ok(Action::Gui {
+                url: Some(url.clone()),
+                private: true,
+            }),
             _ => Err(USAGE.to_owned()),
         },
-        "" => Ok(Action::Gui(None)),
+        "" => Ok(Action::Gui {
+            url: None,
+            private: false,
+        }),
         url => match (rest.next().map(String::as_str), rest.next()) {
-            (None, None) => Ok(Action::Gui(Some(url.to_owned()))),
-            (Some("--private"), None) => Ok(Action::Gui(Some(url.to_owned()))),
+            (None, None) => Ok(Action::Gui {
+                url: Some(url.to_owned()),
+                private: false,
+            }),
+            (Some("--private"), None) => Ok(Action::Gui {
+                url: Some(url.to_owned()),
+                private: true,
+            }),
             _ => Err(USAGE.to_owned()),
         },
     }
@@ -254,7 +279,7 @@ fn main() {
             wait_ms,
         } => screenshot(&url, &out, viewport, wait_ms),
         Action::PopupScreenshot { dir, out } => popup_screenshot(&dir, &out),
-        Action::Gui(url) => run_gui(url.as_deref()),
+        Action::Gui { url, private } => run_gui(url.as_deref(), private),
     }
 }
 
@@ -265,6 +290,19 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| (*part).to_owned()).collect()
+    }
+
+    #[test]
+    fn private_flag_reaches_gui_action() {
+        let action = parse_args(&argv(&["hodo-shell", "--private"])).unwrap();
+        assert!(matches!(action, Action::Gui { private: true, .. }));
+        let action = parse_args(&argv(&["hodo-shell", "about:blank", "--private"])).unwrap();
+        assert!(matches!(
+            action,
+            Action::Gui { url: Some(ref url), private: true } if url == "about:blank"
+        ));
+        let action = parse_args(&argv(&["hodo-shell"])).unwrap();
+        assert!(matches!(action, Action::Gui { private: false, .. }));
     }
 
     #[test]

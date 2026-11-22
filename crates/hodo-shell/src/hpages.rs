@@ -1,9 +1,8 @@
-//! Read-only `hodo://` settings and privacy pages.
+//! Live `hodo://` settings and privacy pages.
 //!
-//! Wave 1 composes static HTML from the landed privacy / adblock / cache APIs
-//! and feeds it through the same shell pipeline as `about:hodo` (synthetic HTML
-//! -> normal engine render). Synthetic pages have no click routing yet, so all
-//! values are read-only; toggles and allowlist edits ride the page-JS wave.
+//! Settings are real form controls named `setting:<key>`; the shell's form
+//! registry hit-tests them, the settings module persists/applies the change and
+//! hodo-render paints M3E switches from the `setting:` name prefix.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -36,56 +35,173 @@ pub fn hodo_page_html(url: &str) -> Option<String> {
     }
 }
 
-/// `hodo://settings`: current adblock, privacy-flag and appearance state.
+fn switch_row(label: &str, key: &str, on: bool, restart: bool) -> String {
+    format!(
+        "<div class=\"row\"><input class=\"switch\" type=\"checkbox\" \
+         name=\"setting:{key}\" value=\"{}\"{}> <span>{}{}</span></div>",
+        if on { "on" } else { "off" },
+        if on { " checked" } else { "" },
+        escape_html(label),
+        if restart { " (restart)" } else { "" }
+    )
+}
+
+fn radio_row(label: &str, key: &str, value: &str, selected: bool) -> String {
+    format!(
+        "<div class=\"row\"><input class=\"radio\" type=\"radio\" \
+         name=\"setting:{key}\" value=\"{value}\"{}> <span>{label}</span></div>",
+        if selected { " checked" } else { "" }
+    )
+}
+
+fn action_button(label: &str, key: &str) -> String {
+    format!(
+        "<div class=\"row\"><button type=\"button\" name=\"setting:{key}\">{label}</button></div>"
+    )
+}
+
+/// `hodo://settings`: live, persisted knobs rendered as M3E switches.
 pub fn settings_html() -> String {
+    let s = crate::settings::current();
     let enabled = hodo_adblock::adblock_enabled();
     let (parsed, skipped) = hodo_adblock::rule_counts();
     let build_ms = hodo_adblock::automaton_build_millis();
     let stats = hodo_net::privacy_stats();
     let dark = read_dark_enabled();
+    let preset = crate::settings::ram_preset(&s.ram_budget);
 
-    format!(
-        "<html><head><title>hodo — settings</title></head><body>\
-         <h1>hodo settings</h1>\
-         <p>Read-only snapshot. Synthetic pages have no click routing yet; \
-         toggles and allowlist edits ride the page-JS wave.</p>\
-         <h2>Adblock</h2>\
-         <ul>\
-         <li>Status: {}</li>\
-         <li>Rules parsed: {}, skipped: {}</li>\
-         <li>Automaton build: {} ms</li>\
-         <li>Blocked so far: {} requests, {} bytes</li>\
-         <li>Per-site allowlist: individual allowances can be queried with \
-         is_site_allowed(site), but the landed API exposes no listing or count; \
-         editing rides the page-JS wave.</li>\
-         </ul>\
-         <h2>Privacy flags</h2>\
-         <ul>\
-         <li>HODO_NO_ADBLOCK: {} — disables adblock at startup.</li>\
-         <li>HODO_NO_ISOLATION: {} — disables extension isolation at startup.</li>\
-         </ul>\
-         <h2>Appearance</h2>\
-         <ul>\
-         <li>Dark theme: {} (cache/design.json — set_dark_enabled(bool) writes it)</li>\
-         </ul>\
-         <h2>Privacy counters</h2>\
-         <ul>\
-         <li>Cookies: {}, warnings: {}, HSTS hosts: {}</li>\
-         </ul>\
-         </body></html>",
-        if enabled { "Enabled" } else { "Disabled" },
-        parsed,
-        skipped,
-        build_ms,
-        stats.blocked,
-        stats.blocked_bytes,
-        env_flag("HODO_NO_ADBLOCK"),
-        env_flag("HODO_NO_ISOLATION"),
-        if dark { "on" } else { "off" },
-        stats.cookies,
-        stats.warnings,
-        stats.hsts_hosts,
-    )
+    let mut out = String::from(
+        "<html><head><title>hodo — settings</title><style>\
+         body{font-family:sans-serif;font-size:14px}\
+         .switch{width:52px;height:44px}\
+         .radio{width:20px;height:20px}\
+         .row{margin:4px 0}\
+         </style></head><body><h1>hodo settings</h1>",
+    );
+    out.push_str(&format!(
+        "<p>Settings loaded from: {} — env vars override file values.</p>",
+        escape_html(&crate::settings::settings_path().display().to_string())
+    ));
+
+    out.push_str("<h2>Appearance</h2>");
+    out.push_str(&switch_row("Dark theme", "theme", dark, false));
+
+    out.push_str("<h2>Privacy &amp; Security</h2>");
+    out.push_str(&switch_row(
+        "Enable JavaScript",
+        "javascript",
+        s.javascript,
+        true,
+    ));
+    out.push_str(&switch_row(
+        "Block ads &amp; trackers",
+        "adblock",
+        enabled,
+        false,
+    ));
+    out.push_str(&switch_row("HTTPS only", "https_only", s.https_only, false));
+    out.push_str(&switch_row("HSTS", "hsts_enable", s.hsts_enable, false));
+    out.push_str(&switch_row(
+        "Strip referrer to origin",
+        "referrer_strip",
+        s.referrer_strip,
+        false,
+    ));
+    out.push_str(&switch_row(
+        "Extension isolation",
+        "ext_isolation",
+        s.ext_isolation,
+        true,
+    ));
+    out.push_str(&format!(
+        "<p>Adblock: {} rules parsed, {} skipped, automaton built in {} ms; \
+         {} requests / {} bytes blocked.</p>",
+        parsed, skipped, build_ms, stats.blocked, stats.blocked_bytes
+    ));
+    out.push_str("<h3>Adblock allowlist</h3>");
+    let sites = hodo_adblock::allowed_sites();
+    if sites.is_empty() {
+        out.push_str("<p>None.</p>");
+    } else {
+        for site in sites {
+            out.push_str(&format!(
+                "<div class=\"row\">{} {}</div>",
+                escape_html(&site),
+                action_button("Revoke", &format!("revoke:{site}"))
+            ));
+        }
+    }
+    out.push_str(&action_button("Clear HSTS hosts", "clear_hsts"));
+
+    out.push_str("<h2>Performance</h2>");
+    out.push_str(&format!(
+        "<p>RAM budget: {} — spill {}, cache {} MiB, glyph atlas {} MiB, JS budget {} ms.</p>",
+        escape_html(&s.ram_budget),
+        preset.spill_threshold,
+        preset.cache_cap_mb,
+        preset.glyph_cache_mb,
+        preset.js_budget_ms
+    ));
+    out.push_str(&radio_row(
+        "Low",
+        "ram_budget",
+        "low",
+        s.ram_budget == "low",
+    ));
+    out.push_str(&radio_row(
+        "Balanced",
+        "ram_budget",
+        "balanced",
+        s.ram_budget == "balanced",
+    ));
+    out.push_str(&radio_row(
+        "High",
+        "ram_budget",
+        "high",
+        s.ram_budget == "high",
+    ));
+    out.push_str(&switch_row(
+        "Prefetch on hover",
+        "prefetch_enabled",
+        s.prefetch_enabled,
+        false,
+    ));
+
+    out.push_str("<h2>Advanced</h2>");
+    out.push_str(&switch_row(
+        "Force full repaint",
+        "force_full_repaint",
+        s.force_full_repaint,
+        false,
+    ));
+    out.push_str(&switch_row(
+        "Debug damage",
+        "debug_damage",
+        s.debug_damage,
+        false,
+    ));
+    out.push_str(&switch_row(
+        "Private by default",
+        "private_by_default",
+        s.private_by_default,
+        false,
+    ));
+    out.push_str(&switch_row(
+        "Restore sessions",
+        "restore_sessions",
+        s.restore_sessions,
+        true,
+    ));
+
+    out.push_str(&format!(
+        "<h2>Privacy counters</h2><ul><li>Cookies: {}, warnings: {}, HSTS hosts: {}</li></ul>",
+        stats.cookies, stats.warnings, stats.hsts_hosts
+    ));
+    out.push_str(
+        "<p>Env overrides: HODO_NO_ADBLOCK, HODO_NO_ISOLATION, HODO_NO_PAGE_JS, \
+         HODO_SPILL_THRESHOLD.</p></body></html>",
+    );
+    out
 }
 
 /// `hodo://privacy`: the full report built only from landed accessors.
@@ -153,15 +269,6 @@ fn url_list_html(items: &[String]) -> String {
     out
 }
 
-fn env_flag(name: &str) -> &'static str {
-    let on = std::env::var(name).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-    if on {
-        "set"
-    } else {
-        "unset"
-    }
-}
-
 #[derive(Deserialize)]
 struct Design {
     dark: bool,
@@ -187,27 +294,19 @@ pub fn read_dark_enabled() -> bool {
     read_dark_enabled_from(&root)
 }
 
-// Consumed by the restyle wave; wave 1 only reads the flag.
-#[allow(dead_code)]
-fn write_dark_enabled_to(root: &Path, enabled: bool) -> std::io::Result<()> {
+/// Persist the dark-theme flag to `cache/design.json` as `{"dark":bool}`.
+/// Atomic temp+rename: no remove window where the file is missing.
+pub(crate) fn write_dark_enabled_to(root: &Path, enabled: bool) -> std::io::Result<()> {
     let dir = root.join("cache");
     fs::create_dir_all(&dir)?;
     let path = design_path(root);
     let tmp = dir.join("design.json.tmp");
     let body = format!("{{\"dark\":{enabled}}}");
     fs::write(&tmp, body)?;
-    // shortcut: Windows cannot rename over an existing file, so the target is
-    // removed first; the brief gap is acceptable for a local theme preference.
-    if path.exists() {
-        fs::remove_file(&path)?;
-    }
     fs::rename(&tmp, &path)
 }
 
-/// Persist the dark-theme flag to `cache/design.json` as `{"dark":bool}`.
-// Consumed by the restyle wave; wave 1 only reads the flag.
-#[allow(dead_code)]
-pub fn set_dark_enabled(enabled: bool) {
+pub(crate) fn set_dark_enabled(enabled: bool) {
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let _ = write_dark_enabled_to(&root, enabled);
 }
@@ -232,27 +331,22 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn settings_page_reflects_known_adblock_state() {
+    fn settings_page_renders_live_switches() {
         let _guard = page_lock();
-        let before = hodo_adblock::adblock_enabled();
-
-        hodo_adblock::set_adblock_enabled(false);
-        assert!(settings_html().contains("Status: Disabled"));
-
-        hodo_adblock::set_adblock_enabled(true);
+        crate::settings::set_bool("adblock", false);
         let page = settings_html();
-        assert!(page.contains("Status: Enabled"));
-        let (parsed, skipped) = hodo_adblock::rule_counts();
-        assert!(page.contains(&format!("Rules parsed: {parsed}, skipped: {skipped}")));
-        assert!(page.contains(&format!(
-            "Automaton build: {} ms",
-            hodo_adblock::automaton_build_millis()
-        )));
+        assert!(page.contains("name=\"setting:adblock\" value=\"off\""));
+        assert!(page.contains("name=\"setting:javascript\" value=\"on\" checked"));
+        assert!(page.contains("Enable JavaScript") && page.contains("(restart)"));
+        assert!(page.contains("name=\"setting:ram_budget\" value=\"balanced\""));
         assert!(page.contains("HODO_NO_ADBLOCK") && page.contains("HODO_NO_ISOLATION"));
-        assert!(page.contains("is_site_allowed") && page.contains("page-JS wave"));
-        assert!(page.contains("Dark theme:"));
+        assert!(page.contains("Settings loaded from:"));
+        assert!(page.contains("Rules parsed") || page.contains("rules parsed"));
 
-        hodo_adblock::set_adblock_enabled(before);
+        crate::settings::set_bool("adblock", true);
+        let page = settings_html();
+        assert!(page.contains("name=\"setting:adblock\" value=\"on\" checked"));
+        assert!(page.contains("Dark theme"));
     }
 
     #[test]
@@ -300,6 +394,13 @@ pub(crate) mod tests {
         assert!(!list.items.is_empty());
         let (_, err_list) = crate::app::load_page("hodo://nope", crate::app::DEFAULT_VIEWPORT);
         assert!(!err_list.items.is_empty());
+    }
+
+    #[test]
+    fn about_page_names_the_settings_file() {
+        let page = crate::about::about_hodo_html();
+        assert!(page.contains("Settings loaded from:"));
+        assert!(page.contains("settings.json"));
     }
 
     #[test]

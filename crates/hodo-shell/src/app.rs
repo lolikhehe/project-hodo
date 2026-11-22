@@ -93,7 +93,9 @@ impl BrowserApp {
         popup_actions: Vec<PopupAction>,
     ) -> Self {
         let mut state = App::new(initial_url);
-        state.restore();
+        if crate::settings::current().restore_sessions {
+            state.restore();
+        }
         let mut app = Self {
             window: None,
             context: None,
@@ -177,6 +179,23 @@ impl BrowserApp {
     fn submit_form(&mut self, action: FormAction) {
         match action {
             FormAction::Navigate(url) => self.navigate(url),
+            FormAction::Reload => {
+                let url = self.state.active_tab().url.clone();
+                let (title, list, _page_js) = load_page_with_flag(
+                    &url,
+                    self.viewport,
+                    page_js_enabled(),
+                    page_script_budget(false),
+                );
+                let tab = &mut self.state.tabs[self.state.active];
+                tab.title = title;
+                tab.display_list = list;
+                tab.page_height = crate::ui::display_bottom(&tab.display_list);
+                tab.scroll_offset = 0.0;
+                self.force_full = true;
+                self.sync_forms();
+                self.request_redraw();
+            }
             FormAction::Response { title, list, form } => {
                 // The response body replaces the document: its old realm must
                 // not keep delivering events into a DOM nobody paints.
@@ -635,9 +654,12 @@ fn shell_cache() -> Option<&'static Mutex<hodo_cache::DiskCache>> {
     CACHE
         .get_or_init(|| {
             let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            hodo_cache::DiskCache::open(&root, 128 * 1024 * 1024)
-                .ok()
-                .map(Mutex::new)
+            hodo_cache::DiskCache::open(
+                &root,
+                (crate::settings::current().cache_cap_mb as u64) * 1024 * 1024,
+            )
+            .ok()
+            .map(Mutex::new)
         })
         .as_ref()
 }
@@ -895,7 +917,11 @@ const GUI_PAGE_SCRIPT_BUDGET_MS: u64 = 50;
 const HEADLESS_PAGE_SCRIPT_BUDGET_MS: u64 = 250;
 
 fn page_script_budget(headless: bool) -> Duration {
-    let default_ms = if headless {
+    let configured = crate::settings::current().js_budget_ms;
+    // The 50 ms default is invisible: headless keeps its historic 250 ms.
+    let default_ms = if configured != 50 {
+        configured
+    } else if headless {
         HEADLESS_PAGE_SCRIPT_BUDGET_MS
     } else {
         GUI_PAGE_SCRIPT_BUDGET_MS
@@ -904,9 +930,13 @@ fn page_script_budget(headless: bool) -> Duration {
 }
 
 /// `HODO_NO_PAGE_JS=1` disables the whole page-JS path, including collection:
-/// no realm is built and no extra work is done on script-free pages.
+/// no realm is built and no extra work is done on script-free pages. The
+/// persisted `javascript` setting is the second source (env wins).
 fn page_js_enabled() -> bool {
-    !std::env::var_os("HODO_NO_PAGE_JS").is_some_and(|value| value == "1")
+    if let Some(value) = std::env::var_os("HODO_NO_PAGE_JS") {
+        return value != "1";
+    }
+    crate::settings::current().javascript
 }
 
 #[derive(Debug)]
@@ -3173,6 +3203,68 @@ pub(crate) mod tests {
             "with page scripting on, <noscript> content stays hidden"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn javascript_setting_off_renders_noscript_after_reload_over_loopback() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let _guard = PAGE_JS_ENV_LOCK.lock().unwrap();
+        let _settings_guard = crate::hpages::tests::page_lock();
+        std::env::remove_var("HODO_NO_PAGE_JS");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let body = "<html><body><noscript><p>NOSCRIPT-SETTING-42</p></noscript></body></html>";
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/");
+
+        crate::settings::set_bool("javascript", false);
+        let (_, off, _) = load_page_with_flag(
+            &url,
+            DEFAULT_VIEWPORT,
+            page_js_enabled(),
+            page_script_budget(false),
+        );
+        assert!(
+            list_has(&off, "NOSCRIPT-SETTING-42"),
+            "javascript=off must render <noscript> content after reload"
+        );
+
+        crate::settings::set_bool("javascript", true);
+        let (_, on, _) = load_page_with_flag(
+            &url,
+            DEFAULT_VIEWPORT,
+            page_js_enabled(),
+            page_script_budget(false),
+        );
+        assert!(
+            !list_has(&on, "NOSCRIPT-SETTING-42"),
+            "javascript=on hides <noscript> content again"
+        );
+        server.join().expect("loopback server");
     }
 
     #[test]

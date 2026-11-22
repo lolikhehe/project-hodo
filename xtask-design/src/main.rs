@@ -21,7 +21,30 @@ struct Tokens {
     shape: Shape,
     state: State,
     motion: Motion,
+    #[serde(default)]
+    switch: Switch,
     window: Window,
+}
+
+/// M3 Expressive switch geometry. Values are dp; `touch_target` is the hit box,
+/// the track and thumb are the painted shape centered inside it.
+#[derive(Debug, Deserialize)]
+struct Switch {
+    touch_target: f32,
+    track_width: f32,
+    track_height: f32,
+    thumb: f32,
+}
+
+impl Default for Switch {
+    fn default() -> Self {
+        Self {
+            touch_target: 44.0,
+            track_width: 52.0,
+            track_height: 32.0,
+            thumb: 28.0,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -228,6 +251,25 @@ fn generate_rust(t: &Tokens) -> String {
     ));
     out.push('\n');
 
+    // M3 Expressive switch geometry (touch target / track / thumb).
+    out.push_str(&format!(
+        "pub const SWITCH_TOUCH_TARGET: f32 = {};\n",
+        float_lit(t.switch.touch_target)
+    ));
+    out.push_str(&format!(
+        "pub const SWITCH_TRACK_WIDTH: f32 = {};\n",
+        float_lit(t.switch.track_width)
+    ));
+    out.push_str(&format!(
+        "pub const SWITCH_TRACK_HEIGHT: f32 = {};\n",
+        float_lit(t.switch.track_height)
+    ));
+    out.push_str(&format!(
+        "pub const SWITCH_THUMB: f32 = {};\n",
+        float_lit(t.switch.thumb)
+    ));
+    out.push('\n');
+
     // Eased motion.
     for (name, eased) in &t.motion.eased {
         let n = name.to_ascii_uppercase();
@@ -306,6 +348,22 @@ fn generate_css(t: &Tokens) -> String {
         shared.insert(format!("--md-sys-shape-corner-{i}"), format!("{step}px"));
     }
     shared.insert("--md-sys-shape-corner-full".into(), "9999px".into());
+    shared.insert(
+        "--md-sys-switch-touch-target".into(),
+        format!("{}px", float_lit(t.switch.touch_target)),
+    );
+    shared.insert(
+        "--md-sys-switch-track-width".into(),
+        format!("{}px", float_lit(t.switch.track_width)),
+    );
+    shared.insert(
+        "--md-sys-switch-track-height".into(),
+        format!("{}px", float_lit(t.switch.track_height)),
+    );
+    shared.insert(
+        "--md-sys-switch-thumb".into(),
+        format!("{}px", float_lit(t.switch.thumb)),
+    );
     for (name, eased) in &t.motion.eased {
         let base = format!("--md-sys-motion-{}-", kebab(name));
         shared.insert(

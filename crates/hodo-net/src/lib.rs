@@ -12,14 +12,15 @@ mod privacy;
 pub use privacy::{
     adblock_blocked_count, allow_site, blocked_count, blocked_urls, check_adblock, clear_hsts,
     cookie_count, fetch, hsts_hosts, is_site_allowed, privacy_stats, revoke_site,
-    set_adblock_enabled, strip_tracking_params, warned_urls, warning_count, FetchOutcome,
-    PrivacyStats, Warning,
+    set_adblock_enabled, set_hsts_enable, set_https_only, set_referrer_strip,
+    strip_tracking_params, warned_urls, warning_count, FetchOutcome, PrivacyStats, Warning,
 };
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -1739,6 +1740,13 @@ fn same_origin(a: &str, b: &str) -> bool {
     )
 }
 
+/// Live prefetch toggle, pushed from the persisted setting. Read on every call.
+static PREFETCH_ENABLED: AtomicBool = AtomicBool::new(true);
+
+pub fn set_prefetch_enabled(enabled: bool) {
+    PREFETCH_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
 /// Warm the disk cache for `url` at low priority, returning no body. Intended
 /// for the shell's link-hover hook (see [`hover_prefetch_hint`]); all errors are
 /// deliberately swallowed — prefetch is best-effort and never on a critical
@@ -1768,7 +1776,8 @@ pub fn prefetch(url: &str, opts: &FetchOptions) {
 /// visible so tests (and a future shell that owns its cache handle) can wire
 /// it without touching the process-wide cache.
 pub(crate) fn prefetch_with_cache(url: &str, opts: &FetchOptions, cache: &mut DiskCache) {
-    if opts.private || opts.offline || !opts.use_cache {
+    if !PREFETCH_ENABLED.load(Ordering::Relaxed) || opts.private || opts.offline || !opts.use_cache
+    {
         return;
     }
     let Ok(normalized) = normalize_url(url) else {
