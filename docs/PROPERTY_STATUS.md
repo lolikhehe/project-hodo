@@ -1,11 +1,11 @@
 # CSS property / feature status (Wave A baseline, plus current-tree verification)
 
-> **IN FLIGHT (uncommitted wave):** the tree moves under this doc. Active zones:
-> style-parallel (CSS value/cascade work), tab-spill (`HODO_SPILL_THRESHOLD`
-> display-list spill agent), net-mmap (mmap-backed resource path), js-memo
-> (memoized JS bindings), render image-cache (decoded-image cache), and 6 bug
-> indexers. Every status flip below was verified by reading current code, not
-> `git log`; re-check before using this as a release gate. No commits in this wave.
+> **WAVE 2 LANDED:** the uncommitted wave-2 tree was integrated, gated and
+> committed. Newly verified below: `@media`/`@supports`/`@import`, document-order
+> stylesheet merge / cascade order, link/interaction pseudos, `:where()`/`:is()`,
+> `font-family` and viewport units. Every status flip below was verified by
+> reading current code (`file:line` evidence), not `git log`; re-check before
+> using this as a release gate.
 
 Scope: the Wave A baseline (`git log --oneline d911e52..9df4f23`) **plus** code
 verified in the current uncommitted tree for the rows flipped below. Each flip
@@ -65,7 +65,12 @@ on layout.
 | `width` / `height`, `min-width` / `min-height` / `max-width` / `max-height` | ✓ | ✓ | ✓ | Parsed `crates/hodo-style/src/lib.rs:1081-1086`; clamped `crates/hodo-layout/src/block.rs:381-385,604-605,703-705`. Limit: widthless floats take the full content width (`block.rs:378-379`). |
 | `white-space`, `line-height`, `text-align`, `text-indent`, `letter-spacing` / `word-spacing`, `text-decoration`, `overflow-wrap` | ✓ | ✓ | ✓ | Parsed `crates/hodo-style/src/lib.rs:965-968,1048-1060`; consumed in `crates/hodo-layout/src/inline.rs:603-645` (ws/indent/align/spacing), `inline.rs:144,616,797` (line-height), `inline.rs:448` (overflow-wrap); `line-through` painted at `crates/hodo-render/src/lib.rs:1379-1395`. `word-break`: no field/handler found in `crates/` — **not audited**, still pending. |
 | `vertical-align`, `inline-block` | ✓ | ✓ | ✓ | Baseline shift `crates/hodo-layout/src/inline.rs:269-303,621`; `Display::InlineBlock` → `inline_block_atom` (`block.rs:525`, `inline.rs:702-714`), one atomic slot per line. |
-| `z-index` / stacking, `box-sizing`, CSS variables `var()`, `calc()`, `@media`, `@font-face`, `background-image` / gradients | not audited | not audited | not audited | Unchanged from `9df4f23` (ТЗ M8 / post-M8 decision); not read this wave, so no status flip. |
+| Media queries: `@media` (`screen`/`print`, `min-`/`max-width`, `min-`/`max-height`, `orientation`, `hover`) + `@supports` + `@import` | ✓ | ✓ | n/a | Wave 2: `hodo_css::Viewport` (`crates/hodo-css/src/lib.rs:31-46`) plus `parse_stylesheet_with`, which evaluates conditions and drops non-matching blocks (`lib.rs:223-292,346-452`). The shell threads the real viewport and merges sheet bodies document-order (`crates/hodo-shell/src/app.rs:1101-1152`); `media="print"` links are skipped (`app.rs:1119-1127`). `@import`/`@layer` warn once and are skipped (`lib.rs:283-289`). |
+| Link/interaction pseudos (`:link`, `:visited`, `:hover`, `:focus`, `:active`) + `:where()` / `:is()` | ✓ | ✓ | n/a | Wave 2: parsed/encoded in `hodo-css` (`crates/hodo-css/src/lib.rs:124-128,949-952,1002,1121`); `:link`/`:visited` both match `a[href]` and pointer/focus states never match in a static render (`lib.rs:1652-1657`); `:where()` is zero-specificity, `:is()` takes its best branch (`lib.rs:1426`). Consumed by the `hodo-style` matcher. |
+| `font-family` | ✓ | ✓ | n/a | Wave 2: parsed as a declaration (`crates/hodo-css/src/lib.rs:1946-1958`), stored and inherited in `ComputedStyle` (`crates/hodo-style/src/lib.rs:212,925`) and seeded in the layout fallback style (`crates/hodo-layout/src/lib.rs:155`). Glyph selection still uses the single `fontdue` fallback chain — no per-family shaping. |
+| Viewport units `vh` / `vw` / `vmin` / `vmax` | ✓ | ✓ | ✓ | Wave 2: resolved to px against the stylesheet `Viewport` at parse time (`crates/hodo-css/src/lib.rs:632-655,639-650`), so `hodo-style`/`hodo-layout` consume them as ordinary lengths; tests `lib.rs:2607-2632`. `vi`/`vb` stay unresolved. |
+| Stylesheet merge order (cascade order) | ✓ | ✓ | n/a | Wave 2: `<style>`/`<link>` bodies are appended in document order so a later sheet wins a same-specificity tie (`crates/hodo-shell/src/app.rs:1107-1152`, test `app.rs:1235`); failed links warn and the page still renders (`app.rs:1132-1138`, test `app.rs:1300`). Full `@layer` cascade layers are not implemented — `@layer` warns and drops inner rules (`hodo-css/src/lib.rs:289`). |
+| `z-index` / stacking, `box-sizing`, CSS variables `var()`, `calc()`, `@font-face`, `background-image` / gradients | not audited | not audited | not audited | Unchanged from `9df4f23` (ТЗ M8 / post-M8 decision); not read this wave, so no status flip. `@media` is no longer in this row — it landed in wave 2 (see above). |
 
 ## Non-CSS features with painted output
 

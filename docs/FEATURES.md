@@ -1,23 +1,26 @@
 # hodo — feature status catalog (100 features)
 
-> **IN FLIGHT (uncommitted wave):** the tree moves under this catalog. Active
-> zones: style-parallel (CSS value/cascade work), tab-spill
-> (`HODO_SPILL_THRESHOLD` display-list spill agent), net-mmap (mmap-backed
-> resource path), js-memo (memoized JS bindings), render image-cache
-> (decoded-image cache), and 6 bug indexers. Every status flip below was
-> verified by reading current code, not `git log`; re-check before using this
-> as a release gate. No commits in this wave.
+> **WAVE 2 LANDED:** the uncommitted wave-2 tree was integrated, gated and
+> committed. Landed: MD3 chrome restyle; page-JS (script lifecycle, events,
+> mutation relayout, final-URL base threading); document-order stylesheet merge
+> with a real viewport, `media=print` skip and failed-link warnings;
+> `@media`/`@supports`/`@import` + link/interaction pseudos + `:where()`/`:is()`
+> + `font-family` + viewport units + `@layer` warn in `hodo-css`/`hodo-style`;
+> real-site layout fixes; `noscript`/`template` hiding; redirect-loop fix;
+> layout micro perf and perf-stack/icons housekeeping. Every status flip below
+> was verified by reading current code (`file:line` evidence), not `git log`;
+> re-check before using this as a release gate.
 
 This is an **honest catalog**, not a roadmap pitch. The goal is to beat Firefox on *feature count* — privacy by default, low RAM, power-user tools and built-in replacements for extensions — **not** on 20+ years of web compatibility. P0 rows are the gate: nothing else counts until every P0 is closed. Statuses are grounded in `git log` plus current-tree code reads (`file:line` evidence on flipped/shipped rows); "in-flight" means a frozen brief exists in `hodo — ТЗ для агента milestones M2–M7.md` and work is running, "planned" means a wave assignment from that plan, and "later" means no wave yet. Wave key: **X1** = layout + net-privacy + cookies + adblock + js-dom + bigdoc + fuzz; **X2** = shell features (popup, forms, damage+scroll, sessions+private tabs, page-JS execution, M3 broker flip, hodo-ui foundation); **X3** = `hodo://` pages (settings/tasks/privacy-report/new-tab), reader mode, find-in-page, WebP/AVIF, content_scripts, DNR, command palette, vertical/tree tabs, DevTools-lite, AccessKit. Cross-check: `docs/PROPERTY_STATUS.md` (CSS), `docs/ROADMAP.md`, `docs/EXTENSIONS.md`.
 
 | # | Feature | P | Status | Where |
 | --- | --- | --- | --- | --- |
-| 1 | JS у веб-сторінках (page JS, boa + DOM bindings) | P0 | 🔶 planned wave X2 | NOT STARTED: `hodo-js` drives extension contexts only (`crates/hodo-js/src/prelude.rs`); page-JS execution is X2. |
+| 1 | JS у веб-сторінках (page JS, boa + DOM bindings) | P0 | ✅ shipped | Wave 2: inline + `<script src>` in document order, `DOMContentLoaded`, click/key events and a native-DOM fingerprint that re-pipes styles/layout on mutation (`crates/hodo-shell/src/app.rs:875-903,942-1001,807-873`; `crates/hodo-shell/src/tabs.rs:514-548`). Final-URL base threading after redirects (`app.rs:607-669`); fixture `examples/js-site/`. Limits: no modules or full timer/event loop beyond the drained runtime budget; headless screenshots drop the realm. |
 | 2 | Повний DOM API (events, MutationObserver, IntersectionObserver, forms) | P0 | 🟡 partial | Arena DOM with `u32` generation handles, tags/attrs/text only (`hodo-dom::NodeKind`, `Dom::validate`); no event dispatch/observers; minimal DOM bindings are M2.2 in-flight; full API = X1 js-dom + X2 page-JS. |
 | 3 | fetch/XHR/WebSocket/EventSource + CORS/CSP | P0 | 🟡 partial | Extension `fetch` via `ApiCall::Fetch` → `hodo-net::load_with`; CSP validator `ext-host::validate_csp` shipped; no page-side XHR/WS/EventSource/CORS → X1 net-privacy + X2 page-JS. |
 | 4 | Cookie jar (SameSite/Secure/HttpOnly/partitioning) | P0 | ✅ shipped | `hodo-cookie::CookieJar` (8 tests, `crates/hodo-cookie/src/lib.rs:410-566`): `store`/`cookie_header` with SameSite/Secure/Partitioned and caller-supplied partition key (`lib.rs:60-218`); double-keyed attach in `crates/hodo-net/src/privacy.rs:369-393`. `HttpOnly` parsed but not enforced — no script context (`cookie lib.rs:10`). |
 | 5 | localStorage/sessionStorage/IndexedDB per-origin | P0 | 🟡 partial | Extension `storage.local/session/sync` with quota (`ext-api::ApiRegistry::quota_check`, `STORAGE_QUOTA_BYTES`) shipped; no page storage → X1 js-dom. |
-| 6 | CSS core (position/float/overflow/z-index, var/calc/@media/@font-face) | P0 | 🟡 partial | Selector engine + inline box model + base CSS landed (commits `25d03fa`, `f3e6d9d`); M8 position/float/overflow now consumed+painted (`crates/hodo-layout/src/block.rs:362-395,428-435,133-170`) and flex/grid/table engines landed (`flex.rs:153`, `grid.rs:302`, `table.rs:274`) — see `docs/PROPERTY_STATUS.md`. `z-index`/`var()`/`calc()`/`@media`/`@font-face` not audited this wave; still open. |
+| 6 | CSS core (position/float/overflow/z-index, var/calc/@media/@font-face) | P0 | 🟡 partial | Selector engine + inline box model + base CSS landed (commits `25d03fa`, `f3e6d9d`); M8 position/float/overflow now consumed+painted (`crates/hodo-layout/src/block.rs:362-395,428-435,133-170`) and flex/grid/table engines landed (`flex.rs:153`, `grid.rs:302`, `table.rs:274`) — see `docs/PROPERTY_STATUS.md`. **Wave 2:** media queries — `@media`/`@supports`/`@import` with a real `Viewport` (`crates/hodo-css/src/lib.rs:31-46,223-292,346-452`) and document-order stylesheet merge/cascade order with real viewport threading (`crates/hodo-shell/src/app.rs:1101-1152`); link/interaction pseudos + `:where()`/`:is()` (`hodo-css/src/lib.rs:124-128,949-952,1652-1657`), viewport units (`lib.rs:639-655`) and `font-family` (`hodo-style/src/lib.rs:212,925`). `z-index`/`var()`/`calc()`/`@font-face` still open. |
 | 7 | CSS transitions/animations + rAF на dirty-rect | P1 | 🔶 planned wave X2 | damage+scroll (M5) is the prerequisite; minimal M9.2 motion only after that. |
 | 8 | TLS 1.3 (rustls), HSTS, HTTP/2, пізніше HTTP/3 | P0 | 🟡 partial | HTTPS loads via `ureq` (rustls in `Cargo.lock`) in `hodo-net::load/load_with`; HSTS now landed (`crates/hodo-net/src/privacy.rs:247-304,348-365`); HTTP/2/QUIC not audited this wave — still open. |
 | 9 | Зображення й медіа (WebP/AVIF/GIF/SVG/srcset/video) | P1 | 🟡 partial | PNG/JPEG decode + blit (`hodo-render`, `645b5fa`), `<img src>` resolved against page URL (`cd1b1ec`); WebP/AVIF → X3; GIF/SVG/video → later. |
@@ -115,7 +118,7 @@ This is an **honest catalog**, not a roadmap pitch. The goal is to beat Firefox 
 
 ## P0 punch-list — what still blocks "a browser that works on real sites"
 
-18 P0 rows; **9 shipped, 0 in-flight, 9 open** — all in-flight work landed (partial and needs-decision rows
+18 P0 rows; **10 shipped, 0 in-flight, 8 open** — all in-flight work landed, wave 2 included (partial and needs-decision rows
 count as open; statuses verified against the current tree, not just `git log`):
 
 - **✅ #4 Cookie jar** — `hodo-cookie::CookieJar` (8 tests) + double-keyed attach (`hodo-net/src/privacy.rs:369-393`).
@@ -126,11 +129,11 @@ count as open; statuses verified against the current tree, not just `git log`):
 - **✅ #41 Sessions** — atomic snapshot + 32/512 caps (`hodo-shell/src/sessions.rs:30-33,95-120`).
 - **✅ #56 MV2+MV3 dual dialect** — landed (`d63a90c`); the "blocking webRequest" clause is not, and is tracked under #57 → **X3**.
 - **✅ #26 Freeze inactive tabs (all landed)** — spill + restore wired (`tabs.rs:204-231`, `sessions.rs:456`); counted shipped.
-- **#1 page JS** → **X2** (page-JS execution; not started).
+- **✅ #1 page JS** — landed in wave 2: script lifecycle, events, mutation relayout and final-URL base (`app.rs:875-1001`, `tabs.rs:514-548`).
 - **#2 Full DOM API** → **X1 js-dom** (observers, events, forms) + **X2 page-JS** (bindings).
 - **#3 fetch/XHR/WS/EventSource + CORS/CSP** → **X1 net-privacy** (CORS/CSP) + **X2 page-JS**; extension fetch + CSP validator already shipped.
 - **#5 Web storage / IndexedDB** → **X1 js-dom**; extension storage quota already shipped.
-- **#6 CSS core** → partial: M8 position/float/overflow + flex/grid/table landed (see `docs/PROPERTY_STATUS.md`); `z-index`/`var()`/`calc()`/`@media`/`@font-face` not audited this wave → **X1 layout**.
+- **#6 CSS core** → partial: M8 position/float/overflow + flex/grid/table landed (see `docs/PROPERTY_STATUS.md`); wave 2 closed `@media`/`@supports`/`@import`, document-order cascade, pseudos, viewport units and `font-family` (`hodo-css/src/lib.rs:31-46,223-292,346-452,639-655`; `app.rs:1101-1152`); `z-index`/`var()`/`calc()`/`@font-face` still open → **X1 layout**.
 - **#8 TLS/rustls + HSTS + HTTP/2** → HSTS landed (`hodo-net/src/privacy.rs:247-304`); HTTP/2/QUIC not audited this wave, still open → **X1 net-privacy**.
 - **#11 Top-site storage partitioning** → cache partition + cookie partition landed (`hodo-net/src/privacy.rs:369-393`); page-storage partitioning not audited this wave, still open → **X1 cookies/js-dom**.
 - **#58 content_scripts** → **X3 content_scripts**.
@@ -138,4 +141,4 @@ count as open; statuses verified against the current tree, not just `git log`):
 
 Order to close them: X1 (layout, net-privacy, cookies, adblock, js-dom, bigdoc, fuzz) → X2 (popup, forms, damage+scroll, sessions+private tabs, page-JS, M3 broker flip, hodo-ui) → X3 (hodo:// pages, content_scripts, DNR, DevTools-lite, AccessKit), with the #83 decision needed before X3 starts.
 
-<!-- ponytail: docs-only status sync; flipped rows were read from the current tree, not git log. Risk: the uncommitted waves (style-parallel, tab-spill, net-mmap, js-memo, render image-cache, 6 bug indexers) can move statuses again before commit — re-check code before using this as a release gate. -->
+<!-- ponytail: docs-only status sync; flipped rows were read from the current tree, not git log. Risk: future waves can move these statuses again — re-check code before using this as a release gate. -->

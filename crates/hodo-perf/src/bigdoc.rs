@@ -874,10 +874,10 @@ mod tests {
     fn checked_in_baseline_parses_all_four_large_stages() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../baseline_bigdoc.txt");
         let baseline = read_baseline(&path).expect("baseline_bigdoc.txt must be present");
-        assert_eq!(baseline.restyle_styles, 27.5);
-        assert_eq!(baseline.restyle_layout, 64.0);
-        assert_eq!(baseline.append_styles, 27.8);
-        assert_eq!(baseline.append_layout, 62.5);
+        assert_eq!(baseline.restyle_styles, 23.0);
+        assert_eq!(baseline.restyle_layout, 42.6);
+        assert_eq!(baseline.append_styles, 25.7);
+        assert_eq!(baseline.append_layout, 36.2);
     }
 
     #[test]
