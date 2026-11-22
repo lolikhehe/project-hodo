@@ -150,12 +150,23 @@ impl TreeSink for Sink {
         _flags: ElementFlags,
     ) -> Self::Handle {
         let tag = name.local.to_string();
-        let attrs: Vec<(String, String)> = attrs
+        let is_html = name.ns == html5ever::ns!(html);
+        let mut attrs: Vec<(String, String)> = attrs
             .into_iter()
             .map(|attr| (attr.name.local.to_string(), attr.value.to_string()))
             .collect();
-        let is_template =
-            tag == "template" && name.ns.to_string() == "http://www.w3.org/1999/xhtml";
+        let is_template = is_html && tag == "template";
+        // html5ever defaults to scripting_enabled=true, so <noscript> content
+        // arrives as raw text that would otherwise paint. Hide the subtree the
+        // same way hodo-shell hides <script>/<style>; an inline style outranks
+        // the UA and author sheets and every layout engine skips display:none.
+        if is_html && tag == "noscript" {
+            if let Some((_, value)) = attrs.iter_mut().find(|(k, _)| k == "style") {
+                value.push_str(";display:none");
+            } else {
+                attrs.push(("style".to_string(), "display:none".to_string()));
+            }
+        }
         let id = self
             .dom
             .borrow_mut()
@@ -501,6 +512,86 @@ mod tests {
         );
         assert_eq!(dom.text(children[0]), Some("Hello world"));
         assert_sane(&dom);
+    }
+
+    fn parse_chunks_text(chunks: &[&str]) -> String {
+        let mut parser = html5ever::parse_document(Sink::default(), Default::default()).from_utf8();
+        for chunk in chunks {
+            parser.process(Tendril::from_slice(chunk.as_bytes()));
+        }
+        let dom = parser.finish();
+        text_content(&dom, find_tag(&dom, "p"))
+    }
+
+    #[test]
+    fn noscript_subtree_is_hidden_even_though_content_is_present() {
+        let dom = parse_document("<noscript><h2>enable JS</h2></noscript><p>real</p>");
+        let noscript = find_tag(&dom, "noscript");
+        // Render-skip contract: an inline display:none makes layout skip the
+        // whole subtree (all four engines filter it, layout_child returns early)
+        // without touching hodo-shell/hodo-layout/hodo-render.
+        assert_eq!(dom.attr(noscript, "style"), Some("display:none"));
+        // html5ever defaults to scripting_enabled=true, so the notice is raw
+        // text; it stays in the DOM (reachable), it just never paints.
+        assert!(text_content(&dom, noscript).contains("enable JS"));
+        assert_eq!(text_content(&dom, find_tag(&dom, "p")), "real");
+        assert_sane(&dom);
+    }
+
+    #[test]
+    fn existing_noscript_style_is_preserved_when_hiding() {
+        let dom = parse_document("<noscript style=\"color:red\"><b>x</b></noscript>");
+        let noscript = find_tag(&dom, "noscript");
+        let style = dom.attr(noscript, "style").unwrap();
+        assert!(
+            style.contains("color:red"),
+            "author style must survive: {style}"
+        );
+        assert!(
+            style.contains("display:none"),
+            "hide must be appended: {style}"
+        );
+        assert_sane(&dom);
+    }
+
+    #[test]
+    fn template_content_is_outside_the_live_tree() {
+        let dom = parse_document("<template><h2>not rendered</h2></template><p>real</p>");
+        // html5ever puts template children in a detached fragment created by
+        // create_element; dom.walk from the root never reaches them.
+        let mut h2_in_live_tree = false;
+        dom.walk(|id, _| {
+            if dom.tag(id) == Some("h2") {
+                h2_in_live_tree = true;
+            }
+        });
+        assert!(
+            !h2_in_live_tree,
+            "template content must not be in the live tree"
+        );
+        assert_eq!(text_content(&dom, find_tag(&dom, "p")), "real");
+        assert_sane(&dom);
+    }
+
+    #[test]
+    fn chunked_entity_boundaries_decode_after_merge() {
+        // html5ever decodes character references in the tokenizer; chunking the
+        // input mid-entity must not leak literal fragments into the merged text.
+        assert_eq!(parse_chunks_text(&["<p>&am", "p;</p>"]), "&");
+        assert_eq!(parse_chunks_text(&["<p>&#x27", ";</p>"]), "'");
+        assert_eq!(parse_chunks_text(&["<p>&lt", ";</p>"]), "<");
+        assert_eq!(parse_chunks_text(&["<p>&gt", ";</p>"]), ">");
+        assert_eq!(parse_chunks_text(&["<p>&quo", "t;</p>"]), "\"");
+        assert_eq!(parse_chunks_text(&["<p>&", "amp;</p>"]), "&");
+        assert_eq!(
+            parse_chunks_text(&["<p>&am", "p; and &l", "t;</p>"]),
+            "& and <"
+        );
+
+        // One byte per chunk around a mix of named and numeric references.
+        let whole = "<p>Tom &amp; Jerry &lt;b&gt; &#x27; &#65; &quot;q&quot;</p>";
+        let bytes: Vec<&str> = whole.split_inclusive(|_: char| true).collect();
+        assert_eq!(parse_chunks_text(&bytes), "Tom & Jerry <b> ' A \"q\"");
     }
 
     #[test]

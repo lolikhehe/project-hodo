@@ -1,0 +1,25 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Entity site</title>
+  <style>
+    body { font-family: sans-serif; font-size: 20px; }
+    h1 { font-size: 26px; }
+    .row { margin: 6px 0; }
+    .bad { color: #c00000; font-size: 24px; }
+  </style>
+</head>
+<body>
+  <h1>Entity decode fixture</h1>
+  <div class="row">Amp in text: Tom &amp; Jerry</div>
+  <div class="row">Quotes: &quot;double&quot; and &#x27;single&#x27;</div>
+  <div class="row">Ampersand in URL: /search?q=a&amp;b=2&amp;c=3</div>
+  <div class="row">Escaped markup (literal text): &lt;a href="/x"&gt;link&lt;/a&gt;</div>
+  <div class="row">Nested quotes: &lt;div class=&quot;box&quot;&gt;x&lt;/div&gt;</div>
+  <div class="row">Numeric: &#65;&#66;&#67; and &#x1F600;</div>
+  <noscript><h2 class="bad">NOSCRIPT NOTICE MUST NOT RENDER</h2></noscript>
+  <template><h2 class="bad">TEMPLATE CONTENT MUST NOT RENDER</h2></template>
+  <div class="row">After noscript/template: still visible</div>
+</body>
+</html>
