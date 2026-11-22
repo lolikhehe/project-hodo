@@ -16,11 +16,13 @@
 
 use std::cell::Cell;
 
+use hodo_dom::NodeId;
 use hodo_layout::DisplayList;
 use hodo_types::Size;
+use serde_json::Value;
 
 use crate::about::ABOUT_HODO_URL;
-use crate::app::{load_page, DEFAULT_VIEWPORT};
+use crate::app::{load_page_live, PageContext, DEFAULT_VIEWPORT};
 use crate::ui::{clamp_scroll_offset, compose_display_list, display_bottom, tab_counter};
 
 /// Where a tab's page content lives.
@@ -53,6 +55,10 @@ pub struct Tab {
     pub history_cursor: usize,
     /// Private tab: loads skip the disk cache, and the tab is never saved.
     pub private: bool,
+    /// Whether this tab's document declares page scripts. Used to re-arm a
+    /// realm when it becomes active again without paying a reload on every
+    /// script-free tab switch.
+    pub has_page_js: bool,
 }
 
 impl Tab {
@@ -68,6 +74,7 @@ impl Tab {
             history: Vec::new(),
             history_cursor: 0,
             private: false,
+            has_page_js: false,
         }
     }
 
@@ -101,7 +108,8 @@ fn startup_private() -> bool {
 }
 
 /// Build the display list and page height for a restored tab without adding
-/// history or touching the URL bar.
+/// history or touching the URL bar. JS runs so its mutations reach the list,
+/// but the realm is dropped: only the active tab ever owns a live context.
 fn hydrate(tab: &mut Tab) {
     let url = tab
         .history
@@ -110,13 +118,35 @@ fn hydrate(tab: &mut Tab) {
         .filter(|url| !url.is_empty())
         .unwrap_or_else(|| ABOUT_HODO_URL.to_string());
     set_private_load(tab.private);
-    let (title, display_list) = load_page(&url, DEFAULT_VIEWPORT);
+    let (title, display_list, page_js) = load_page_live(&url, DEFAULT_VIEWPORT);
     tab.url = url;
     tab.title = title;
     tab.display_list = display_list;
     tab.scroll_offset = 0.0;
     tab.page_height = display_bottom(&tab.display_list);
     tab.body = Body::Live;
+    tab.has_page_js = page_js.is_some();
+}
+
+/// Drop the old realm and build a fresh one for the active tab. Only called
+/// for documents we know declare scripts, so script-free pages keep their
+/// existing display list and pay no reload on a tab switch.
+fn reattach_page_js(app: &mut App) {
+    app.page_js = None;
+    let index = app.active;
+    let url = app.tabs[index].url.clone();
+    if url.is_empty() {
+        return;
+    }
+    set_private_load(app.tabs[index].private);
+    let (_, list, page_js) = load_page_live(&url, app.viewport);
+    app.tabs[index].has_page_js = page_js.is_some();
+    if page_js.is_some() {
+        let height = display_bottom(&list);
+        app.tabs[index].display_list = list;
+        app.tabs[index].page_height = height;
+    }
+    app.page_js = page_js;
 }
 
 /// Build the restored tab vector from a session snapshot.
@@ -177,6 +207,10 @@ pub struct App {
     viewport: Size,
     /// Monotonic stamp used to order spill candidates by recency.
     clock: u64,
+    /// Live JS realm of the active tab only. Dropped on every navigation,
+    /// reload, history move, tab switch and close (realm drop). Inactive tabs
+    /// keep their last painted list, never a second Boa context.
+    pub(crate) page_js: Option<PageContext>,
 }
 
 impl App {
@@ -189,6 +223,7 @@ impl App {
             url_focused: true,
             viewport: DEFAULT_VIEWPORT,
             clock: 0,
+            page_js: None,
         };
         let welcome = initial_url.is_none();
         // Same toggle the future UI uses: `--private` opens tab 0 private.
@@ -264,6 +299,7 @@ impl App {
     /// cache. Entries carrying a valid spill id stay spilled until first
     /// switched to; the active tab is restored now.
     pub fn restore(&mut self) {
+        self.page_js = None;
         let private = self.tabs[self.active].private;
         let saved = crate::sessions::restore_sessions();
         // Startup sweep: any spill file not named by this session is an orphan.
@@ -288,6 +324,11 @@ impl App {
         self.tabs[0].last_used = self.clock;
         self.url_bar = self.tabs[0].url.clone();
         self.url_focused = false;
+        // A restored tab has no DOM in memory; re-arm its realm if its
+        // document declared scripts (the spilled list keeps its JS mutations).
+        if self.tabs[0].has_page_js {
+            reattach_page_js(self);
+        }
     }
 
     /// Open a new tab on the welcome page and make it active.
@@ -306,12 +347,16 @@ impl App {
         if let Some(uuid) = self.tabs[self.active].spill_uuid().map(str::to_string) {
             crate::sessions::delete_spill(&uuid);
         }
+        self.page_js = None;
         self.tabs.remove(self.active);
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
         }
         self.url_bar = self.tabs[self.active].url.clone();
         self.url_focused = false;
+        if self.tabs[self.active].has_page_js {
+            reattach_page_js(self);
+        }
         self.save();
     }
 
@@ -322,12 +367,19 @@ impl App {
         if index >= self.tabs.len() || index == self.active {
             return false;
         }
+        // Dropping the realm here is the "one context per active tab" rule;
+        // re-arm only script-bearing tabs so switching between static pages
+        // stays a pure display-list swap (no reparse, no extra Boa context).
+        self.page_js = None;
         restore_or_reload(&mut self.tabs[index]);
         self.active = index;
         self.clock += 1;
         self.tabs[index].last_used = self.clock;
         self.url_bar = self.tabs[index].url.clone();
         self.url_focused = false;
+        if self.tabs[index].has_page_js {
+            reattach_page_js(self);
+        }
         self.save();
         true
     }
@@ -345,16 +397,21 @@ impl App {
     }
 
     /// Load the active tab's current history entry without adding history.
+    /// The old realm is dropped before parsing so no stale listener or timer
+    /// can fire into the document being replaced.
     fn load_history_entry(&mut self, viewport: Size) -> String {
+        self.page_js = None;
         set_private_load(self.tabs[self.active].private);
         let url = self.tabs[self.active].history[self.tabs[self.active].history_cursor].clone();
-        let (title, display_list) = load_page(&url, viewport);
+        let (title, display_list, page_js) = load_page_live(&url, viewport);
+        self.page_js = page_js;
         let tab = &mut self.tabs[self.active];
         tab.url = url.clone();
         tab.title = title.clone();
         tab.display_list = display_list;
         tab.scroll_offset = 0.0;
         tab.page_height = display_bottom(&tab.display_list);
+        tab.has_page_js = self.page_js.is_some();
         self.url_bar = url;
         self.url_focused = false;
         title
@@ -390,13 +447,16 @@ impl App {
         if url.is_empty() {
             return String::new();
         }
+        self.page_js = None;
         set_private_load(self.tabs[self.active].private);
-        let (title, display_list) = load_page(&url, viewport);
+        let (title, display_list, page_js) = load_page_live(&url, viewport);
+        self.page_js = page_js;
         let tab = &mut self.tabs[self.active];
         tab.title = title.clone();
         tab.display_list = display_list;
         tab.scroll_offset = 0.0;
         tab.page_height = display_bottom(&tab.display_list);
+        tab.has_page_js = self.page_js.is_some();
         self.save();
         title
     }
@@ -417,6 +477,80 @@ impl App {
     /// Keep hit-testing in sync with the GUI surface size.
     pub fn set_viewport(&mut self, viewport: Size) {
         self.viewport = viewport;
+    }
+
+    fn adopt_page_list(&mut self, list: DisplayList) {
+        let tab = &mut self.tabs[self.active];
+        tab.display_list = list;
+        tab.page_height = display_bottom(&tab.display_list);
+    }
+
+    /// Resolve a viewport point to its DOM owner through the existing
+    /// node-map hit-test. Chrome and unpainted pixels have no owner.
+    pub(crate) fn hit_node(&self, x: f32, y: f32) -> Option<NodeId> {
+        let tab = self.active_tab();
+        let label = tab_counter(self.active + 1, self.tabs.len());
+        let composed = compose_display_list(
+            &tab.display_list,
+            self.viewport,
+            &self.url_bar,
+            &[],
+            tab.scroll_offset,
+            &label,
+        );
+        crate::ui::hit_test(&composed, x, y).1
+    }
+
+    pub(crate) fn page_js_root(&self) -> Option<NodeId> {
+        self.page_js.as_ref().map(PageContext::root)
+    }
+
+    pub(crate) fn page_js_has_timers(&self) -> bool {
+        self.page_js.as_ref().is_some_and(PageContext::has_timers)
+    }
+
+    /// One idle tick: deliver page tasks, then re-pipe only if JS mutated the
+    /// DOM. Returns true when the painted list changed.
+    pub(crate) fn page_js_tick(&mut self, viewport: Size) -> bool {
+        let changed = match self.page_js.as_mut() {
+            Some(ctx) => ctx.tick(viewport),
+            None => None,
+        };
+        let Some(list) = changed else {
+            return false;
+        };
+        self.adopt_page_list(list);
+        true
+    }
+
+    /// Deliver a DOM event to listeners on `node` in this frame.
+    pub(crate) fn page_js_dispatch(
+        &mut self,
+        node: NodeId,
+        kind: &str,
+        payload: Value,
+        viewport: Size,
+    ) -> bool {
+        let changed = match self.page_js.as_mut() {
+            Some(ctx) => ctx.dispatch(node, kind, payload, viewport),
+            None => None,
+        };
+        let Some(list) = changed else {
+            return false;
+        };
+        self.adopt_page_list(list);
+        true
+    }
+
+    /// Forced re-pipe after a resize (the DOM did not change, so `tick` alone
+    /// would skip it).
+    pub(crate) fn page_js_relayout(&mut self, viewport: Size) -> bool {
+        let list = self.page_js.as_ref().map(|ctx| ctx.relayout(viewport));
+        let Some(list) = list else {
+            return false;
+        };
+        self.adopt_page_list(list);
+        true
     }
 
     /// Click at `(x, y)` (viewport pixel coordinates). Navigates if a link is
@@ -451,6 +585,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::load_page;
     use hodo_dom::NodeId;
     use hodo_layout::{ControlKind, DisplayItem};
     use hodo_types::{Color, Rect};
@@ -762,5 +897,61 @@ mod tests {
         );
         crate::sessions::delete_spill(&uuid);
         crate::sessions::clear_test_spill_dir(&dir);
+    }
+
+    #[test]
+    fn navigation_reload_and_back_recreate_one_page_realm() {
+        let _guard = crate::app::tests::PAGE_JS_ENV_LOCK.lock().unwrap();
+        let url = crate::app::tests::js_site_url();
+        let mut app = App::new(None);
+        app.navigate(&url, DEFAULT_VIEWPORT);
+        assert!(app.page_js.is_some(), "a scripted page gets a live realm");
+        assert!(app.active_tab().has_page_js);
+        assert!(crate::app::tests::list_has(
+            &app.active_tab().display_list,
+            "JS-OK"
+        ));
+
+        app.navigate(ABOUT_HODO_URL, DEFAULT_VIEWPORT);
+        assert!(app.page_js.is_none(), "leaving a page drops its realm");
+        assert!(!app.active_tab().has_page_js);
+
+        app.back(DEFAULT_VIEWPORT);
+        assert!(app.page_js.is_some(), "back rebuilds the realm");
+        assert!(crate::app::tests::list_has(
+            &app.active_tab().display_list,
+            "JS-OK"
+        ));
+
+        app.reload(DEFAULT_VIEWPORT);
+        assert!(app.page_js.is_some(), "reload rebuilds the realm");
+    }
+
+    #[test]
+    fn switching_to_a_script_free_tab_drops_the_realm_without_a_reparse() {
+        let _guard = crate::app::tests::PAGE_JS_ENV_LOCK.lock().unwrap();
+        let url = crate::app::tests::js_site_url();
+        let mut app = App::new(None);
+        app.navigate(&url, DEFAULT_VIEWPORT);
+        assert!(app.page_js.is_some());
+        app.new_tab();
+        assert!(app.page_js.is_none(), "only the active tab owns a realm");
+        let before = format!("{:?}", app.active_tab().display_list.items);
+        app.switch_tab(0);
+        assert!(
+            app.page_js.is_some(),
+            "switching back to a scripted tab re-arms its realm"
+        );
+        assert!(crate::app::tests::list_has(
+            &app.active_tab().display_list,
+            "JS-OK"
+        ));
+        app.switch_tab(1);
+        assert!(app.page_js.is_none());
+        assert_eq!(
+            format!("{:?}", app.active_tab().display_list.items),
+            before,
+            "a script-free switch is still a pure display-list swap"
+        );
     }
 }

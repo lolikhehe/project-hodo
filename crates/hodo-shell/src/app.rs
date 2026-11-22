@@ -3,16 +3,22 @@
 //! The window-agnostic tab model lives in [`tabs`]; chrome composition in
 //! [`ui`]; the softbuffer draw path in [`present`].
 
+use std::cell::RefCell;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use hodo_css::{parse_stylesheet, Stylesheet};
-use hodo_dom::Dom;
+use hodo_cache::CacheKey;
+use hodo_css::{parse_stylesheet_with, Stylesheet};
+use hodo_dom::{Dom, NodeId};
+use hodo_ext_api::{ApiCall, ApiResult};
+use hodo_js::ExtScriptRuntime;
 use hodo_layout::DisplayList;
 use hodo_net::Resource;
 use hodo_types::Size;
+use serde_json::{json, Value};
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -170,6 +176,9 @@ impl BrowserApp {
         match action {
             FormAction::Navigate(url) => self.navigate(url),
             FormAction::Response { title, list, form } => {
+                // The response body replaces the document: its old realm must
+                // not keep delivering events into a DOM nobody paints.
+                self.state.page_js = None;
                 let tab = &mut self.state.tabs[self.state.active];
                 tab.display_list = list;
                 tab.title = title.clone();
@@ -250,6 +259,11 @@ impl BrowserApp {
             form.set_viewport(viewport);
         }
         self.sync_forms_list();
+        // The form list is a different DOM snapshot; for a JS page the live
+        // realm is authoritative, so re-pipe it after the form copy.
+        if self.state.page_js_relayout(self.viewport) {
+            self.force_full = true;
+        }
         if let Some(popup) = self.popup.as_mut() {
             popup.set_viewport(viewport);
         }
@@ -262,7 +276,7 @@ impl BrowserApp {
         self.popup.is_some() && matches!(key, Key::Named(NamedKey::Escape))
     }
 
-    /// Route a left-click: toolbar action → popup click → dismiss → page link.
+    /// Route a left-click: toolbar → popup → form control → page JS → link.
     fn click_at(&mut self, x: f32, y: f32) {
         if let Some(index) = crate::ui::hit_test_action(self.viewport, &self.ext_titles, x, y) {
             self.open_popup(index);
@@ -272,24 +286,42 @@ impl BrowserApp {
             if !inside {
                 self.close_popup();
             }
-        } else if self
-            .forms
-            .as_ref()
-            .is_some_and(|form| form.hit(x, y, self.state.active_tab().scroll_offset))
-        {
-            let scroll = self.state.active_tab().scroll_offset;
-            let action = self
+        } else {
+            // Resolve the NodeId before form state can replace the display
+            // list. Forms own inputs first; page listeners still see the click
+            // afterwards, and can mutate the same DOM the forms registry reads.
+            let node = self.state.hit_node(x, y);
+            let form_hit = self
                 .forms
-                .as_mut()
-                .and_then(|form| form.click(x, y, scroll));
-            self.state.url_focused = false;
-            self.tick_forms();
+                .as_ref()
+                .is_some_and(|form| form.hit(x, y, self.state.active_tab().scroll_offset));
+            let mut action = None;
+            if form_hit {
+                let scroll = self.state.active_tab().scroll_offset;
+                action = self
+                    .forms
+                    .as_mut()
+                    .and_then(|form| form.click(x, y, scroll));
+                self.state.url_focused = false;
+                self.tick_forms();
+            }
+            if let Some(node) = node {
+                if self.state.page_js_dispatch(
+                    node,
+                    "click",
+                    json!({ "x": x, "y": y }),
+                    self.viewport,
+                ) {
+                    self.force_full = true;
+                    self.request_redraw();
+                }
+            }
             if let Some(action) = action {
                 self.submit_form(action);
+            } else if !form_hit && self.state.handle_click(x, y) {
+                let title = self.state.active_tab().title.clone();
+                self.set_window_title(&title);
             }
-        } else if self.state.handle_click(x, y) {
-            let title = self.state.active_tab().title.clone();
-            self.set_window_title(&title);
         }
     }
 
@@ -318,14 +350,17 @@ impl BrowserApp {
                 }
             }
             if let Some(action) = submitted {
+                self.dispatch_page_key(&event);
                 self.submit_form(action);
                 return;
             }
             if handled {
                 self.tick_forms();
+                self.dispatch_page_key(&event);
                 return;
             }
         }
+        self.dispatch_page_key(&event);
         match event.logical_key.as_ref() {
             Key::Named(NamedKey::Enter) => {
                 if self.state.url_focused {
@@ -421,6 +456,30 @@ impl BrowserApp {
                 self.request_redraw();
             }
             _ => {}
+        }
+    }
+
+    /// Page key events target the document root. Form controls keep their own
+    /// registry handling first (see `on_key`); the URL bar and popup swallow
+    /// keys so typing there never reaches the page.
+    fn dispatch_page_key(&mut self, event: &KeyEvent) {
+        if self.state.url_focused || self.popup.is_some() {
+            return;
+        }
+        let Some(root) = self.state.page_js_root() else {
+            return;
+        };
+        let key = match event.logical_key.as_ref() {
+            Key::Named(named) => format!("{named:?}"),
+            Key::Character(text) => text.to_string(),
+            _ => String::new(),
+        };
+        if self
+            .state
+            .page_js_dispatch(root, "keydown", json!({ "key": key }), self.viewport)
+        {
+            self.force_full = true;
+            self.request_redraw();
         }
     }
 }
@@ -528,9 +587,15 @@ impl ApplicationHandler for BrowserApp {
         // Same dirty-fingerprint path the popup uses; edits are already applied
         // synchronously, so this is a safety net for future mutation sources.
         self.tick_forms();
-        // Idle costs nothing: redraws are event-driven. A popup still owns a JS
-        // context with timers, so keep its 33 ms tick until it closes.
-        let flow = if self.popup.is_some() {
+        // One page-JS tick per frame: drains timers/promises/events, detects
+        // native DOM mutation by fingerprint and re-pipes styles/layout once.
+        if self.state.page_js_tick(self.viewport) {
+            self.force_full = true;
+            self.request_redraw();
+        }
+        // Idle costs nothing without scripts: redraws are event-driven. An open
+        // popup or a page with live timers keeps the 33 ms tick until it closes.
+        let flow = if self.popup.is_some() || self.state.page_js_has_timers() {
             ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(33))
         } else {
             ControlFlow::Wait
@@ -539,14 +604,20 @@ impl ApplicationHandler for BrowserApp {
     }
 }
 
-/// Resolve a stylesheet `href` against the page URL.
+/// Resolve a stylesheet/script/image URL against the page's **final** URL.
 ///
-/// Naive by design: absolute URLs (with a scheme) pass through unchanged;
-/// otherwise the last path segment of `base` is replaced. Handles both `/`
-/// and `\` separators so local Windows paths work.
+/// For http(s) bases this delegates to hodo-net's RFC-style resolver so a
+/// root-relative `/static/x.css` keeps the authority instead of producing
+/// `https:///static/x.css`. Local Windows paths fall back to the old
+/// last-segment replacement (they have no URL authority).
 pub fn join_url(base: &str, href: &str) -> String {
     if href.contains("://") || href.starts_with("file:") || href.starts_with("data:") {
         return href.to_string();
+    }
+    if base.starts_with("http://") || base.starts_with("https://") {
+        if let Ok(resolved) = hodo_net::resolve_location(base, href) {
+            return resolved;
+        }
     }
     match base.rfind(['/', '\\']) {
         Some(index) => format!("{}{}", &base[..=index], href),
@@ -590,11 +661,271 @@ pub(crate) fn load_resource(url: &str) -> Result<Resource, hodo_net::FetchError>
     }
 }
 
-/// Run the whole pipeline for one URL and return `(title, display_list)`.
-///
-/// The DOM, stylesheet and style map are local to this function and dropped
-/// before it returns — that is the low-RAM contract of the shell.
-pub fn load_page(url: &str, viewport: Size) -> (String, DisplayList) {
+/// Follow redirect entries left in the shared cache by `load_with` and return
+/// the URL that actually served the body. `hodo_net::Resource` drops its
+/// `final_url`, so relative DOM URLs must be resolved through this seam or a
+/// redirected page resolves against a half-empty authority (`https:///…`).
+/// Private loads bypass the cache entirely and keep the request URL.
+fn final_base_url(url: &str) -> String {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return url.to_string();
+    }
+    let normalized = hodo_net::normalize_url(url).unwrap_or_else(|_| url.to_string());
+    let Some(cache) = shell_cache() else {
+        return normalized;
+    };
+    resolve_cached_redirects(normalized, |hop| {
+        let mut guard = cache.lock().unwrap_or_else(|err| err.into_inner());
+        let entry = guard.get(&CacheKey::new("GET", hop, ""))?;
+        Some((entry.status_code, entry.headers.get("location")?.clone()))
+    })
+}
+
+/// Pure redirect walk over a `(status, Location)` lookup, capped like hodo-net.
+fn resolve_cached_redirects<F>(mut current: String, mut hop: F) -> String
+where
+    F: FnMut(&str) -> Option<(u16, String)>,
+{
+    for _ in 0..5 {
+        let Some((status, location)) = hop(&current) else {
+            break;
+        };
+        if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+            break;
+        }
+        let Ok(next) = hodo_net::resolve_location(&current, &location) else {
+            break;
+        };
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    current
+}
+
+/// Script count cap. The central limit table has no page-script entry; reuse
+/// the live-context cap so a single document cannot spawn an unbounded realm.
+const MAX_PAGE_SCRIPTS: usize = hodo_types::limits::MAX_EXT_CONTEXTS;
+/// Per-script source cap, shared with every other untrusted resource.
+const MAX_SCRIPT_BYTES: usize = hodo_types::limits::MAX_RESOURCE_BYTES;
+/// Wall budget for a *series* of script evals. A single script is still bounded
+/// by hodo-js's loop (1e6) and recursion (256) runtime limits.
+const PAGE_SCRIPT_BUDGET: Duration = Duration::from_millis(50);
+
+/// `HODO_NO_PAGE_JS=1` disables the whole page-JS path, including collection:
+/// no realm is built and no extra work is done on script-free pages.
+fn page_js_enabled() -> bool {
+    !std::env::var_os("HODO_NO_PAGE_JS").is_some_and(|value| value == "1")
+}
+
+#[derive(Debug)]
+enum ScriptSource {
+    Inline(String),
+    External(String),
+}
+
+/// Attributes whose mutation can change style, layout or hit-testing. Interned
+/// DOMs have no attribute iterator, so enumerate the names (same list as the
+/// popup overlay's fingerprint).
+const FINGERPRINT_ATTRS: &[&str] = &[
+    "id",
+    "class",
+    "style",
+    "href",
+    "src",
+    "rel",
+    "action",
+    "method",
+    "name",
+    "value",
+    "type",
+    "checked",
+    "selected",
+    "disabled",
+    "readonly",
+    "placeholder",
+    "maxlength",
+    "rows",
+    "cols",
+    "width",
+    "height",
+    "colspan",
+    "rowspan",
+];
+
+/// Cheap change probe over the reachable DOM. hodo-js has no mutation counter
+/// and the DOM crate is not in this zone, so (like the popup overlay) we walk
+/// the live document once per tick rather than thread a dirty flag through the
+/// native bindings. Script mutation is detected before the next paint.
+fn dom_fingerprint(dom: &Dom) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    dom.walk(|id, node| {
+        id.0.hash(&mut hasher);
+        match &node.kind {
+            hodo_dom::NodeKind::Document => "document".hash(&mut hasher),
+            hodo_dom::NodeKind::Element { .. } => {
+                dom.tag(id).hash(&mut hasher);
+                for name in FINGERPRINT_ATTRS {
+                    dom.attr(id, name).hash(&mut hasher);
+                }
+            }
+            hodo_dom::NodeKind::Text(_) => dom.text(id).hash(&mut hasher),
+        }
+    });
+    hasher.finish()
+}
+
+/// Host side of `__hodoFetch`: GET only, through the same cached loader as
+/// stylesheets and `<script src>`. The page prelude never sees chrome/browser.
+fn page_fetch_hook(call: &ApiCall, base_url: &str) -> ApiResult {
+    let ApiCall::Fetch { url, method, body } = call else {
+        return ApiResult::Err("page: unsupported API call".to_string());
+    };
+    if method != "GET" || !body.is_empty() {
+        return ApiResult::Err("page fetch: only empty GET is supported".to_string());
+    }
+    let resolved = join_url(base_url, url);
+    match load_resource(&resolved) {
+        Ok(Resource::Html(text)) => {
+            ApiResult::Ok(json!({ "ok": true, "status": 200, "body": text }))
+        }
+        Ok(Resource::Other { data, .. }) => ApiResult::Ok(json!({
+            "ok": true,
+            "status": 200,
+            "body": String::from_utf8_lossy(&data)
+        })),
+        Err(err) => ApiResult::Err(format!("page fetch {resolved}: {err}")),
+    }
+}
+
+/// The JS realm of the active tab. Dropping it closes the realm, clears timers
+/// and unregisters every DOM handle owned by the page (hodo-js `Drop`).
+pub(crate) struct PageContext {
+    dom: Rc<RefCell<Dom>>,
+    runtime: ExtScriptRuntime,
+    base_url: String,
+    fingerprint: u64,
+}
+
+impl PageContext {
+    fn new(dom: Rc<RefCell<Dom>>, base_url: String, runtime: ExtScriptRuntime) -> Self {
+        let fingerprint = dom_fingerprint(&dom.borrow());
+        Self {
+            dom,
+            runtime,
+            base_url,
+            fingerprint,
+        }
+    }
+
+    pub(crate) fn has_timers(&self) -> bool {
+        self.runtime.timer_count() != 0
+    }
+
+    pub(crate) fn root(&self) -> NodeId {
+        self.dom.borrow().root()
+    }
+
+    /// Drain timers/promises/queued events, then relayout only if a native
+    /// actually changed the DOM. One fingerprint check per frame, so changes
+    /// from several tasks coalesce into one relayout.
+    pub(crate) fn tick(&mut self, viewport: Size) -> Option<DisplayList> {
+        self.runtime.tick();
+        let _ = self.runtime.take_message_replies();
+        for line in self.runtime.take_logs() {
+            eprintln!("hodo: page script: {line}");
+        }
+        self.recompute_if_changed(viewport)
+    }
+
+    /// Queue a DOM event and deliver it in this frame, so click/key handlers
+    /// are reflected in the very next paint.
+    pub(crate) fn dispatch(
+        &mut self,
+        node: NodeId,
+        kind: &str,
+        payload: Value,
+        viewport: Size,
+    ) -> Option<DisplayList> {
+        self.runtime.dispatch_page_event(node, kind, payload);
+        self.tick(viewport)
+    }
+
+    fn recompute_if_changed(&mut self, viewport: Size) -> Option<DisplayList> {
+        let fingerprint = dom_fingerprint(&self.dom.borrow());
+        if fingerprint == self.fingerprint {
+            return None;
+        }
+        self.fingerprint = fingerprint;
+        Some(self.relayout(viewport))
+    }
+
+    /// Full re-pipe against the live DOM (M5.3 incremental layout stays future).
+    pub(crate) fn relayout(&self, viewport: Size) -> DisplayList {
+        let dom = self.dom.borrow();
+        let stylesheet = collect_styles(&dom, &self.base_url, viewport);
+        let styles = hodo_style::compute_styles(&dom, &[stylesheet]);
+        hodo_layout::layout(&dom, &styles, viewport)
+    }
+}
+
+/// Resolve inline sources and `<script src>` in document order with hard caps.
+fn collect_scripts(found: Vec<ScriptSource>, page_url: &str) -> Vec<String> {
+    let mut scripts = Vec::new();
+    for source in found {
+        if scripts.len() >= MAX_PAGE_SCRIPTS {
+            eprintln!("hodo: page script cap of {MAX_PAGE_SCRIPTS} reached on {page_url}");
+            break;
+        }
+        let code = match source {
+            ScriptSource::Inline(text) => text,
+            ScriptSource::External(src) => {
+                let url = join_url(page_url, &src);
+                match load_resource(&url) {
+                    Ok(Resource::Html(text)) => text,
+                    Ok(Resource::Other { data, .. }) => String::from_utf8_lossy(&data).into_owned(),
+                    Err(err) => {
+                        eprintln!("hodo: page script {url}: {err}");
+                        continue;
+                    }
+                }
+            }
+        };
+        if code.len() > MAX_SCRIPT_BYTES {
+            eprintln!("hodo: page script on {page_url} exceeds {MAX_SCRIPT_BYTES} bytes");
+            continue;
+        }
+        scripts.push(code);
+    }
+    scripts
+}
+
+/// Full pipeline with an explicit JS toggle. The GUI keeps the returned realm;
+/// headless callers drop it, but still observe the scripts' DOM mutations in
+/// the display list (the `--screenshot` path relies on this).
+fn load_page_with_flag(
+    url: &str,
+    viewport: Size,
+    js_enabled: bool,
+) -> (String, DisplayList, Option<PageContext>) {
+    // A local directory is a site shorthand (`--screenshot examples/js-site`);
+    // resolve it before loading so relative script/src URLs get the right base.
+    let resolved = if !url.contains("://") && Path::new(url).extension().is_none() {
+        if Path::new(url).is_dir() {
+            Path::new(url)
+                .join("index.html")
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            url.to_string()
+        }
+    } else {
+        url.to_string()
+    };
+    let url = resolved.as_str();
     let html = if let Some(page) = crate::hpages::hodo_page_html(url) {
         page
     } else if url == ABOUT_HODO_URL {
@@ -606,26 +937,95 @@ pub fn load_page(url: &str, viewport: Size) -> (String, DisplayList) {
             Err(err) => crate::about::error_page_html(&err.to_string()),
         }
     };
-    let mut dom = hodo_html::parse_document(&html);
+    // The load above may have followed redirects; every relative URL below
+    // must resolve against the URL that actually served this body.
+    let base_url = final_base_url(url);
+    let dom = Rc::new(RefCell::new(hodo_html::parse_document(&html)));
     // Layout has no base-URL parameter, so a relative img[src] would resolve
-    // against the process CWD. Rewrite it against the page we actually loaded.
-    let mut relative_images = Vec::new();
-    dom.walk(|id, _| {
-        if dom.tag(id).is_some_and(|t| t.eq_ignore_ascii_case("img")) {
-            if let Some(src) = dom.attr(id, "src") {
-                if !src.contains("://") && !src.starts_with("data:") {
-                    relative_images.push((id, join_url(url, src)));
+    // against the process CWD. Rewrite it against the final page URL.
+    {
+        let mut doc = dom.borrow_mut();
+        let mut relative_images = Vec::new();
+        doc.walk(|id, _| {
+            if doc.tag(id).is_some_and(|t| t.eq_ignore_ascii_case("img")) {
+                if let Some(src) = doc.attr(id, "src") {
+                    if !src.contains("://") && !src.starts_with("data:") {
+                        relative_images.push((id, join_url(&base_url, src)));
+                    }
                 }
             }
+        });
+        for (id, src) in relative_images {
+            doc.set_attr(id, "src", src);
         }
-    });
-    for (id, src) in relative_images {
-        dom.set_attr(id, "src", src);
     }
-    let title = first_title(&dom);
-    let stylesheet = collect_styles(&dom, url);
-    let styles = hodo_style::compute_styles(&dom, &[stylesheet]);
-    let display_list = hodo_layout::layout(&dom, &styles, viewport);
+
+    // `scan_document` folds script discovery into the existing title walk, so
+    // a script-free page pays no extra traversal at all.
+    let (title, found) = {
+        let doc = dom.borrow();
+        scan_document(&doc, js_enabled)
+    };
+    let scripts = if js_enabled {
+        collect_scripts(found, &base_url)
+    } else {
+        Vec::new()
+    };
+
+    // realm-drop → parse → collect → eval → DOMContentLoaded → styles/layout
+    let page = if scripts.is_empty() {
+        None
+    } else {
+        let root = dom.borrow().root();
+        let mut runtime = ExtScriptRuntime::new_page(Rc::clone(&dom));
+        let fetch_base = base_url.clone();
+        runtime.set_fetch_hook(Rc::new(move |call| page_fetch_hook(call, &fetch_base)));
+        // Page scripts cannot exchange extension messages, but drain replies
+        // anyway so a stray sendResponse cannot grow the runtime's queue.
+        runtime.set_message_reply_hook(Some(Rc::new(|_: &Value, _: &Value| {})));
+        let started = Instant::now();
+        for script in scripts {
+            if started.elapsed() > PAGE_SCRIPT_BUDGET {
+                eprintln!("hodo: page script budget exceeded on {url}");
+                break;
+            }
+            if let Err(err) = runtime.eval(&script) {
+                eprintln!("hodo: page script on {url}: {err}");
+            }
+        }
+        runtime.dispatch_page_event(root, "DOMContentLoaded", json!({}));
+        let _ = runtime.tick();
+        for line in runtime.take_logs() {
+            eprintln!("hodo: page script on {url}: {line}");
+        }
+        Some(PageContext::new(Rc::clone(&dom), base_url.clone(), runtime))
+    };
+
+    let display_list = {
+        let doc = dom.borrow();
+        let stylesheet = collect_styles(&doc, &base_url, viewport);
+        let styles = hodo_style::compute_styles(&doc, &[stylesheet]);
+        hodo_layout::layout(&doc, &styles, viewport)
+    };
+    (title, display_list, page)
+}
+
+/// Navigation/reload/back entry point that keeps the new realm alive for
+/// events and post-load mutation relayout.
+pub(crate) fn load_page_live(
+    url: &str,
+    viewport: Size,
+) -> (String, DisplayList, Option<PageContext>) {
+    load_page_with_flag(url, viewport, page_js_enabled())
+}
+
+/// Run the whole pipeline for one URL and return `(title, display_list)`.
+///
+/// The DOM, stylesheet, style map — and any page JS realm created to produce
+/// the mutations — are local to this function and dropped before it returns.
+/// Headless screenshot mode uses this path.
+pub fn load_page(url: &str, viewport: Size) -> (String, DisplayList) {
+    let (title, display_list, _) = load_page_live(url, viewport);
     (title, display_list)
 }
 
@@ -657,29 +1057,57 @@ pub fn premultiply_rgba(rgba: &[u8]) -> Vec<u8> {
     out
 }
 
-fn first_title(dom: &Dom) -> String {
+/// One walk for the page title and its script sources. Inline text and
+/// `src=` URLs are collected in document order; `type=module` is skipped
+/// (module graph loading is not part of this substrate).
+fn scan_document(dom: &Dom, js_enabled: bool) -> (String, Vec<ScriptSource>) {
     let mut title = String::new();
-    let mut found = false;
+    let mut found_title = false;
+    let mut scripts = Vec::new();
     dom.walk(|id, _| {
-        if !found && dom.tag(id) == Some("title") {
-            found = true;
+        if !found_title && dom.tag(id) == Some("title") {
+            found_title = true;
             for &child in dom.children(id) {
                 if let Some(text) = dom.text(child) {
                     title.push_str(text);
                 }
             }
         }
+        // The kill switch skips even script discovery inside this walk.
+        if !js_enabled || dom.tag(id) != Some("script") {
+            return;
+        }
+        if dom
+            .attr(id, "type")
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("module"))
+        {
+            return;
+        }
+        if let Some(src) = dom.attr(id, "src") {
+            scripts.push(ScriptSource::External(src.to_string()));
+        } else {
+            let mut source = String::new();
+            for &child in dom.children(id) {
+                if let Some(text) = dom.text(child) {
+                    source.push_str(text);
+                }
+            }
+            scripts.push(ScriptSource::Inline(source));
+        }
     });
-    title
+    (title, scripts)
 }
 
-pub(crate) fn collect_styles(dom: &Dom, page_url: &str) -> Stylesheet {
+pub(crate) fn collect_styles(dom: &Dom, page_url: &str, viewport: Size) -> Stylesheet {
     // The engine's UA sheet does not hide <head>; without this the <style>
     // and <title> text would spill into the page as visible text.
     let mut sources: Vec<String> =
         vec!["head, style, link, meta, title, script { display: none }".to_owned()];
 
-    // Every <style> element contributes the text of its children.
+    // One document-order walk: inline <style> text and fetched <link> bodies
+    // are appended as they appear. A later sheet now wins a same-specificity
+    // tie over an earlier one, matching the browser cascade. dom.walk visits
+    // nodes in html5ever append order, so children are already in order.
     dom.walk(|id, _| {
         if dom.tag(id) == Some("style") {
             for &child in dom.children(id) {
@@ -687,38 +1115,64 @@ pub(crate) fn collect_styles(dom: &Dom, page_url: &str) -> Stylesheet {
                     sources.push(text.to_owned());
                 }
             }
-        }
-    });
-
-    // Every <link rel="stylesheet" href="..."> is resolved and loaded.
-    // Load failures are ignored; the rest of the page still renders.
-    dom.walk(|id, _| {
-        if dom.tag(id) == Some("link") && dom.attr(id, "rel") == Some("stylesheet") {
-            if let Some(href) = dom.attr(id, "href") {
-                let resolved = join_url(page_url, href);
-                if let Ok(resource) = load_resource(&resolved) {
-                    match resource {
-                        Resource::Html(text) => sources.push(text),
-                        Resource::Other { data, .. } => {
-                            sources.push(String::from_utf8_lossy(&data).into_owned());
-                        }
-                    }
+        } else if dom.tag(id) == Some("link") && dom.attr(id, "rel") == Some("stylesheet") {
+            // Wave-1 simplification: only `media="print"` is non-matching.
+            // `all`/`screen`/absent (and any other value) load; a future wave
+            // can evaluate the full media list against `css_viewport`.
+            if dom
+                .attr(id, "media")
+                .is_some_and(|m| m.trim().eq_ignore_ascii_case("print"))
+            {
+                return;
+            }
+            let Some(href) = dom.attr(id, "href") else {
+                return;
+            };
+            let resolved = join_url(page_url, href);
+            match load_resource(&resolved) {
+                Ok(Resource::Html(text)) => sources.push(text),
+                Ok(Resource::Other { data, .. }) => {
+                    sources.push(String::from_utf8_lossy(&data).into_owned());
                 }
+                Err(err) => eprintln!("hodo: stylesheet {resolved}: {err}"),
             }
         }
     });
 
+    let css_viewport = hodo_css::Viewport {
+        width: viewport.w.round().max(1.0) as u32,
+        height: viewport.h.round().max(1.0) as u32,
+        media_type: hodo_css::MediaType::Screen,
+        scripting_enabled: true,
+    };
     let mut rules = Vec::new();
     for source in sources {
-        rules.extend(parse_stylesheet(&source).rules);
+        rules.extend(parse_stylesheet_with(css_viewport, &source).rules);
     }
     Stylesheet { rules }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use std::path::Path;
+
+    /// Tests that toggle `HODO_NO_PAGE_JS` hold this lock; every test that
+    /// loads the JS fixture takes it too, so a parallel test never sees the
+    /// kill switch mid-flip.
+    pub(crate) static PAGE_JS_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    pub(crate) fn js_site_url() -> String {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/js-site/index.html")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    pub(crate) fn list_has(list: &DisplayList, fragment: &str) -> bool {
+        list.items
+            .iter()
+            .any(|item| format!("{item:?}").contains(fragment))
+    }
 
     fn linked_text(x: f32, y: f32, w: f32, h: f32, href: Option<&str>) -> DisplayItem {
         DisplayItem::Text {
@@ -748,6 +1202,117 @@ mod tests {
             "D:\\site\\style.css"
         );
         assert_eq!(join_url("page.html", "style.css"), "style.css");
+    }
+
+    /// One local `<link>` sheet + arbitrary `<head>` markup; returns the
+    /// computed color of `<p class="target">` after the real shell pipeline.
+    fn stylesheet_color(tag: &str, sheet: &str, head: &str, viewport: Size) -> Color {
+        let dir = std::env::temp_dir().join(format!("hodo-css-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sheet.css"), sheet).unwrap();
+        let page = dir.join("index.html").to_string_lossy().into_owned();
+        let html =
+            format!("<html><head>{head}</head><body><p class=\"target\">x</p></body></html>");
+        let dom = hodo_html::parse_document(&html);
+        let stylesheet = collect_styles(&dom, &page, viewport);
+        let styles = hodo_style::compute_styles(&dom, &[stylesheet]);
+        let mut target = None;
+        dom.walk(|id, _| {
+            if dom.attr(id, "class") == Some("target") {
+                target = Some(id);
+            }
+        });
+        let color = styles
+            .get(target.expect("fixture has .target"))
+            .unwrap()
+            .color;
+        let _ = std::fs::remove_dir_all(&dir);
+        color
+    }
+
+    #[test]
+    fn stylesheet_merge_order_follows_document_order() {
+        let sheet = "p.target { color: rgb(255, 0, 0) }";
+        let inline = "<style>p.target { color: rgb(0, 128, 0) }</style>";
+        // <link> first, inline later: the inline rule wins the same-specificity tie.
+        assert_eq!(
+            stylesheet_color(
+                "link-first",
+                sheet,
+                &format!("<link rel=\"stylesheet\" href=\"sheet.css\">{inline}"),
+                DEFAULT_VIEWPORT,
+            ),
+            Color::rgb(0, 128, 0),
+        );
+        // Inline first, <link> later: the external rule wins the tie.
+        assert_eq!(
+            stylesheet_color(
+                "style-first",
+                sheet,
+                &format!("{inline}<link rel=\"stylesheet\" href=\"sheet.css\">"),
+                DEFAULT_VIEWPORT,
+            ),
+            Color::rgb(255, 0, 0),
+        );
+    }
+
+    #[test]
+    fn print_media_link_is_skipped_but_other_media_load() {
+        let sheet = "p.target { color: rgb(255, 0, 0) }";
+        assert_eq!(
+            stylesheet_color(
+                "print",
+                sheet,
+                "<link rel=\"stylesheet\" href=\"sheet.css\" media=\"print\">",
+                DEFAULT_VIEWPORT,
+            ),
+            Color::BLACK,
+            "a print-only sheet must not style the screen",
+        );
+        assert_eq!(
+            stylesheet_color(
+                "screen",
+                sheet,
+                "<link rel=\"stylesheet\" href=\"sheet.css\" media=\"screen\">",
+                DEFAULT_VIEWPORT,
+            ),
+            Color::rgb(255, 0, 0),
+        );
+    }
+
+    #[test]
+    fn stylesheet_media_evaluates_against_the_shell_viewport() {
+        let sheet = "p.target { color: rgb(0, 0, 255) } \
+                     @media (max-width: 500px) { p.target { color: rgb(255, 0, 0) } }";
+        let link = "<link rel=\"stylesheet\" href=\"sheet.css\">";
+        assert_eq!(
+            stylesheet_color("narrow", sheet, link, Size { w: 400.0, h: 300.0 }),
+            Color::rgb(255, 0, 0),
+        );
+        assert_eq!(
+            stylesheet_color("wide", sheet, link, DEFAULT_VIEWPORT),
+            Color::rgb(0, 0, 255),
+        );
+    }
+
+    #[test]
+    fn failed_stylesheet_link_warns_and_the_page_still_renders() {
+        let dir = std::env::temp_dir().join(format!("hodo-css-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let page = dir.join("index.html").to_string_lossy().into_owned();
+        let html = "<html><head><link rel=\"stylesheet\" href=\"missing.css\"></head>\
+                    <body><p>still here</p></body></html>";
+        let dom = hodo_html::parse_document(html);
+        let stylesheet = collect_styles(&dom, &page, DEFAULT_VIEWPORT);
+        let styles = hodo_style::compute_styles(&dom, &[stylesheet]);
+        let list = hodo_layout::layout(&dom, &styles, DEFAULT_VIEWPORT);
+        assert!(
+            list_has(&list, "still here"),
+            "one bad sheet must not drop the page"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1095,5 +1660,271 @@ mod tests {
             "the clamped panel must paint into the main frame"
         );
         assert!(frame.iter().all(|&pixel| pixel >> 24 == 255));
+    }
+
+    // ---- page JS ---------------------------------------------------------
+
+    #[test]
+    fn js_site_scripts_mutate_dom_before_first_paint() {
+        let _guard = PAGE_JS_ENV_LOCK.lock().unwrap();
+        let (_, list, ctx) = load_page_live(&js_site_url(), DEFAULT_VIEWPORT);
+        assert!(ctx.is_some(), "the fixture declares a script");
+        assert!(
+            list_has(&list, "JS-OK"),
+            "script mutation must reach the first paint"
+        );
+        assert!(!list_has(&list, "JS-PENDING"));
+    }
+
+    #[test]
+    fn js_site_click_from_node_map_updates_counter_via_page_listener() {
+        let _guard = PAGE_JS_ENV_LOCK.lock().unwrap();
+        let (_, list, ctx) = load_page_live(&js_site_url(), DEFAULT_VIEWPORT);
+        let index = list
+            .items
+            .iter()
+            .position(|item| {
+                matches!(
+                    item,
+                    DisplayItem::Control {
+                        kind: hodo_layout::ControlKind::Button,
+                        name,
+                        ..
+                    } if name == "btn"
+                )
+            })
+            .expect("the fixture button is in the display list");
+        let node = list.node_map[index];
+        let mut ctx = ctx.expect("the fixture has a live page realm");
+        let fresh = ctx
+            .dispatch(
+                node,
+                "click",
+                json!({ "x": 10.0, "y": 10.0 }),
+                DEFAULT_VIEWPORT,
+            )
+            .expect("the click listener mutated the DOM");
+        assert!(list_has(&fresh, "count: 1"));
+        let fresh = ctx
+            .dispatch(node, "click", json!({}), DEFAULT_VIEWPORT)
+            .expect("the second click mutated the DOM");
+        assert!(list_has(&fresh, "count: 2"));
+    }
+
+    #[test]
+    fn redirect_final_url_drives_relative_resource_resolution() {
+        let final_url =
+            resolve_cached_redirects("https://example.com/sub/".to_string(), |hop| match hop {
+                "https://example.com/sub/" => {
+                    Some((301, "https://other.example.com/deep/".to_string()))
+                }
+                "https://other.example.com/deep/" => {
+                    Some((308, "https://final.example.com/root/".to_string()))
+                }
+                _ => None,
+            });
+        assert_eq!(final_url, "https://final.example.com/root/");
+        assert_eq!(
+            join_url(&final_url, "img/x.png"),
+            "https://final.example.com/root/img/x.png"
+        );
+        assert_eq!(
+            join_url(&final_url, "/static/site.css"),
+            "https://final.example.com/static/site.css",
+            "root-relative URLs must keep the authority"
+        );
+    }
+
+    #[test]
+    fn cached_redirect_entry_supplies_the_final_base_url() {
+        let dir = std::env::temp_dir().join(format!("hodo-redirect-base-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cache = hodo_cache::DiskCache::open(&dir, 1024 * 1024).unwrap();
+        let key = CacheKey::new("GET", "https://example.com/sub/", "");
+        let entry = hodo_cache::CacheEntry {
+            url: key.url.clone(),
+            content_type: String::new(),
+            data: Vec::new(),
+            status_code: 301,
+            expires_at: None,
+            etag: None,
+            last_modified: None,
+            vary: Default::default(),
+            headers: [(
+                "location".to_string(),
+                "https://other.example.com/deep/".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            partition_key: String::new(),
+            request_method: "GET".to_string(),
+            stored_at: 0,
+        };
+        cache.put(&key, &entry).unwrap();
+        let final_url = resolve_cached_redirects("https://example.com/sub/".to_string(), |hop| {
+            let found = cache.get(&CacheKey::new("GET", hop, ""))?;
+            Some((found.status_code, found.headers.get("location")?.clone()))
+        });
+        assert_eq!(final_url, "https://other.example.com/deep/");
+        drop(cache);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn script_free_demo_has_no_page_js_overhead() {
+        let _guard = PAGE_JS_ENV_LOCK.lock().unwrap();
+        let demo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/demo-site/index.html")
+            .to_string_lossy()
+            .into_owned();
+        let (_, _, ctx) = load_page_live(&demo, DEFAULT_VIEWPORT);
+        assert!(ctx.is_none(), "a script-free page creates no realm");
+
+        let bench = |enabled: bool| {
+            let start = Instant::now();
+            for _ in 0..24 {
+                let _ = load_page_with_flag(&demo, DEFAULT_VIEWPORT, enabled);
+            }
+            start.elapsed().as_secs_f64()
+        };
+        let _ = bench(true); // warm the shared cache and allocator
+        let on = bench(true);
+        let off = bench(false);
+        let delta = if off > 0.0 {
+            (on - off) / off * 100.0
+        } else {
+            0.0
+        };
+        eprintln!(
+            "script-free demo — page JS on: {:.2} ms | off: {:.2} ms | delta: {delta:.1}%",
+            on * 1000.0,
+            off * 1000.0
+        );
+        assert!(
+            on <= off * 1.75 + 0.01,
+            "script-free page must not pay for page JS: {on} vs {off}"
+        );
+    }
+
+    #[test]
+    fn hodo_no_page_js_kills_the_whole_path() {
+        let _guard = PAGE_JS_ENV_LOCK.lock().unwrap();
+        std::env::set_var("HODO_NO_PAGE_JS", "1");
+        let enabled = page_js_enabled();
+        let (_, list, ctx) = load_page_live(&js_site_url(), DEFAULT_VIEWPORT);
+        std::env::remove_var("HODO_NO_PAGE_JS");
+        assert!(!enabled);
+        assert!(ctx.is_none(), "the kill switch must build no realm");
+        assert!(list_has(&list, "JS-PENDING"));
+        assert!(!list_has(&list, "JS-OK"));
+        assert!(page_js_enabled(), "the switch must be scoped to its value");
+    }
+
+    #[test]
+    fn script_caps_skip_modules_and_beyond_16() {
+        let _guard = PAGE_JS_ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("hodo-js-site-caps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut html = String::from(
+            "<div id=\"out\">none</div>\
+             <script type=\"module\">document.getElementById('out').textContent='module';</script>",
+        );
+        for i in 0..(MAX_PAGE_SCRIPTS + 1) {
+            html.push_str(&format!(
+                "<script>document.getElementById('out').textContent='s{i}';</script>"
+            ));
+        }
+        let path = dir.join("index.html");
+        std::fs::write(&path, html).unwrap();
+        let url = path.to_string_lossy().into_owned();
+        let (_, list, ctx) = load_page_live(&url, DEFAULT_VIEWPORT);
+        assert!(ctx.is_some());
+        let last = MAX_PAGE_SCRIPTS - 1;
+        assert!(
+            list_has(&list, &format!("s{last}")),
+            "16 scripts run in order"
+        );
+        assert!(!list_has(&list, &format!("s{MAX_PAGE_SCRIPTS}")));
+        assert!(!list_has(&list, "module"), "type=module is skipped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn directory_url_loads_index_html_and_runs_scripts() {
+        let _guard = PAGE_JS_ENV_LOCK.lock().unwrap();
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/js-site")
+            .to_string_lossy()
+            .into_owned();
+        let (title, list, ctx) = load_page_live(&dir, DEFAULT_VIEWPORT);
+        assert_eq!(title, "JS site");
+        assert!(ctx.is_some());
+        assert!(list_has(&list, "JS-OK"));
+    }
+
+    #[test]
+    fn js_site_painted_frame_contains_the_mutated_text_region() {
+        let _guard = PAGE_JS_ENV_LOCK.lock().unwrap();
+        let url = js_site_url();
+        let (_, js_list, _) = load_page_live(&url, DEFAULT_VIEWPORT);
+        let (_, raw_list, _) = load_page_with_flag(&url, DEFAULT_VIEWPORT, false);
+        let mut js_frame = hodo_render::render(&js_list, DEFAULT_VIEWPORT);
+        let mut raw_frame = hodo_render::render(&raw_list, DEFAULT_VIEWPORT);
+        composite_over_white(&mut js_frame);
+        composite_over_white(&mut raw_frame);
+        assert_ne!(
+            js_frame, raw_frame,
+            "the script's DOM mutation must reach the painted pixels"
+        );
+        let rect = js_list
+            .items
+            .iter()
+            .find_map(|item| match item {
+                DisplayItem::Text { rect, text, .. } if text.contains("JS-OK") => Some(*rect),
+                _ => None,
+            })
+            .expect("JS-OK is laid out as a text item");
+        let dark_pixels = |frame: &[u8]| -> usize {
+            let mut count = 0;
+            let w = DEFAULT_VIEWPORT.w as usize;
+            let h = DEFAULT_VIEWPORT.h as usize;
+            for y in (rect.y.max(0.0) as usize)..((rect.y + rect.h) as usize).min(h) {
+                for x in (rect.x.max(0.0) as usize)..((rect.x + rect.w) as usize).min(w) {
+                    let index = (y * w + x) * 4;
+                    if frame[index] < 200 {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        };
+        assert!(
+            dark_pixels(&js_frame) > 0,
+            "the JS-OK glyph band must contain dark pixels"
+        );
+    }
+
+    #[test]
+    fn js_site_keydown_reaches_document_listener() {
+        let _guard = PAGE_JS_ENV_LOCK.lock().unwrap();
+        let (_, _, ctx) = load_page_live(&js_site_url(), DEFAULT_VIEWPORT);
+        let root = ctx.as_ref().unwrap().root();
+        let list = ctx
+            .unwrap()
+            .dispatch(root, "keydown", json!({ "key": "Enter" }), DEFAULT_VIEWPORT)
+            .expect("the keydown listener mutated the DOM");
+        assert!(list_has(&list, "key:Enter"));
+    }
+
+    #[test]
+    fn oversized_script_source_is_dropped() {
+        let scripts = collect_scripts(
+            vec![
+                ScriptSource::Inline("small".to_string()),
+                ScriptSource::Inline("x".repeat(MAX_SCRIPT_BYTES + 1)),
+            ],
+            "about:test",
+        );
+        assert_eq!(scripts, ["small"]);
     }
 }
