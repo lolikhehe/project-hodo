@@ -1,1 +1,0 @@
-import{O as e}from"./vendor-lit-MQ4DzmMc.js";function t(t,n,r){return r||(r=encodeURIComponent(`${t}:"${n}"`)),e`<a class="metadata-search-link" href=${`/search?query=${r}`}>${n}</a>`}export{t};

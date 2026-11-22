@@ -60,6 +60,20 @@ fn action_button(label: &str, key: &str) -> String {
     )
 }
 
+/// Performance readout uses the EFFECTIVE knobs, not the preset's nominal
+/// values: env overrides (and a corrupt-file fallback) can differ from the
+/// preset, and `cache_cap_mb` is frozen in a `OnceLock` until restart.
+fn performance_summary(s: &crate::settings::Settings) -> String {
+    format!(
+        "<p>RAM budget: {} (restart) — spill {}, cache {} MiB, glyph atlas {} MiB, JS budget {} ms.</p>",
+        escape_html(&s.ram_budget),
+        s.spill_threshold,
+        s.cache_cap_mb,
+        s.glyph_cache_mb,
+        s.js_budget_ms
+    )
+}
+
 /// `hodo://settings`: live, persisted knobs rendered as M3E switches.
 pub fn settings_html() -> String {
     let s = crate::settings::current();
@@ -68,7 +82,6 @@ pub fn settings_html() -> String {
     let build_ms = hodo_adblock::automaton_build_millis();
     let stats = hodo_net::privacy_stats();
     let dark = read_dark_enabled();
-    let preset = crate::settings::ram_preset(&s.ram_budget);
 
     let mut out = String::from(
         "<html><head><title>hodo — settings</title><style>\
@@ -85,6 +98,21 @@ pub fn settings_html() -> String {
 
     out.push_str("<h2>Appearance</h2>");
     out.push_str(&switch_row("Dark theme", "theme", dark, false));
+
+    out.push_str("<h2>Search</h2>");
+    out.push_str(&radio_row(
+        "DuckDuckGo Lite",
+        "search_engine",
+        "duckduckgo",
+        s.search_engine == "duckduckgo",
+    ));
+    // Declared today, but Google's page is JS-walled for our engine (blank).
+    out.push_str(&radio_row(
+        "Google (JS-walled)",
+        "search_engine",
+        "google",
+        s.search_engine == "google",
+    ));
 
     out.push_str("<h2>Privacy &amp; Security</h2>");
     out.push_str(&switch_row(
@@ -134,14 +162,7 @@ pub fn settings_html() -> String {
     out.push_str(&action_button("Clear HSTS hosts", "clear_hsts"));
 
     out.push_str("<h2>Performance</h2>");
-    out.push_str(&format!(
-        "<p>RAM budget: {} — spill {}, cache {} MiB, glyph atlas {} MiB, JS budget {} ms.</p>",
-        escape_html(&s.ram_budget),
-        preset.spill_threshold,
-        preset.cache_cap_mb,
-        preset.glyph_cache_mb,
-        preset.js_budget_ms
-    ));
+    out.push_str(&performance_summary(&s));
     out.push_str(&radio_row(
         "Low",
         "ram_budget",
@@ -339,6 +360,10 @@ pub(crate) mod tests {
         assert!(page.contains("name=\"setting:javascript\" value=\"on\" checked"));
         assert!(page.contains("Enable JavaScript") && page.contains("(restart)"));
         assert!(page.contains("name=\"setting:ram_budget\" value=\"balanced\""));
+        assert!(
+            page.contains("name=\"setting:search_engine\" value=\"duckduckgo\" checked")
+                && page.contains("name=\"setting:search_engine\" value=\"google\"")
+        );
         assert!(page.contains("HODO_NO_ADBLOCK") && page.contains("HODO_NO_ISOLATION"));
         assert!(page.contains("Settings loaded from:"));
         assert!(page.contains("Rules parsed") || page.contains("rules parsed"));
@@ -347,6 +372,21 @@ pub(crate) mod tests {
         let page = settings_html();
         assert!(page.contains("name=\"setting:adblock\" value=\"on\" checked"));
         assert!(page.contains("Dark theme"));
+    }
+
+    #[test]
+    fn performance_summary_shows_effective_values_and_restart_hint() {
+        // Env overrides can make the effective cache cap differ from the
+        // "balanced" preset's 128 MiB; the page must show the effective value.
+        let s = crate::settings::Settings {
+            cache_cap_mb: 7,
+            spill_threshold: 3,
+            ..Default::default()
+        };
+        let summary = performance_summary(&s);
+        assert!(summary.contains("(restart)"), "{summary}");
+        assert!(summary.contains("cache 7 MiB"), "{summary}");
+        assert!(summary.contains("spill 3"), "{summary}");
     }
 
     #[test]

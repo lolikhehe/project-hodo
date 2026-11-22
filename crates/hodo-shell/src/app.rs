@@ -4,19 +4,22 @@
 //! [`ui`]; the softbuffer draw path in [`present`].
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use accesskit::{ActionHandler, ActionRequest, ActivationHandler, DeactivationHandler, TreeUpdate};
+use hodo_a11y::{ControlStates, TreeBuilder};
 use hodo_cache::CacheKey;
 use hodo_css::{parse_stylesheet_with, Stylesheet};
 use hodo_dom::{Dom, NodeId, NodeKind};
-use hodo_ext_api::{ApiCall, ApiResult};
+use hodo_ext_api::{ApiCall, ApiDialect, ApiResult, RuntimeConfig};
+use hodo_ext_manifest::{ManifestVersion, RunAt};
 use hodo_js::ExtScriptRuntime;
-use hodo_layout::DisplayList;
+use hodo_layout::{ControlKind, DisplayList};
 use hodo_net::Resource;
 use hodo_types::Size;
 use serde_json::{json, Value};
@@ -60,10 +63,142 @@ pub const SCROLL_LINE: f32 = 40.0;
 /// Pixels scrolled per PageUp / PageDown key press.
 pub const SCROLL_PAGE: f32 = 400.0;
 
+/// Only prime the next realm when winit is about to block with nothing pending:
+/// an open popup or a live page timer schedules another frame, so the ~56 ms
+/// prelude parse must wait for a truly idle moment.
+fn idle_prime_allowed(popup_open: bool, timers_pending: bool) -> bool {
+    !popup_open && !timers_pending
+}
+
+/// AccessKit activation stubs. The tree is pushed from the shell on layout
+/// settle; the initial-tree request is answered by that first push.
+struct QuietActivation;
+impl ActivationHandler for QuietActivation {
+    fn request_initial_tree(&mut self) -> Option<TreeUpdate> {
+        None
+    }
+}
+struct QuietDeactivation;
+impl DeactivationHandler for QuietDeactivation {
+    fn deactivate_accessibility(&mut self) {}
+}
+
+/// accesskit_winit 0.34.2 delivers actions through the `ActionHandler` passed
+/// to `Adapter::with_direct_handlers`, on a platform-dependent thread. Queue
+/// the raw request here; the winit loop decodes it with the page's `TreeBuilder`
+/// and applies it through [`ShellActions`] on the main thread.
+#[derive(Clone, Default)]
+struct A11yActionQueue(Arc<Mutex<VecDeque<ActionRequest>>>);
+
+impl A11yActionQueue {
+    fn take(&self) -> Vec<ActionRequest> {
+        self.0
+            .lock()
+            .map(|mut queue| std::mem::take(&mut *queue).into_iter().collect())
+            .unwrap_or_default()
+    }
+}
+
+impl ActionHandler for A11yActionQueue {
+    fn do_action(&mut self, request: ActionRequest) {
+        if let Ok(mut queue) = self.0.lock() {
+            queue.push_back(request);
+        }
+    }
+}
+
+/// Shell side of `hodo_a11y::ActionHandler`. Borrows only the pieces of app
+/// state an AT action can change, so decoding stays on the winit thread.
+struct ShellActions<'a> {
+    forms: &'a mut Option<FormPage>,
+    /// Stable DOM handle for each registry control, captured at registration.
+    control_nodes: &'a [NodeId],
+    scroll: f32,
+    submits: &'a mut Vec<FormAction>,
+    changed: &'a mut bool,
+}
+
+impl hodo_a11y::ActionHandler for ShellActions<'_> {
+    fn do_default(&mut self, node: NodeId) {
+        let Some(index) = self.control_nodes.iter().position(|&owner| owner == node) else {
+            return;
+        };
+        let Some(form) = self.forms.as_mut() else {
+            return;
+        };
+        let Some(control) = form.registry.controls.get(index) else {
+            return;
+        };
+        if control.disabled {
+            return;
+        }
+        // Reuse the exact click-activation path: feed it the target's centre in
+        // page coordinates. Topmost-wins hit testing can pick an overlapping
+        // later control; forms in this wave do not overlap.
+        let rect = control.rect;
+        let x = rect.x + rect.w / 2.0;
+        let y = rect.y + rect.h / 2.0 - self.scroll;
+        if let Some(action) = form.click(x, y, self.scroll) {
+            self.submits.push(action);
+        }
+        *self.changed = true;
+    }
+
+    fn set_focus(&mut self, node: NodeId) {
+        let Some(index) = self.control_nodes.iter().position(|&owner| owner == node) else {
+            return;
+        };
+        if let Some(form) = self.forms.as_mut() {
+            if form
+                .registry
+                .controls
+                .get(index)
+                .is_some_and(|control| !control.disabled)
+            {
+                form.registry.focus = Some(index);
+                *self.changed = true;
+            }
+        }
+    }
+
+    fn set_value(&mut self, node: NodeId, value: &str) {
+        let Some(index) = self.control_nodes.iter().position(|&owner| owner == node) else {
+            return;
+        };
+        let Some(form) = self.forms.as_mut() else {
+            return;
+        };
+        let Some(control) = form.registry.controls.get_mut(index) else {
+            return;
+        };
+        // No dedicated set-value method exists in forms.rs; its fields are
+        // crate-visible, so update the authoritative value and caret here.
+        if control.disabled
+            || control.readonly
+            || !matches!(control.kind, ControlKind::TextInput | ControlKind::Textarea)
+        {
+            return;
+        }
+        control.value = value.to_owned();
+        control.caret = control.value.chars().count();
+        *self.changed = true;
+    }
+}
+
 /// State owned by the winit event loop. Graphics objects live here; the tab
 /// model (`tabs::App`) stays window-agnostic and unit-testable.
 pub(crate) struct BrowserApp {
     pub(crate) window: Option<Arc<Window>>,
+    /// Platform adapter, created alongside the window. `None` in headless/tests.
+    a11y: Option<accesskit_winit::Adapter>,
+    /// AT requests from the adapter's direct action handler, pending on the
+    /// winit thread. Drained once per frame.
+    a11y_actions: A11yActionQueue,
+    /// Retained `NodeId -> control state` map and focus handle for the page.
+    a11y_builder: TreeBuilder,
+    /// Stable DOM owner of each registry control, aligned with
+    /// `forms.registry.controls`; captured when the form page is registered.
+    control_nodes: Vec<NodeId>,
     context: Option<Context<Arc<Window>>>,
     pub(crate) surface: Option<Surface<Arc<Window>, Arc<Window>>>,
     pub(crate) state: App,
@@ -92,12 +227,19 @@ impl BrowserApp {
         ext_titles: Vec<String>,
         popup_actions: Vec<PopupAction>,
     ) -> Self {
+        // One long-lived Host for the whole session; content scripts read its
+        // extensions on every navigation and dispatch through its contexts.
+        load_extension_host(Path::new("./extensions"));
         let mut state = App::new(initial_url);
         if crate::settings::current().restore_sessions {
             state.restore();
         }
         let mut app = Self {
             window: None,
+            a11y: None,
+            a11y_actions: A11yActionQueue::default(),
+            a11y_builder: TreeBuilder::new(),
+            control_nodes: Vec::new(),
             context: None,
             surface: None,
             state,
@@ -127,6 +269,104 @@ impl BrowserApp {
         }
     }
 
+    /// Push a full DOM -> AccessKit tree for the active page. Called only on
+    /// layout settle (and once at startup), never on every paint.
+    fn push_a11y_update(&mut self) {
+        // shortcut: PageContext is the only retained DOM source. Static (no-JS)
+        // pages drop theirs at load time and expose no tree until a DOM-retention
+        // seam lands; the `page_js` guard is the whole gate.
+        let Some(page) = self.state.page_js.as_ref() else {
+            return;
+        };
+        let Some(adapter) = self.a11y.as_mut() else {
+            return;
+        };
+        let focused = self
+            .a11y_builder
+            .focused_node()
+            .unwrap_or_else(|| page.root());
+        let states = self.a11y_builder.control_states();
+        adapter.update_if_active(|| page.a11y_tree_update(focused, states));
+    }
+
+    /// Capture the stable DOM owner and live state of every registered control.
+    /// Runs when the form page is (re)registered, not on each tree build, so the
+    /// builder's map survives rebuilds unchanged.
+    fn rebuild_a11y_registry(&mut self) {
+        let mut nodes = Vec::new();
+        let mut states = HashMap::new();
+        if let Some(form) = &self.forms {
+            let list = form.display_list();
+            for (item, &owner) in list.items.iter().zip(list.node_map.iter()) {
+                if matches!(item, hodo_layout::DisplayItem::Control { .. }) {
+                    // `ControlRegistry::from_list` appends one state per Control
+                    // item in this same order.
+                    if let Some(control) = form.registry.controls.get(nodes.len()) {
+                        states.insert(
+                            owner,
+                            ControlStates {
+                                checked: control.checked,
+                                disabled: control.disabled,
+                                readonly: control.readonly,
+                                value: control.value.clone(),
+                            },
+                        );
+                        nodes.push(owner);
+                    }
+                }
+            }
+        }
+        let focused = self
+            .forms
+            .as_ref()
+            .and_then(|form| form.registry.focus)
+            .and_then(|index| nodes.get(index).copied());
+        self.control_nodes = nodes;
+        self.a11y_builder.set_control_states(states);
+        // The registry's focus is a flat index; pairing it with the captured
+        // owner handle is the DOM-level focus the tree needs.
+        self.a11y_builder.set_focused_node(focused);
+    }
+
+    /// Apply AT requests queued by the adapter's direct action handler. The
+    /// handler may run off-thread, so decoding happens here on the winit loop.
+    fn drain_a11y_actions(&mut self) {
+        let requests = self.a11y_actions.take();
+        if requests.is_empty() {
+            return;
+        }
+        let Some(page) = self.state.page_js.as_ref() else {
+            return;
+        };
+        let dom = page.dom_ref();
+        let scroll = self.state.active_tab().scroll_offset;
+        let mut submits = Vec::new();
+        let mut changed = false;
+        {
+            let mut handler = ShellActions {
+                forms: &mut self.forms,
+                control_nodes: &self.control_nodes,
+                scroll,
+                submits: &mut submits,
+                changed: &mut changed,
+            };
+            for request in &requests {
+                self.a11y_builder
+                    .dispatch_action(&dom, request, &mut handler);
+            }
+        }
+        drop(dom);
+        if changed {
+            self.tick_forms();
+            self.rebuild_a11y_registry();
+            self.push_a11y_update();
+        }
+        for action in submits {
+            self.submit_form(action);
+        }
+        self.request_redraw();
+    }
+
     fn navigate(&mut self, url: String) {
         let title = self.state.navigate(&url, self.viewport);
         self.sync_forms();
@@ -148,10 +388,12 @@ impl BrowserApp {
             .any(|item| matches!(item, hodo_layout::DisplayItem::Control { .. }));
         if !has_controls {
             self.forms = None;
+            self.rebuild_a11y_registry();
             return;
         }
         let url = self.state.active_tab().url.clone();
         self.forms = FormPage::load(&url, self.viewport);
+        self.rebuild_a11y_registry();
     }
 
     /// Copy the live form page's layout into the active tab.
@@ -170,6 +412,7 @@ impl BrowserApp {
     fn tick_forms(&mut self) {
         if self.forms.as_mut().is_some_and(FormPage::tick) {
             self.sync_forms_list();
+            self.rebuild_a11y_registry();
             self.request_redraw();
         }
     }
@@ -385,7 +628,8 @@ impl BrowserApp {
         match event.logical_key.as_ref() {
             Key::Named(NamedKey::Enter) => {
                 if self.state.url_focused {
-                    let url = self.state.url_bar.clone();
+                    let typed = self.state.url_bar.clone();
+                    let url = crate::search::omnibox_target(&typed);
                     self.navigate(url);
                 }
             }
@@ -450,8 +694,7 @@ impl BrowserApp {
             }
             Key::Character(text) if ctrl => match text.to_ascii_lowercase().as_str() {
                 "l" => {
-                    self.state.url_focused = true;
-                    self.state.url_bar.clear();
+                    self.state.focus_omnibox();
                     self.request_redraw();
                 }
                 "t" => {
@@ -512,7 +755,9 @@ impl ApplicationHandler for BrowserApp {
         }
         let attrs = Window::default_attributes()
             .with_title("hodo")
-            .with_inner_size(PhysicalSize::new(1200u32, 800u32));
+            .with_inner_size(PhysicalSize::new(1200u32, 800u32))
+            // AccessKit requires the adapter to exist before the first show.
+            .with_visible(false);
         let window = match event_loop.create_window(attrs) {
             Ok(window) => Arc::new(window),
             Err(err) => {
@@ -548,6 +793,15 @@ impl ApplicationHandler for BrowserApp {
         self.window = Some(window.clone());
         self.context = Some(context);
         self.surface = Some(surface);
+        self.a11y = Some(accesskit_winit::Adapter::with_direct_handlers(
+            event_loop,
+            &window,
+            QuietActivation,
+            self.a11y_actions.clone(),
+            QuietDeactivation,
+        ));
+        window.set_visible(true);
+        self.push_a11y_update();
         window.request_redraw();
     }
 
@@ -557,6 +811,10 @@ impl ApplicationHandler for BrowserApp {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        // AccessKit must observe every window event before the app handles it.
+        if let (Some(adapter), Some(window)) = (self.a11y.as_mut(), self.window.as_ref()) {
+            adapter.process_event(window, &event);
+        }
         match event {
             WindowEvent::CloseRequested | WindowEvent::Destroyed => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -597,6 +855,9 @@ impl ApplicationHandler for BrowserApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // adapter actions may have arrived on a platform thread since last frame
+        self.drain_a11y_actions();
+        poll_extension_host();
         if self.tick_popup() {
             self.request_redraw();
         }
@@ -612,11 +873,25 @@ impl ApplicationHandler for BrowserApp {
         // native DOM mutation by fingerprint and re-pipes styles/layout once.
         if self.state.page_js_tick(self.viewport) {
             self.force_full = true;
+            // shortcut: the shell exposes no DOM-version signal to the a11y
+            // seam, so gate the tree push on this relayout flag. Paint-only
+            // ticks never rebuild geometry and never reach here.
+            self.push_a11y_update();
             self.request_redraw();
         }
         // Idle costs nothing without scripts: redraws are event-driven. An open
         // popup or a page with live timers keeps the 33 ms tick until it closes.
-        let flow = if self.popup.is_some() || self.state.page_js_has_timers() {
+        let busy = self.popup.is_some() || self.state.page_js_has_timers();
+        // About-to-wait means the event queue is empty. Prime the next page's
+        // STATIC prelude here, off the navigation critical path; skip it while
+        // timers/popups still schedule frames so the 56 ms parse never competes
+        // with pending work. `prime_page_prelude` is a no-op when one is already
+        // primed, so repeated idle frames cost nothing.
+        #[cfg(not(test))]
+        if idle_prime_allowed(self.popup.is_some(), self.state.page_js_has_timers()) {
+            hodo_js::prime_page_prelude();
+        }
+        let flow = if busy {
             ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(33))
         } else {
             ControlFlow::Wait
@@ -635,15 +910,67 @@ pub fn join_url(base: &str, href: &str) -> String {
     if href.contains("://") || href.starts_with("file:") || href.starts_with("data:") {
         return href.to_string();
     }
-    if base.starts_with("http://") || base.starts_with("https://") {
-        if let Ok(resolved) = hodo_net::resolve_location(base, href) {
-            return resolved;
-        }
-    }
+    let resolved = if base.starts_with("http://") || base.starts_with("https://") {
+        hodo_net::resolve_location(base, href).unwrap_or_else(|_| fallback_join(base, href))
+    } else {
+        fallback_join(base, href)
+    };
+    tidy_join(&resolved)
+}
+
+fn fallback_join(base: &str, href: &str) -> String {
     match base.rfind(['/', '\\']) {
         Some(index) => format!("{}{}", &base[..=index], href),
         None => href.to_string(),
     }
+}
+
+/// Shell-side string hygiene only: drop `.` path segments (stray `./`) and
+/// collapse repeated separators in the path. hodo-net remains authoritative
+/// for http(s) resolution; this cleans the local-path fallback and any `./`
+/// that survived it. The scheme+authority bytes are never rewritten.
+fn tidy_join(resolved: &str) -> String {
+    let (head, path, sep) = match resolved.find("://") {
+        Some(i) => {
+            let Some(j) = resolved[i + 3..].find('/').map(|j| i + 3 + j) else {
+                return resolved.to_string();
+            };
+            (&resolved[..j], &resolved[j..], '/')
+        }
+        None => {
+            let sep = if resolved.contains('\\') && !resolved.contains('/') {
+                '\\'
+            } else {
+                '/'
+            };
+            ("", resolved, sep)
+        }
+    };
+    let mut out = String::with_capacity(resolved.len());
+    out.push_str(head);
+    if head.is_empty() {
+        // UNC paths keep their leading `\\`; a URL path collapses them.
+        for _ in 0..path.chars().take_while(|&c| c == sep).count() {
+            out.push(sep);
+        }
+    }
+    let mut first = true;
+    for segment in path.split(|c| c == '/' || c == '\\') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        // URL paths begin with a separator; local paths begin with a drive/
+        // name, except UNC where the leading separators were just re-emitted.
+        if !head.is_empty() || !first {
+            out.push(sep);
+        }
+        out.push_str(segment);
+        first = false;
+    }
+    if !head.is_empty() && path.ends_with('/') {
+        out.push('/');
+    }
+    out
 }
 
 /// The shell's single disk-cache owner: one `DiskCache` per process, guarded
@@ -675,8 +1002,9 @@ fn shell_cookie_jar() -> &'static Mutex<hodo_cookie::CookieJar> {
 }
 
 /// Registrable domain of a URL's host (no PSL; last two labels, IP literal kept
-/// whole). Used as both `top_site` and the cache partition for shell loads.
-fn site_of(url: &str) -> String {
+/// whole). Used as the tab's `top_site` and as the cache partition for shell
+/// loads; `tabs` calls it when arming the load context from the tab's page URL.
+pub(crate) fn site_of(url: &str) -> String {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
     let authority = rest
         .split(['/', '?', '#'])
@@ -701,17 +1029,28 @@ fn site_of(url: &str) -> String {
     }
 }
 
-/// Build the privacy options for one resource load. The private flag comes from
-/// the active tab; the loaded URL supplies the top site / double-key partition
-/// (the shell has no richer top-frame context to thread here yet).
-fn resource_fetch_options(url: &str) -> hodo_net::FetchOptions {
-    let site = site_of(url);
+/// Privacy options shared by every load in the current tab context. The shell
+/// knows the page whose resources these are, so `top_site` (cookie double-key)
+/// and `partition` (cache double-key) come from that page, never from the
+/// subresource's own host — otherwise `||tracker^$third-party` could never fire
+/// and a cross-site cookie would land in the first-party partition.
+fn tab_fetch_options() -> hodo_net::FetchOptions {
+    let site = crate::tabs::top_site();
     hodo_net::FetchOptions {
         private: crate::tabs::private_load(),
         top_site: site.clone(),
         partition: site,
         referer: None,
         ..Default::default()
+    }
+}
+
+/// Per-URL view of [`tab_fetch_options`]: only the mixed-content hint depends
+/// on the request URL; privacy keys stay bound to the tab's page.
+fn resource_fetch_options(url: &str) -> hodo_net::FetchOptions {
+    hodo_net::FetchOptions {
+        secure_context: url.starts_with("https://"),
+        ..tab_fetch_options()
     }
 }
 
@@ -768,6 +1107,14 @@ pub(crate) fn resource_text(resource: Resource) -> String {
     }
 }
 
+/// Cache key for the warm probe of a chunk. `hodo_net::load_with` normalizes
+/// before building its own key, so the shell must do the same here or a
+/// fragment/case-only variant of a cached URL would look falsely cold.
+fn chunk_cache_key(url: &str, opts: &hodo_net::FetchOptions) -> CacheKey {
+    let normalized = hodo_net::normalize_url(url).unwrap_or_else(|_| url.to_string());
+    CacheKey::new("GET", &normalized, &opts.partition)
+}
+
 /// Batch-fetch one level of a module graph. Warm cache entries go through the
 /// cached loader (so RFC 9111 / 304 revalidation is preserved); cold entries
 /// are fetched in parallel by `hodo_net::load_many`. Every cold URL is passed
@@ -779,15 +1126,15 @@ pub(crate) fn load_chunk_batch(urls: &[String]) -> HashMap<String, String> {
     if urls.is_empty() {
         return HashMap::new();
     }
-    let opts = resource_fetch_options(&urls[0]);
     let mut cold = Vec::new();
     let mut out = HashMap::new();
     for url in urls {
+        // Per-URL opts: the tab keys privacy, the request only hints secure
+        // context. Chunk 0 must not define the policy for its siblings.
+        let opts = resource_fetch_options(url);
         let warm = shell_cache().is_some_and(|cache| {
             let mut guard = cache.lock().unwrap_or_else(|err| err.into_inner());
-            guard
-                .get(&CacheKey::new("GET", url, &opts.partition))
-                .is_some()
+            guard.get(&chunk_cache_key(url, &opts)).is_some()
         });
         if warm {
             if let Ok(body) = load_resource(url).map(resource_text) {
@@ -802,6 +1149,9 @@ pub(crate) fn load_chunk_batch(urls: &[String]) -> HashMap<String, String> {
     }
     if !cold.is_empty() {
         let requests: Vec<String> = cold.iter().map(|(_, url)| url.clone()).collect();
+        // One batch opts from the tab context (all chunks share the same
+        // top_site/partition/private), not from whichever chunk happened first.
+        let opts = tab_fetch_options();
         for loaded in hodo_net::load_many(&requests, &opts) {
             // Map by the URL that actually served the body so a failed sibling
             // cannot shift the alignment (load_many returns only successes).
@@ -823,14 +1173,28 @@ pub(crate) fn load_chunk_batch(urls: &[String]) -> HashMap<String, String> {
 /// redirected page resolves against a half-empty authority (`https:///…`).
 /// Private loads bypass the cache entirely and keep the request URL.
 fn final_base_url(url: &str) -> String {
+    final_base_url_with(url, shell_cache(), crate::tabs::private_load())
+}
+
+/// Testable core of [`final_base_url`]. A private load must never consult the
+/// shared disk cache: besides leaking the URL into a lookup, a normal tab's
+/// cached 302 would silently rewrite this tab's base URL.
+fn final_base_url_with(
+    url: &str,
+    cache: Option<&Mutex<hodo_cache::DiskCache>>,
+    private: bool,
+) -> String {
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return url.to_string();
     }
+    if private {
+        return url.to_string();
+    }
     let normalized = hodo_net::normalize_url(url).unwrap_or_else(|_| url.to_string());
-    let Some(cache) = shell_cache() else {
+    let Some(cache) = cache else {
         return normalized;
     };
-    let partition = site_of(url);
+    let partition = crate::tabs::top_site();
     resolve_cached_redirects(normalized, move |hop| {
         let mut guard = cache.lock().unwrap_or_else(|err| err.into_inner());
         let entry = guard.get(&CacheKey::new("GET", hop, &partition))?;
@@ -1037,6 +1401,30 @@ fn stylesheet_hash(sheet: &Stylesheet) -> u64 {
     hasher.finish()
 }
 
+/// Evaluate a JSON string expression in the page realm. `ExtScriptRuntime::eval`
+/// returns the value's display text, so `JSON.stringify` keeps strings quoted
+/// and safe to decode on the host.
+fn eval_json_string(runtime: &mut ExtScriptRuntime, expr: &str) -> String {
+    runtime
+        .eval(&format!("JSON.stringify({expr})"))
+        .unwrap_or_default()
+}
+
+/// Constructable-sheet / shadow-style revision that DOM fingerprints cannot
+/// see. One cheap eval per tick; the CSS text is read only when it changes.
+fn sheets_rev(runtime: &mut ExtScriptRuntime) -> u64 {
+    eval_json_string(runtime, "__hodoSheetsRev")
+        .parse()
+        .unwrap_or(0)
+}
+
+/// CSS text currently adopted by the document and its shadow roots. This walks
+/// the DOM in JS, so callers must gate it on [`sheets_rev`].
+fn adopted_sheet_css(runtime: &mut ExtScriptRuntime) -> String {
+    serde_json::from_str::<String>(&eval_json_string(runtime, "__hodoCollectAdoptedCss()"))
+        .unwrap_or_default()
+}
+
 /// Paint-only repaint: update baked-in colours from the new style map without
 /// touching geometry. The renderer's `diff_display_lists` then limits the
 /// actual pixels redrawn to the changed rows (damage-only repaint).
@@ -1055,7 +1443,16 @@ fn repaint_display_list(list: &mut DisplayList, styles: &hodo_style::StyleMap) {
                 *border_color = (style.border_width > 0.0 && style.border_color.a > 0)
                     .then_some(style.border_color);
             }
-            hodo_layout::DisplayItem::Text { color, .. } => *color = style.color,
+            hodo_layout::DisplayItem::Text {
+                color,
+                underline,
+                line_through,
+                ..
+            } => {
+                *color = style.color;
+                *underline = style.underline;
+                *line_through = style.line_through;
+            }
             _ => {}
         }
     };
@@ -1111,21 +1508,37 @@ pub(crate) struct PageContext {
     styles: hodo_style::StyleMap,
     layout_ctx: hodo_layout::LayoutContext,
     sheet_hash: u64,
+    /// Last observed `__hodoSheetsRev`; a change forces style re-collection
+    /// even when the DOM fingerprint is unchanged.
+    sheets_rev: u64,
+    adopted_css: String,
+    /// Content-script CSS, folded into `adopted_css` and re-applied on every
+    /// constructable-sheet refresh so a later sheet swap cannot drop it.
+    content_css: String,
+    /// Test-visible count of full relayout passes (paint-only ticks excluded).
+    relayouts: usize,
     node_fingerprints: HashMap<NodeId, u64>,
     last_list: DisplayList,
     incremental_ready: bool,
 }
 
 impl PageContext {
+    // Eighth argument is the content-script CSS; bundling it would add a type
+    // for one call site.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         dom: Rc<RefCell<Dom>>,
         base_url: String,
-        runtime: ExtScriptRuntime,
+        mut runtime: ExtScriptRuntime,
         budget: Duration,
         executed_scripts: HashSet<NodeId>,
         script_count: usize,
         dyn_requests: Rc<RefCell<Vec<DynamicModuleRequest>>>,
+        content_css: String,
     ) -> Self {
+        let sheets_rev = sheets_rev(&mut runtime);
+        let mut adopted_css = adopted_sheet_css(&mut runtime);
+        adopted_css.push_str(&content_css);
         let fingerprint = dom_fingerprint(&dom.borrow());
         Self {
             dom,
@@ -1140,6 +1553,10 @@ impl PageContext {
             styles: hodo_style::StyleMap::default(),
             layout_ctx: hodo_layout::LayoutContext::new(),
             sheet_hash: 0,
+            sheets_rev,
+            adopted_css,
+            content_css,
+            relayouts: 0,
             node_fingerprints: HashMap::new(),
             last_list: DisplayList::default(),
             incremental_ready: false,
@@ -1168,8 +1585,42 @@ impl PageContext {
         self.runtime.timer_count() != 0
     }
 
+    /// Detect a constructable-sheet swap and refresh the CSS text to fold into
+    /// the next style collection. `true` means the page's styles changed.
+    fn refresh_sheet_state(&mut self) -> bool {
+        let rev = sheets_rev(&mut self.runtime);
+        if rev == self.sheets_rev {
+            return false;
+        }
+        self.sheets_rev = rev;
+        let mut css = adopted_sheet_css(&mut self.runtime);
+        css.push_str(&self.content_css);
+        self.adopted_css = css;
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn relayout_count(&self) -> usize {
+        self.relayouts
+    }
+
     pub(crate) fn root(&self) -> NodeId {
         self.dom.borrow().root()
+    }
+
+    /// Borrow the live DOM for action decoding on the winit thread.
+    pub(crate) fn dom_ref(&self) -> std::cell::Ref<'_, Dom> {
+        self.dom.borrow()
+    }
+
+    /// Build the shell-side accessibility tree for this page's live DOM,
+    /// copying the shell's retained control state onto the matching nodes.
+    pub(crate) fn a11y_tree_update(
+        &self,
+        focused: NodeId,
+        states: &HashMap<NodeId, ControlStates>,
+    ) -> TreeUpdate {
+        hodo_a11y::build_tree_update_with_states(&self.dom.borrow(), focused, states)
     }
 
     /// Last `document.title` assigned by a page script (empty until one does).
@@ -1373,14 +1824,16 @@ impl PageContext {
     }
 
     fn recompute_if_changed(&mut self, viewport: Size) -> Option<DisplayList> {
+        let sheets_changed = self.refresh_sheet_state();
         let fingerprint = dom_fingerprint(&self.dom.borrow());
-        if fingerprint == self.fingerprint {
+        if fingerprint == self.fingerprint && !sheets_changed {
             return None;
         }
         self.fingerprint = fingerprint;
         if !self.incremental_ready {
             return Some(self.relayout(viewport));
         }
+        let adopted_css = self.adopted_css.clone();
         let dom = self.dom.borrow();
         let node_fps = dom_node_fingerprints(&dom);
         let old_node_fps = std::mem::replace(&mut self.node_fingerprints, node_fps.clone());
@@ -1390,7 +1843,7 @@ impl PageContext {
             .map(|(id, _)| *id)
             .collect();
 
-        let stylesheet = collect_styles(&dom, &self.base_url, viewport);
+        let stylesheet = collect_styles_with(&dom, &self.base_url, viewport, &adopted_css);
         let sheet_hash = stylesheet_hash(&stylesheet);
         let new_styles =
             hodo_style::compute_styles_with_visited(&dom, &[stylesheet], &self.visited);
@@ -1398,7 +1851,9 @@ impl PageContext {
         // Property diff: a stylesheet swap or any layout-affecting style change
         // goes through the incremental relayout path; a pure colour/underline
         // change repaints only, leaving geometry (and the item count) untouched.
-        let mut layout_affecting = sheet_hash != self.sheet_hash;
+        // Constructable-sheet swaps have no DOM fingerprint, so their revision
+        // bump forces the full path here.
+        let mut layout_affecting = sheets_changed || sheet_hash != self.sheet_hash;
         if !layout_affecting {
             for id in &dirty {
                 // A new NodeId (recycled slot) or a text node means content was
@@ -1409,28 +1864,35 @@ impl PageContext {
                     layout_affecting = true;
                     break;
                 }
-                match (self.styles.get(*id), new_styles.get(*id)) {
-                    (Some(old), Some(new)) => {
-                        if hodo_style::style_change_class(old, new)
-                            == hodo_style::StyleChangeClass::LayoutAffecting
-                        {
-                            layout_affecting = true;
-                            break;
-                        }
-                    }
-                    _ => {
-                        layout_affecting = true;
-                        break;
-                    }
+                // A link's :visited colour is baked into its Text item by layout
+                // from `self.visited`; a paint-only recolor cannot recover it.
+                let is_link = |node: NodeId| {
+                    dom.tag(node)
+                        .is_some_and(|tag| tag.eq_ignore_ascii_case("a"))
+                        && dom.attr(node, "href").is_some()
+                };
+                if is_link(*id) || dom.parent(*id).is_some_and(is_link) {
+                    layout_affecting = true;
+                    break;
+                }
+                // Maps-aware seam: a deferred `%` calc leaves every
+                // ComputedStyle field unchanged, so comparing styles alone
+                // would misclassify it as PaintOnly and strand stale geometry.
+                if hodo_style::style_change_class_in_maps(&self.styles, &new_styles, *id)
+                    == hodo_style::StyleChangeClass::LayoutAffecting
+                {
+                    layout_affecting = true;
+                    break;
                 }
             }
         }
 
         let list = if layout_affecting {
-            if sheet_hash != self.sheet_hash {
+            if sheets_changed || sheet_hash != self.sheet_hash {
                 self.layout_ctx.reset();
                 self.sheet_hash = sheet_hash;
             }
+            self.relayouts += 1;
             hodo_layout::layout_from(&dom, &new_styles, viewport, &mut self.layout_ctx, &dirty)
         } else {
             let mut list = self.last_list.clone();
@@ -1445,15 +1907,18 @@ impl PageContext {
     /// Full re-pipe against the live DOM. Used on resize (the viewport check in
     /// `layout_from` resets the context for the new geometry).
     pub(crate) fn relayout(&mut self, viewport: Size) -> DisplayList {
+        let sheets_changed = self.refresh_sheet_state();
+        let adopted_css = self.adopted_css.clone();
         let dom = self.dom.borrow();
-        let stylesheet = collect_styles(&dom, &self.base_url, viewport);
+        let stylesheet = collect_styles_with(&dom, &self.base_url, viewport, &adopted_css);
         let sheet_hash = stylesheet_hash(&stylesheet);
         let new_styles =
             hodo_style::compute_styles_with_visited(&dom, &[stylesheet], &self.visited);
-        if sheet_hash != self.sheet_hash {
+        if sheets_changed || sheet_hash != self.sheet_hash {
             self.layout_ctx.reset();
             self.sheet_hash = sheet_hash;
         }
+        self.relayouts += 1;
         let list = hodo_layout::layout_from(&dom, &new_styles, viewport, &mut self.layout_ctx, &[]);
         self.styles = new_styles;
         self.last_list = list.clone();
@@ -1552,6 +2017,190 @@ fn flush_doc_write(runtime: &ExtScriptRuntime, dom: &Rc<RefCell<Dom>>) {
     if !written.is_empty() {
         append_written_html(&mut dom.borrow_mut(), &written);
     }
+}
+
+// ---- content-script injection (wave 1) -----------------------------------
+
+thread_local! {
+    /// One long-lived host per engine thread: the shared ApiRegistry and broker
+    /// are !Send, and the shell drives them on the GUI/headless thread.
+    static EXTENSION_HOST: RefCell<Option<hodo_ext_host::Host>> = const { RefCell::new(None) };
+}
+
+/// Mirror of hodo-ext-host's private `MAX_SCRIPT_BYTES` (IPC frame minus overhead).
+const MAX_CONTENT_SCRIPT_BYTES: usize = hodo_types::limits::MAX_MSG_BYTES - 64 * 1024;
+
+pub(crate) fn set_extension_host(host: hodo_ext_host::Host) {
+    EXTENSION_HOST.with(|slot| *slot.borrow_mut() = Some(host));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_extension_host() {
+    EXTENSION_HOST.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// Startup: one Host for every unpacked extension under `dir`.
+pub(crate) fn load_extension_host(dir: &Path) {
+    let mut host = hodo_ext_host::HostBuilder::new().build();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let _ = host.load_dir(&path);
+            }
+        }
+    }
+    set_extension_host(host);
+}
+
+/// Keep background workers (and their idle timers) alive between frames.
+pub(crate) fn poll_extension_host() {
+    EXTENSION_HOST.with(|slot| {
+        if let Some(host) = slot.borrow_mut().as_mut() {
+            let _ = host.poll();
+        }
+    });
+}
+
+fn content_script_matches(cs: &hodo_ext_manifest::ContentScript, base_url: &str) -> bool {
+    cs.run_at == RunAt::DocumentEnd && cs.matches.iter().any(|m| m.matches_url(base_url))
+}
+
+/// A script-free page still needs a realm when a content script will run.
+fn has_document_end_scripts(base_url: &str) -> bool {
+    EXTENSION_HOST.with(|slot| {
+        slot.borrow().as_ref().is_some_and(|host| {
+            host.extensions().iter().any(|ext| {
+                ext.manifest
+                    .content_scripts
+                    .iter()
+                    .any(|cs| content_script_matches(cs, base_url))
+            })
+        })
+    })
+}
+
+fn read_extension_file(root: &Path, rel: &str, cap: usize) -> Option<String> {
+    let path = root.join(rel);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!("hodo: content script {}: {err}", path.display());
+            return None;
+        }
+    };
+    if bytes.len() > cap {
+        eprintln!(
+            "hodo: content script {} exceeds {cap} bytes; skipped",
+            path.display()
+        );
+        return None;
+    }
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// document_end: one MAIN world in the page realm, one pass over matching
+/// scripts. Returns content-script CSS to append before the first stylesheet
+/// collection. `chrome.*` calls route through the host's extension context.
+///
+/// shortcut: MAIN world + document_end + top frame only; ISOLATED world,
+/// document_start/idle, iframe injection (FRAME_DOC_WAVE), all_frames,
+/// web_accessible_resources and content→bg messaging land with those seams.
+/// Pages matching several extensions share the first one's dispatch index.
+fn inject_content_scripts(runtime: &mut ExtScriptRuntime, base_url: &str) -> String {
+    struct Pending {
+        ext_index: usize,
+        config: RuntimeConfig,
+        js: Vec<String>,
+        css: String,
+    }
+    // Snapshot everything before eval: hooks borrow the host and must not nest.
+    let pending: Vec<Pending> = EXTENSION_HOST.with(|slot| {
+        let slot = slot.borrow();
+        let Some(host) = slot.as_ref() else {
+            return Vec::new();
+        };
+        host.extensions()
+            .iter()
+            .enumerate()
+            .filter_map(|(ext_index, ext)| {
+                let matching: Vec<_> = ext
+                    .manifest
+                    .content_scripts
+                    .iter()
+                    .filter(|cs| content_script_matches(cs, base_url))
+                    .collect();
+                if matching.is_empty() {
+                    return None;
+                }
+                let dialect = if ext.manifest.gecko_id.is_some() {
+                    ApiDialect::Gecko
+                } else {
+                    match ext.manifest.version {
+                        ManifestVersion::V2 => ApiDialect::ChromeMv2,
+                        ManifestVersion::V3 => ApiDialect::ChromeMv3,
+                    }
+                };
+                let config = RuntimeConfig {
+                    dialect,
+                    extension_name: ext.manifest.name.clone(),
+                    allowed_namespaces: ext.manifest.permissions.clone(),
+                    host_permissions: ext.manifest.host_permissions.clone(),
+                    ..RuntimeConfig::default()
+                };
+                let mut js = Vec::new();
+                let mut css = String::new();
+                for cs in matching {
+                    for rel in &cs.js {
+                        if let Some(code) =
+                            read_extension_file(&ext.root, rel, MAX_CONTENT_SCRIPT_BYTES)
+                        {
+                            js.push(code);
+                        }
+                    }
+                    for rel in &cs.css {
+                        if let Some(text) = read_extension_file(
+                            &ext.root,
+                            rel,
+                            hodo_types::limits::MAX_RESOURCE_BYTES,
+                        ) {
+                            css.push_str(&text);
+                            css.push('\n');
+                        }
+                    }
+                }
+                Some(Pending {
+                    ext_index,
+                    config,
+                    js,
+                    css,
+                })
+            })
+            .collect()
+    });
+    let Some(first) = pending.first() else {
+        return String::new();
+    };
+    // One shared MAIN world per page (well under MAX_EXT_CONTEXTS). Wave 1
+    // routes every API call to the first matching extension's host context.
+    let ext_index = first.ext_index;
+    runtime.set_dispatch_hook(Some(Rc::new(move |call| {
+        EXTENSION_HOST.with(|slot| match slot.borrow_mut().as_mut() {
+            Some(host) => host.dispatch(ext_index, call),
+            None => ApiResult::Err("extension host unavailable".into()),
+        })
+    })));
+    runtime.install_main_world(&first.config);
+    let mut css = String::new();
+    for item in &pending {
+        for code in &item.js {
+            if let Err(err) = runtime.eval(code) {
+                eprintln!("hodo: content script on {base_url}: {err}");
+            }
+        }
+        css.push_str(&item.css);
+    }
+    css
 }
 
 /// Full pipeline with an explicit JS toggle. The GUI keeps the returned realm;
@@ -1678,13 +2327,15 @@ fn load_page_with_flag(
         });
     }
     let initial_count = scripts.len();
-    let needs_realm = !scripts.is_empty() || !module_script.is_empty();
+    let needs_realm = !scripts.is_empty()
+        || !module_script.is_empty()
+        || (js_enabled && has_document_end_scripts(&base_url));
 
     // Dynamic-import requests arrive on the landed native-reply channel; the
     // hook captures them synchronously while JS calls `__hodo_message_reply`.
     let dyn_requests: Rc<RefCell<Vec<DynamicModuleRequest>>> = Rc::new(RefCell::new(Vec::new()));
 
-    // realm-drop → parse → collect → eval → DOMContentLoaded → styles/layout
+    // realm-drop → parse → collect → eval → DOMContentLoaded → content scripts → styles/layout
     let mut page = if !needs_realm {
         None
     } else {
@@ -1735,6 +2386,9 @@ fn load_page_with_flag(
             eprintln!("hodo: page script on {url}: {line}");
         }
         runtime.close_doc_write();
+        // document_end: one MAIN world in this realm, after page scripts and
+        // DOMContentLoaded but before the first stylesheet/layout pass.
+        let content_css = inject_content_scripts(&mut runtime, &base_url);
         let mut page = PageContext::new(
             Rc::clone(&dom),
             base_url.clone(),
@@ -1743,6 +2397,7 @@ fn load_page_with_flag(
             executed_scripts,
             initial_count,
             dyn_requests,
+            content_css,
         );
         // Headless callers never reach about_to_wait, so drive both dynamic
         // passes here too; the GUI realm runs them again as no-ops on tick 1.
@@ -1753,9 +2408,15 @@ fn load_page_with_flag(
     };
 
     let visited = crate::tabs::visited_hrefs();
+    // Read constructable-sheet CSS after all scripts have run. Without a realm
+    // there is nothing to read; the DOM walk covers the script-free case.
+    let adopted_css = page
+        .as_ref()
+        .map(|page| page.adopted_css.clone())
+        .unwrap_or_default();
     let (display_list, styles, layout_ctx, sheet_hash) = {
         let doc = dom.borrow();
-        let stylesheet = collect_styles(&doc, &base_url, viewport);
+        let stylesheet = collect_styles_with(&doc, &base_url, viewport, &adopted_css);
         let sheet_hash = stylesheet_hash(&stylesheet);
         let styles = hodo_style::compute_styles_with_visited(&doc, &[stylesheet], &visited);
         // One LayoutContext per document; the headless screenshot path uses the
@@ -1767,14 +2428,10 @@ fn load_page_with_flag(
     if let Some(page) = page.as_mut() {
         page.init_incremental(layout_ctx, styles, sheet_hash, &display_list);
     }
-    // The page has settled into its first paint. Prime the STATIC half of the
-    // next page's prelude so its ~56 ms parse overlaps that navigation's network
-    // fetch. Boa's Context is !Send, so this must stay on the GUI/thread that
-    // drives page loads; hodo-js stores the primed realm thread-locally. Tests
-    // skip it: a primed realm checked out across pooled test threads corrupts
-    // boa's thread-local handle table.
-    #[cfg(not(test))]
-    hodo_js::prime_page_prelude();
+    // Prime timing: the ~56 ms STATIC prelude parse used to run here, racing
+    // the GUI thread right after a load. It now runs in `about_to_wait`, which
+    // winit calls only once the event queue has drained (see there). Headless
+    // callers prime once at startup and drop the realm at exit.
     (title, display_list, page)
 }
 
@@ -1973,10 +2630,25 @@ fn dump_modules(script: &str) {
 }
 
 pub(crate) fn collect_styles(dom: &Dom, page_url: &str, viewport: Size) -> Stylesheet {
+    collect_styles_with(dom, page_url, viewport, "")
+}
+
+/// Like [`collect_styles`], but also folds in the CSS text of adopted sheets
+/// reported by the page realm. Storage-only `adoptedStyleSheets` swaps are
+/// invisible to the DOM walk, so the shell reads them through `__hodoSheetsRev`.
+pub(crate) fn collect_styles_with(
+    dom: &Dom,
+    page_url: &str,
+    viewport: Size,
+    adopted_css: &str,
+) -> Stylesheet {
     // The engine's UA sheet does not hide <head>; without this the <style>
     // and <title> text would spill into the page as visible text.
     let mut sources: Vec<String> =
         vec!["head, style, link, meta, title, script { display: none }".to_owned()];
+    if !adopted_css.is_empty() {
+        sources.push(adopted_css.to_owned());
+    }
 
     // One document-order walk: inline <style> text and fetched <link> bodies
     // are appended as they appear. A later sheet now wins a same-specificity
@@ -2141,6 +2813,149 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn paint_only_recolor_copies_text_decorations() {
+        let mut dom = Dom::new();
+        let div = dom.create(NodeKind::Element {
+            tag: "div".into(),
+            attrs: vec![(
+                "style".into(),
+                "color:rgb(0,0,255);text-decoration:underline line-through;width:100px".into(),
+            )],
+        });
+        dom.append(dom.root(), div);
+        let text = dom.create(NodeKind::Text("x".into()));
+        dom.append(div, text);
+        let styles = hodo_style::compute_styles(&dom, &[]);
+        let mut list = hodo_layout::layout(&dom, &styles, DEFAULT_VIEWPORT);
+        assert!(list.items.iter().any(|item| matches!(
+            item,
+            DisplayItem::Text {
+                underline: true,
+                line_through: true,
+                ..
+            }
+        )));
+
+        // Hover removes the decorations but not geometry: the paint-only path
+        // must copy all three paint fields, not just `color`.
+        dom.set_attr(div, "style", "color:rgb(255,0,0);width:100px".into());
+        let hover = hodo_style::compute_styles(&dom, &[]);
+        repaint_display_list(&mut list, &hover);
+        assert!(list.items.iter().any(|item| matches!(
+            item,
+            DisplayItem::Text { color, underline: false, line_through: false, .. }
+                if *color == Color::rgb(255, 0, 0)
+        )));
+    }
+
+    #[test]
+    fn link_href_change_forces_exactly_one_relayout() {
+        crate::tabs::set_visited_hrefs_for_test(&["https://visited.test/"]);
+        let mut dom = Dom::new();
+        let style = dom.create(NodeKind::Element {
+            tag: "style".into(),
+            attrs: vec![],
+        });
+        dom.append(dom.root(), style);
+        let css = dom.create(NodeKind::Text(
+            "a:link{color:rgb(0,0,255)}a:visited{color:rgb(255,0,0)}".into(),
+        ));
+        dom.append(style, css);
+        let anchor = dom.create(NodeKind::Element {
+            tag: "a".into(),
+            attrs: vec![("href".into(), "https://fresh.test/".into())],
+        });
+        dom.append(dom.root(), anchor);
+        let text = dom.create(NodeKind::Text("link".into()));
+        dom.append(anchor, text);
+
+        let dom = Rc::new(RefCell::new(dom));
+        let runtime = ExtScriptRuntime::new_page_with_url(Rc::clone(&dom), "https://page.test/");
+        let mut page = PageContext::new(
+            Rc::clone(&dom),
+            "https://page.test/".into(),
+            runtime,
+            Duration::from_millis(50),
+            HashSet::new(),
+            0,
+            Rc::new(RefCell::new(Vec::new())),
+            String::new(),
+        );
+        let first = page.relayout(DEFAULT_VIEWPORT);
+        assert!(first.items.iter().any(|item| matches!(
+            item,
+            DisplayItem::Text { text, color, .. } if text == "link" && *color == Color::rgb(0, 0, 255)
+        )));
+        let before = page.relayout_count();
+
+        dom.borrow_mut()
+            .set_attr(anchor, "href", "https://visited.test/".into());
+        let next = page
+            .tick(DEFAULT_VIEWPORT)
+            .expect("a link change must rerun layout to refresh :visited colour");
+        assert_eq!(
+            page.relayout_count(),
+            before + 1,
+            "link visit recolour triggers exactly one relayout"
+        );
+        assert!(next.items.iter().any(|item| matches!(
+            item,
+            DisplayItem::Text { text, color, .. } if text == "link" && *color == Color::rgb(255, 0, 0)
+        )));
+        crate::tabs::set_visited_hrefs_for_test(&[]);
+    }
+
+    #[test]
+    fn adopted_sheet_swap_recollects_styles_and_repaints() {
+        let mut dom = Dom::new();
+        let para = dom.create(NodeKind::Element {
+            tag: "p".into(),
+            attrs: vec![],
+        });
+        dom.append(dom.root(), para);
+        let text = dom.create(NodeKind::Text("para".into()));
+        dom.append(para, text);
+
+        let dom = Rc::new(RefCell::new(dom));
+        let mut runtime =
+            ExtScriptRuntime::new_page_with_url(Rc::clone(&dom), "https://page.test/");
+        runtime
+            .eval("var __s = new CSSStyleSheet(); __s.replaceSync('p{color:rgb(255,0,0)}'); document.adoptedStyleSheets = [__s];")
+            .expect("constructable-sheet setup evaluates");
+        let mut page = PageContext::new(
+            Rc::clone(&dom),
+            "https://page.test/".into(),
+            runtime,
+            Duration::from_millis(50),
+            HashSet::new(),
+            0,
+            Rc::new(RefCell::new(Vec::new())),
+            String::new(),
+        );
+        let first = page.relayout(DEFAULT_VIEWPORT);
+        assert!(first.items.iter().any(|item| matches!(
+            item,
+            DisplayItem::Text { text, color, .. } if text == "para" && *color == Color::rgb(255, 0, 0)
+        )));
+        let before = page.relayout_count();
+
+        page.runtime
+            .eval("__s.replaceSync('p{color:rgb(0,255,0)}')")
+            .expect("sheet swap evaluates");
+        let next = page
+            .tick(DEFAULT_VIEWPORT)
+            .expect("a constructable-sheet swap must repaint with no DOM change");
+        assert!(
+            page.relayout_count() > before,
+            "sheet revision bump must force a full style re-collection"
+        );
+        assert!(next.items.iter().any(|item| matches!(
+            item,
+            DisplayItem::Text { text, color, .. } if text == "para" && *color == Color::rgb(0, 255, 0)
+        )));
+    }
+
+    #[test]
     fn incremental_layout_reuses_clean_subtrees_on_one_node_edit() {
         let mut dom = Dom::new();
         let root = dom.root();
@@ -2241,6 +3056,13 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn idle_prime_waits_for_pending_work() {
+        assert!(idle_prime_allowed(false, false));
+        assert!(!idle_prime_allowed(true, false));
+        assert!(!idle_prime_allowed(false, true));
+    }
+
+    #[test]
     fn dom_fingerprint_notices_comment_data_mutations() {
         let mut dom = Dom::new();
         let comment = dom.create(NodeKind::Element {
@@ -2281,6 +3103,25 @@ pub(crate) mod tests {
             "D:\\site\\style.css"
         );
         assert_eq!(join_url("page.html", "style.css"), "style.css");
+    }
+
+    #[test]
+    fn url_join_collapses_dot_segments_and_redundant_separators() {
+        let base = "https://example.com/dir/page.html";
+        assert_eq!(join_url(base, "./x"), "https://example.com/dir/x");
+        assert_eq!(join_url(base, "child"), "https://example.com/dir/child");
+        assert_eq!(
+            join_url("https://example.com/dir/", "x"),
+            "https://example.com/dir/x"
+        );
+        assert_eq!(join_url("D:\\site\\page.html", "./x"), "D:\\site\\x");
+        // A correct http(s) resolution is returned byte-for-byte.
+        assert_eq!(
+            join_url(base, "child"),
+            hodo_net::resolve_location(base, "child").unwrap()
+        );
+        let absolute = "https://cdn.example//a/./b.css?x=./y";
+        assert_eq!(join_url(base, absolute), absolute);
     }
 
     /// One local `<link>` sheet + arbitrary `<head>` markup; returns the
@@ -2522,6 +3363,8 @@ pub(crate) mod tests {
                     color: Color::WHITE,
                     border_color: None,
                     radius: 0.0,
+                    border_style: 0,
+                    border_width: 0.0,
                 },
             ],
         };
@@ -2744,6 +3587,57 @@ pub(crate) mod tests {
     // ---- page JS ---------------------------------------------------------
 
     #[test]
+    fn content_script_runs_at_document_end_with_css_and_title_suffix() {
+        let _guard = PAGE_JS_ENV_LOCK.lock().unwrap();
+        let ext = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../extensions/content-demo");
+        let mut host = hodo_ext_host::HostBuilder::new().isolated(false).build();
+        host.load_dir(&ext).expect("the demo extension must parse");
+        set_extension_host(host);
+
+        let (dir, path) = html_fixture(
+            "content-demo",
+            "<html><head><title>Base</title></head><body><p>page</p></body></html>",
+        );
+        let url = format!("file://{path}");
+        let (_, list, ctx) = load_page_live(&url, DEFAULT_VIEWPORT);
+        let mut ctx = ctx.expect("content scripts create a page realm");
+
+        assert!(
+            list_has(&list, "content-demo: injected"),
+            "the document_end script must add its marker before first paint"
+        );
+        assert!(
+            list.items.iter().any(|item| matches!(
+                item,
+                DisplayItem::Text { text, color, .. }
+                    if text.contains("content-demo: injected")
+                        && *color == Color::rgb(0, 128, 0)
+            )),
+            "content-script CSS must reach the marker's computed style"
+        );
+        assert!(
+            ctx.document_title().ends_with("[content-demo]"),
+            "the content script must extend document.title"
+        );
+        // A later constructable-sheet swap must not drop the injected CSS.
+        ctx.runtime
+            .eval("var s = new CSSStyleSheet(); s.replaceSync('p{color:blue}'); document.adoptedStyleSheets = [s];")
+            .unwrap();
+        let fresh = ctx.tick(DEFAULT_VIEWPORT).unwrap();
+        assert!(
+            fresh.items.iter().any(|item| matches!(
+                item,
+                DisplayItem::Text { text, color, .. }
+                    if text.contains("content-demo: injected")
+                        && *color == Color::rgb(0, 128, 0)
+            )),
+            "content-script CSS must survive a later sheet swap"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        clear_extension_host();
+    }
+
+    #[test]
     fn js_site_scripts_mutate_dom_before_first_paint() {
         let _guard = PAGE_JS_ENV_LOCK.lock().unwrap();
         let (_, list, ctx) = load_page_live(&js_site_url(), DEFAULT_VIEWPORT);
@@ -2847,6 +3741,93 @@ pub(crate) mod tests {
         assert_eq!(final_url, "https://other.example.com/deep/");
         drop(cache);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn private_base_url_never_consults_the_shared_cache() {
+        let dir = std::env::temp_dir().join(format!("hodo-private-base-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut disk = hodo_cache::DiskCache::open(&dir, 1024 * 1024).unwrap();
+        let url = "https://example.com/start";
+        let key = CacheKey::new("GET", url, "");
+        let entry = hodo_cache::CacheEntry {
+            url: url.to_string(),
+            content_type: String::new(),
+            data: Vec::new(),
+            status_code: 302,
+            expires_at: None,
+            etag: None,
+            last_modified: None,
+            vary: Default::default(),
+            headers: [(
+                "location".to_string(),
+                "https://redirect.test/landing".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            partition_key: String::new(),
+            request_method: "GET".to_string(),
+            stored_at: 0,
+        };
+        disk.put(&key, &entry).unwrap();
+        let cache = Mutex::new(disk);
+        crate::tabs::set_top_site_for_test("");
+
+        assert_eq!(
+            final_base_url_with(url, Some(&cache), false),
+            "https://redirect.test/landing"
+        );
+        let before = cache.lock().unwrap().stats();
+        assert_eq!(final_base_url_with(url, Some(&cache), true), url);
+        let after = cache.lock().unwrap().stats();
+        assert_eq!((before.hits, before.misses), (after.hits, after.misses));
+
+        drop(cache);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shell_resource_options_inherit_the_tab_top_site() {
+        let _guard = crate::hpages::tests::page_lock();
+        let tracker = "https://123date.me/banner.js";
+        crate::tabs::set_top_site_for_test("page.test");
+        let opts = resource_fetch_options(tracker);
+        assert_eq!(opts.top_site, "page.test");
+        assert_eq!(opts.partition, "page.test");
+        assert!(
+            matches!(
+                hodo_net::check_adblock(tracker, &opts),
+                Err(hodo_net::FetchError::Blocked { .. })
+            ),
+            "a third-party-listed tracker must be blocked through the shell seam"
+        );
+        assert_ne!(
+            hodo_cookie::partition_key("https", "123date.me", &opts.top_site),
+            hodo_cookie::partition_key("https", "123date.me", &site_of(tracker)),
+            "a cross-site cookie must not collapse into the request site's partition"
+        );
+
+        crate::tabs::set_top_site_for_test("123date.me");
+        let same_site = resource_fetch_options(tracker);
+        assert!(
+            hodo_net::check_adblock(tracker, &same_site).is_ok(),
+            "$third-party rule must not fire on the tracker's own site"
+        );
+        crate::tabs::set_top_site_for_test("");
+    }
+
+    #[test]
+    fn chunk_cache_key_normalizes_variants_and_uses_tab_partition() {
+        crate::tabs::set_top_site_for_test("page.test");
+        let opts = resource_fetch_options("https://a.example/chunk.js");
+        let key = chunk_cache_key("HTTPS://A.EXAMPLE:443/chunk.js#frag", &opts);
+        assert_eq!(key.url, "https://a.example/chunk.js");
+        assert_eq!(key.partition, "page.test");
+        // Two chunks from different origins still get the tab's privacy keys.
+        let other = resource_fetch_options("https://other.example/chunk.js");
+        assert_eq!(other.top_site, "page.test");
+        assert_eq!(other.partition, "page.test");
+        crate::tabs::set_top_site_for_test("");
     }
 
     #[test]
@@ -3469,5 +4450,129 @@ pub(crate) mod tests {
     fn headless_page_script_budget_is_longer_than_gui() {
         assert_eq!(GUI_PAGE_SCRIPT_BUDGET_MS, 50);
         assert_eq!(HEADLESS_PAGE_SCRIPT_BUDGET_MS, 250);
+    }
+
+    #[test]
+    fn a11y_update_builder_is_wired_without_a_window() {
+        // shortcut: winit window creation needs a display, so the adapter push
+        // is exercised by the GUI path only; this asserts the builder seam the
+        // shell hands to `Adapter::update_if_active`.
+        let mut dom = Dom::new();
+        let button = dom.create(NodeKind::Element {
+            tag: "button".into(),
+            attrs: Vec::new(),
+        });
+        dom.append(dom.root(), button);
+        let update = hodo_a11y::build_tree_update(&dom, button);
+        assert_eq!(update.focus, accesskit::NodeId::from(u64::from(button.0)));
+        assert_eq!(
+            update.tree.as_ref().unwrap().root,
+            accesskit::NodeId::from(u64::from(dom.root().0))
+        );
+        assert!(update.nodes.iter().any(|(id, node)| *id
+            == accesskit::NodeId::from(u64::from(button.0))
+            && node.role() == accesskit::Role::Button));
+    }
+
+    #[derive(Default)]
+    struct ActionRecorder {
+        defaults: Vec<NodeId>,
+        focuses: Vec<NodeId>,
+        values: Vec<(NodeId, String)>,
+    }
+
+    impl hodo_a11y::ActionHandler for ActionRecorder {
+        fn do_default(&mut self, node: NodeId) {
+            self.defaults.push(node);
+        }
+        fn set_focus(&mut self, node: NodeId) {
+            self.focuses.push(node);
+        }
+        fn set_value(&mut self, node: NodeId, value: &str) {
+            self.values.push((node, value.into()));
+        }
+    }
+
+    #[test]
+    fn a11y_action_queue_reaches_builder_handler_without_a_window() {
+        use accesskit::{Action, ActionData, TreeId};
+
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let button = dom.create(NodeKind::Element {
+            tag: "button".into(),
+            attrs: Vec::new(),
+        });
+        dom.append(root, button);
+        let mut builder = TreeBuilder::new();
+        builder.register_control(button, ControlStates::default());
+
+        // The adapter hands requests to the direct ActionHandler; mimic that
+        // call, then drain and decode on the (windowless) winit side.
+        let queue = A11yActionQueue::default();
+        let mut platform_handler = queue.clone();
+        ActionHandler::do_action(
+            &mut platform_handler,
+            ActionRequest {
+                action: Action::Click,
+                target_tree: TreeId::ROOT,
+                target_node: accesskit::NodeId::from(u64::from(button.0)),
+                data: None,
+            },
+        );
+        ActionHandler::do_action(
+            &mut platform_handler,
+            ActionRequest {
+                action: Action::SetValue,
+                target_tree: TreeId::ROOT,
+                target_node: accesskit::NodeId::from(u64::from(button.0)),
+                data: Some(ActionData::Value("hi".into())),
+            },
+        );
+        let mut recorder = ActionRecorder::default();
+        for request in queue.take() {
+            assert!(builder.dispatch_action(&dom, &request, &mut recorder));
+        }
+        assert_eq!(recorder.defaults, vec![button]);
+        assert_eq!(recorder.values, vec![(button, "hi".into())]);
+        assert!(recorder.focuses.is_empty());
+    }
+
+    #[test]
+    fn shell_actions_route_default_focus_and_value_into_form_state() {
+        let html = "<form action='http://example.test/next' method='get'>\
+            <input name='q' value='before'><button type='submit'>Go</button></form>";
+        let form = FormPage::from_html(html, "http://example.test/", DEFAULT_VIEWPORT)
+            .expect("form page with two controls");
+        let list = form.display_list();
+        let nodes: Vec<NodeId> = list
+            .items
+            .iter()
+            .zip(list.node_map.iter())
+            .filter(|(item, _)| matches!(item, DisplayItem::Control { .. }))
+            .map(|(_, &owner)| owner)
+            .collect();
+        assert_eq!(nodes.len(), 2);
+
+        let mut forms = Some(form);
+        let mut submits = Vec::new();
+        let mut changed = false;
+        {
+            let mut actions = ShellActions {
+                forms: &mut forms,
+                control_nodes: &nodes,
+                scroll: 0.0,
+                submits: &mut submits,
+                changed: &mut changed,
+            };
+            hodo_a11y::ActionHandler::do_default(&mut actions, nodes[1]);
+            hodo_a11y::ActionHandler::set_focus(&mut actions, nodes[0]);
+            hodo_a11y::ActionHandler::set_value(&mut actions, nodes[0], "after");
+        }
+        assert!(changed);
+        assert!(matches!(submits.as_slice(), [FormAction::Navigate(_)]));
+        let form = forms.as_ref().unwrap();
+        assert_eq!(form.registry.focus, Some(0));
+        assert_eq!(form.registry.controls[0].value, "after");
     }
 }

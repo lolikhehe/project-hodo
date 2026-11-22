@@ -148,29 +148,47 @@ function __hodoRunModule(url, deps, factory) {
 // (boa has no native import syntax). Pending id -> { resolve, reject }.
 var __hodoDynPending = Object.create(null);
 var __hodoDynNextId = 1;
-// Wave-1 string resolution: absolute URLs pass through; relative specs are
-// joined to the current module's directory and `.`/`..` segments collapsed.
+// Wave-1 string resolution, RFC-3986-style merge: absolute specs pass
+// through; the base keeps its scheme and authority, its last path segment
+// is stripped, `.`/`..` collapse on both separators and the result never
+// carries a stray `\.` or `//`. `file://` and scheme-less bases are local
+// paths in hodo's world, so they resolve to `file://` + merged path: the
+// spec stays fetchable as-is and never degenerates into a pseudo-absolute
+// `/D:` drive head, which the shell's joiner concatenates back onto the
+// base directory into an unreadable `..././\//D:/...` (os error 123).
 // No percent-encoding, punycode or default-port canonicalisation.
 function __hodoResolveModuleSpec(spec, base) {
   var text = String(spec);
   if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(text)) return text;
-  var rest = String(base || '');
-  var prefix = '';
-  var origin = /^([A-Za-z][A-Za-z0-9+.-]*:\/\/[^/]*)(\/.*)?$/.exec(rest);
-  if (origin) { prefix = origin[1]; rest = origin[2] || '/'; }
-  else { prefix = ''; }
-  rest = rest.replace(/[?#].*$/, '');
-  var dir = rest.slice(0, rest.lastIndexOf('/') + 1);
-  var joined = text.charAt(0) === '/' ? text : dir + text;
+  var rest = String(base || '').replace(/[?#].*$/, '');
+  var scheme = '';
+  var authority = '';
+  if (/^file:\/\//.test(rest)) {
+    rest = rest.slice('file://'.length);
+  } else {
+    var origin = /^([A-Za-z][A-Za-z0-9+.-]*):\/\/([^/]*)/.exec(rest);
+    if (origin) {
+      scheme = origin[1];
+      authority = origin[2];
+      rest = rest.slice(origin[0].length) || '/';
+    }
+  }
+  var rel = text.replace(/\\/g, '/');
+  var cut = Math.max(rest.lastIndexOf('/'), rest.lastIndexOf('\\'));
+  var dir = rel.charAt(0) === '/' || cut < 0 ? '' : rest.slice(0, cut + 1);
+  var path = (rel.charAt(0) === '/' ? rel : dir + rel).replace(/\\/g, '/');
+  var segs = path.split('/');
+  var rooted = segs.length > 0 && segs[0] === '';
   var parts = [];
-  var segs = joined.split('/');
   for (var i = 0; i < segs.length; i++) {
     var seg = segs[i];
     if (seg === '' || seg === '.') continue;
-    if (seg === '..') { parts.pop(); continue; }
+    if (seg === '..') { if (parts.length) parts.pop(); continue; }
     parts.push(seg);
   }
-  return prefix + '/' + parts.join('/');
+  var merged = (rooted ? '/' : '') + parts.join('/');
+  if (scheme) return scheme + '://' + authority + merged;
+  return 'file://' + merged;
 }
 function __hodoDynImport(spec) {
   var id = __hodoDynNextId++;
@@ -240,6 +258,21 @@ function __hodoArgs(a) { return Array.prototype.slice.call(a); }
 __HODO_MEMO__
 __HODO_MODULES__
 var __hodoState = { pending: {}, listeners: {}, lastError: null, nextId: 1 };
+// Cross-context message replies: pending send id -> settle fn. The host echoes
+// the stamped message back in a runtime.onMessageReply event; the ACK is not a
+// reply. One internal listener is installed lazily by __hodoSendMessage.
+var __hodoMsgPend = {};
+var __hodoMsgReplyListening = false;
+var __hodoMsgNextId = 1;
+function __hodoOnMsgReply(info) {
+  var message = info && info.message;
+  var id = message && message.__hodoMsgId;
+  if (id === undefined || id === null) return;
+  var settle = __hodoMsgPend[id];
+  if (!settle) return;
+  delete __hodoMsgPend[id];
+  settle(info.response === undefined ? null : info.response);
+}
 function __hodoPost(name, args) {
   return __hodo_post_task(name, args);
 }
@@ -338,6 +371,42 @@ function __hodoApiCall(style, name, args) {
   if (style === 'chrome-cb') return __hodoCall(name, rest, cb, true);
   return __hodoCall(name, rest, cb, cb !== null);
 }
+// New tab commands ride the existing `tabs.create` wire name behind a sentinel.
+// hodo-js's decode table is frozen for this wave; the host expands the sentinel
+// into the real TabAction before dispatch. Single tab id; options beyond the
+// basic fields are forwarded untouched in `props`/`payload`.
+function __hodoTabWire(style, op, args) {
+  var cb = (args.length && typeof args[args.length - 1] === 'function') ? args[args.length - 1] : null;
+  var rest = cb ? Array.prototype.slice.call(args, 0, -1) : Array.prototype.slice.call(args);
+  var cmd = { op: op, id: Number(rest[0]) };
+  if (op === 'update') cmd.props = (rest[1] && typeof rest[1] === 'object') ? rest[1] : {};
+  if (op === 'sendMessage') cmd.payload = rest.length > 1 ? rest[1] : null;
+  var wire = ['__hodo_tab__:' + JSON.stringify(cmd)];
+  if (cb) wire.push(cb);
+  return __hodoApiCall(style, 'tabs.create', wire);
+}
+// Shell events arrive as one JSON object; Chrome listeners get positional args.
+// Unwrap `{tabId, changeInfo, tab}` / `{notificationId}` (or a bare id string).
+function __hodoSplitEvent(name, key, withChangeInfo) {
+  var ev = __hodoEvent(name);
+  return {
+    addListener: function (fn) {
+      if (typeof fn !== 'function') return;
+      var wrapped = function (payload) {
+        var value = (payload && typeof payload === 'object') ? payload[key] : payload;
+        if (withChangeInfo) {
+          fn(value, (payload && payload.changeInfo) || {}, (payload && payload.tab) || null);
+        } else {
+          fn(value);
+        }
+      };
+      fn.__hodoWrapped = wrapped;
+      ev.addListener(wrapped);
+    },
+    removeListener: function (fn) { ev.removeListener(fn.__hodoWrapped || fn); },
+    hasListener: function (fn) { return ev.hasListener(fn.__hodoWrapped || fn); }
+  };
+}
 function setTimeout(fn, delay) {
   if (typeof fn !== 'function') throw new TypeError('setTimeout expects a function');
   var ms = Number(delay);
@@ -368,17 +437,31 @@ function __hodoPort(name) {
   return Object.freeze(port);
 }
 function __hodoSendMessage(message, callback) {
-  var resolveFn = null, rejectFn = null, timer = null, responded = false;
+  var resolveFn = null, rejectFn = null, timer = null, responded = false, pendingId = null;
+  function fail(err) {
+    if (responded) return;
+    responded = true;
+    if (timer !== null) clearTimeout(timer);
+    if (pendingId !== null) delete __hodoMsgPend[pendingId];
+    var e = (err instanceof Error) ? err : new Error(String(err && err.message || err));
+    __hodoState.lastError = e;
+    if (callback) {
+      try { callback(undefined); } catch (ex) { __hodoReportError(ex); }
+    } else if (rejectFn) {
+      rejectFn(e);
+    }
+  }
   function respond(value) {
     if (responded) return true;
     responded = true;
     if (timer !== null) clearTimeout(timer);
+    if (pendingId !== null) delete __hodoMsgPend[pendingId];
+    __hodoState.lastError = null;
     var result = value === undefined ? null : value;
     if (callback) {
       try { callback(result); } catch (e) { __hodoReportError(e); }
-    } else if (resolveFn) {
-      resolveFn(result);
     }
+    if (resolveFn) resolveFn(result);
     return true;
   }
   return new Promise(function (resolve, reject) {
@@ -393,25 +476,31 @@ function __hodoSendMessage(message, callback) {
           waitingAsync = true;
         } else if (reply && typeof reply.then === 'function') {
           waitingAsync = true;
-          reply.then(respond, reject);
+          reply.then(respond, fail);
         } else if (reply !== undefined) {
           respond(reply);
         }
       } catch (e) {
-        reject(e);
+        fail(e);
         return;
       }
     }
     if (!responded) {
       timer = setTimeout(function () { respond(null); }, 1000);
       if (!waitingAsync) {
-        __hodoCall('runtime.sendMessage', [message], null, false).then(respond, function (e) {
-          if (!responded) {
-            responded = true;
-            if (timer !== null) clearTimeout(timer);
-            reject(e);
+        // Only objects survive host stamping, so only they can be correlated
+        // with a reply event; scalars are posted unchanged.
+        if (message !== null && typeof message === 'object' && !Array.isArray(message)) {
+          pendingId = 'm' + (__hodoMsgNextId++);
+          message.__hodoMsgId = pendingId;
+          __hodoMsgPend[pendingId] = respond;
+          if (!__hodoMsgReplyListening) {
+            __hodoMsgReplyListening = true;
+            __hodoAddListener('runtime.onMessageReply', __hodoOnMsgReply);
           }
-        });
+        }
+        // The bare ACK is not the reply: wait for onMessageReply (or the timer).
+        __hodoCall('runtime.sendMessage', [message], null, false).then(function () {}, fail);
       }
     }
   });
@@ -479,10 +568,17 @@ fn storage_ns(style: &str) -> String {
     )
 }
 
+// `onUpdated` is a listener stub: the shell drives it with
+// host.emit_event(ext, "tabs.onUpdated", {tabId, changeInfo}). Until that hook is
+// installed no changeInfo exists, so the listener simply never fires.
 const TABS_NS: &str = r#"tabs: {
   create: function () { return __hodoApiCall('STYLE', 'tabs.create', __hodoArgs(arguments)); },
   list: function () { return __hodoApiCall('STYLE', 'tabs.list', __hodoArgs(arguments)); },
-  query: function () { return __hodoApiCall('STYLE', 'tabs.query', __hodoArgs(arguments)); }
+  query: function () { return __hodoApiCall('STYLE', 'tabs.query', __hodoArgs(arguments)); },
+  update: function () { return __hodoTabWire('STYLE', 'update', arguments); },
+  remove: function () { return __hodoTabWire('STYLE', 'remove', arguments); },
+  sendMessage: function () { return __hodoTabWire('STYLE', 'sendMessage', arguments); },
+  onUpdated: __hodoSplitEvent('tabs.onUpdated', 'tabId', true)
 }"#;
 
 fn runtime_ns(style: &str) -> String {
@@ -508,6 +604,7 @@ fn runtime_ns(style: &str) -> String {
   getManifest: function () {{ return __hodoApiCall('{style}', 'runtime.getManifest', []); }},
   get id() {{ return __hodoApiCall('{style}', 'runtime.id', []); }},
   onMessage: __hodoEvent('runtime.onMessage'),
+  onMessageReply: __hodoEvent('runtime.onMessageReply'),
   onConnect: __hodoEvent('runtime.onConnect')
 }}"
     )
@@ -519,8 +616,12 @@ const ALARMS_NS: &str = r#"alarms: {
   onAlarm: __hodoEvent('alarms.onAlarm')
 }"#;
 
+// Basic template only: the shell renders a toast from title/message and returns
+// `{notificationId}`. `onClicked` is a listener stub until the shell echoes the
+// id with host.emit_event(ext, "notifications.onClicked", notificationId).
 const NOTIFICATIONS_NS: &str = r#"notifications: {
-  create: function () { return __hodoApiCall('STYLE', 'notifications.create', __hodoArgs(arguments)); }
+  create: function () { return __hodoApiCall('STYLE', 'notifications.create', __hodoArgs(arguments)); },
+  onClicked: __hodoSplitEvent('notifications.onClicked', 'notificationId', false)
 }"#;
 
 /// `i18n.getMessage` and the `action` aliases. PURE reads flow through the same
@@ -598,6 +699,29 @@ pub fn build_prelude(config: &RuntimeConfig) -> String {
 /// ever installed here — only console, timers, promise plumbing, the DOM
 /// wrappers, the minimal `window` alias and the internal `__hodoFetch` helper.
 const PAGE_STATIC: &str = r#"
+// Bumped whenever script-visible style state changes without a DOM mutation:
+// constructable-sheet writes, adoptedStyleSheets swaps and shadow <style> stamps.
+// The shell folds this into its fingerprint so a swap still triggers a repaint.
+var __hodoSheetsRev = 0;
+function __hodoNoteSheets() { __hodoSheetsRev++; }
+function __hodoCollectAdoptedCss() {
+  var out = '';
+  var seen = [];
+  function add(sheets) {
+    for (var i = 0; i < sheets.length; i++) {
+      var sheet = sheets[i];
+      var text = sheet && sheet.__hodoCssText;
+      if (text && seen.indexOf(sheet) < 0) { seen.push(sheet); out += text + '\n'; }
+    }
+  }
+  add(document.adoptedStyleSheets);
+  var all = document.querySelectorAll('*');
+  for (var j = 0; j < all.length; j++) {
+    var root = all[j].shadowRoot;
+    if (root) add(root.adoptedStyleSheets);
+  }
+  return out;
+}
 var console = {
   log: function () { __hodo_log(__hodoJoin(arguments)); },
   info: function () { __hodo_log(__hodoJoin(arguments)); },
@@ -938,7 +1062,15 @@ function __hodoDomProps(api, node) {
     get: function () { return __hodoSerialize(__hodoInnerTarget(node)); },
     set: function (value) {
       __hodoNoteAttributeNames(value);
-      __hodo_dom_set_inner_html(__hodoInnerTarget(node), String(value));
+      var text = String(value);
+      // A shadow root's <style> text is picked up by the shell's DOM walk, but
+      // the walk alone cannot tell a swap from an unrelated mutation; stamp the
+      // same revision so the swap always triggers style re-collection.
+      if (text.toLowerCase().indexOf('<style') >= 0
+          && __hodo_dom_tag(__hodoInnerTarget(node)) === '#shadow-root') {
+        __hodoNoteSheets();
+      }
+      __hodo_dom_set_inner_html(__hodoInnerTarget(node), text);
     },
     enumerable: true
   });
@@ -1463,9 +1595,12 @@ ShadowRoot.prototype = Object.create(DocumentFragment.prototype);
 ShadowRoot.prototype.constructor = ShadowRoot;
 // Constructable stylesheet surface. Lit capability-sniffs `replace` here plus
 // `adoptedStyleSheets` on Document.prototype to select the constructable path
-// instead of its <style>-injection fallback. shortcut: wave-1 stores CSS text
-// only — no parse, no rules and no engine cascade wiring; <style> elements
-// stamped into shadow roots are still picked up by the shell's normal walk.
+// instead of its <style>-injection fallback. The shell reads the stored CSS
+// text through `__hodoCollectAdoptedCss()` and folds it into the cascade;
+// shadow-root <style> elements are still picked up by its normal DOM walk.
+// shortcut: no per-sheet media/scoping or constructable sheet objects in the
+// engine — adopted text is appended to the document author sheet; upgrade when
+// per-root scoping is required.
 function CSSStyleSheet(options) {
   this.__hodoCssText = '';
   this.__hodoOptions = options === undefined ? null : options;
@@ -1474,6 +1609,7 @@ function CSSStyleSheet(options) {
 CSSStyleSheet.prototype.replaceSync = function (text) {
   this.__hodoCssText = String(text === undefined ? '' : text);
   this.cssText = this.__hodoCssText;
+  __hodoNoteSheets();
 };
 CSSStyleSheet.prototype.replace = function (text) {
   this.replaceSync(text);
@@ -1495,7 +1631,10 @@ globalThis.CSSStyleSheet = CSSStyleSheet;
 function __hodoAdoptedStyleSheets() {
   return {
     get: function () { return this.__hodoAdoptedStyleSheets || []; },
-    set: function (value) { this.__hodoAdoptedStyleSheets = value; },
+    set: function (value) {
+      this.__hodoAdoptedStyleSheets = value;
+      __hodoNoteSheets();
+    },
     configurable: true, enumerable: true
   };
 }

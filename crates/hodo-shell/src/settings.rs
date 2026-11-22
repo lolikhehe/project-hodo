@@ -24,6 +24,11 @@ use serde::{Deserialize, Serialize};
 pub(crate) struct Settings {
     // Appearance
     pub theme: String,
+    /// Omnibox search engine for non-URL queries. `duckduckgo` uses the
+    /// `https://lite.duckduckgo.com/lite/?q=` template, which renders with our
+    /// engine today. `google` selects `https://google.com/search?q=` but is
+    /// declared-only: Google is JS-walled for us today (blank render).
+    pub search_engine: String,
     // Privacy & Security
     pub javascript: bool,
     pub adblock: bool,
@@ -84,6 +89,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: "light".into(),
+            search_engine: "duckduckgo".into(),
             javascript: true,
             adblock: true,
             adblock_allowlist: Vec::new(),
@@ -218,14 +224,24 @@ pub(crate) fn load() -> Settings {
 }
 
 fn load_from(path: &std::path::Path) -> Settings {
-    let Ok(text) = fs::read_to_string(path) else {
-        return with_env_overrides(Settings::default());
-    };
-    let parsed = serde_json::from_str::<Settings>(&text).unwrap_or_default();
-    with_env_overrides(parsed)
+    // One exit: whichever fallback we take, env overrides are applied last so
+    // a corrupt/missing file can never silently discard them.
+    let loaded = fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Settings>(&text).ok())
+        .unwrap_or_default();
+    with_env_overrides(loaded)
 }
 
 static SETTINGS: OnceLock<Mutex<Settings>> = OnceLock::new();
+
+/// `HODO_SPILL_THRESHOLD` is process-global (also read by `sessions`), so the
+/// test that sets it and every test that reads it must share this guard.
+#[cfg(test)]
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Cheap read of the current snapshot. Never panics, even before `load()`.
 pub(crate) fn current() -> Settings {
@@ -233,6 +249,14 @@ pub(crate) fn current() -> Settings {
         .get()
         .map(|slot| slot.lock().unwrap_or_else(|e| e.into_inner()).clone())
         .unwrap_or_default()
+}
+
+/// Temp file for an atomic save. The pid keeps two concurrent writers (e.g. a
+/// running browser and a CLI invocation) from renaming each other's partial
+/// file out from under the rename step.
+fn temp_path_for(path: &std::path::Path, pid: u32) -> PathBuf {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!("{name}.tmp-{pid}"))
 }
 
 /// Atomically persist a snapshot (write temp, then rename — no remove window).
@@ -244,7 +268,7 @@ pub(crate) fn save(s: &Settings) {
     let Ok(json) = serde_json::to_string_pretty(s) else {
         return;
     };
-    let temp = path.with_extension("json.tmp");
+    let temp = temp_path_for(&path, std::process::id());
     if fs::write(&temp, json).is_ok() {
         let _ = fs::rename(&temp, &path);
     } else {
@@ -308,6 +332,9 @@ pub(crate) fn apply_control(name: &str, checked: bool, value: &str) {
             crate::hpages::set_dark_enabled(checked);
             mutate(|s| s.theme = if checked { "dark" } else { "light" }.into());
         }
+        "search_engine" if matches!(value, "duckduckgo" | "google") => {
+            mutate(|s| s.search_engine = value.into());
+        }
         "javascript" | "adblock" | "https_only" | "hsts_enable" | "referrer_strip"
         | "ext_isolation" | "prefetch_enabled" | "force_full_repaint" | "debug_damage"
         | "private_by_default" | "restore_sessions" => {
@@ -367,6 +394,7 @@ mod tests {
     fn defaults_match_the_hardcoded_baseline() {
         let s = Settings::default();
         assert_eq!(s.theme, "light");
+        assert_eq!(s.search_engine, "duckduckgo");
         assert!(s.javascript && s.adblock && s.https_only && s.hsts_enable);
         assert!(s.referrer_strip && s.ext_isolation && s.prefetch_enabled);
         assert_eq!(s.spill_threshold, 8);
@@ -379,26 +407,33 @@ mod tests {
 
     #[test]
     fn roundtrip_and_corrupt_fallback() {
+        let _env = env_lock();
         let p = path("roundtrip");
         let s = Settings {
             adblock: false,
             ram_budget: "high".into(),
+            search_engine: "google".into(),
             adblock_allowlist: vec!["ads.test".into()],
             ..Settings::default()
         };
         save_to(&p, &s);
         assert_eq!(load_from(&p), s);
 
+        let expected = with_env_overrides(Settings::default());
         fs::write(&p, b"{not json").unwrap();
-        assert_eq!(load_from(&p), Settings::default());
-        assert_eq!(load_from(&path("missing")), Settings::default());
+        assert_eq!(
+            load_from(&p),
+            expected,
+            "corrupt file must still honour env"
+        );
+        assert_eq!(load_from(&path("missing")), expected);
         let _ = fs::remove_file(&p);
     }
 
     /// Save to an explicit path (production `save` uses `settings_path`).
     fn save_to(path: &std::path::Path, s: &Settings) {
         let json = serde_json::to_string_pretty(s).unwrap();
-        let temp = path.with_extension("json.tmp");
+        let temp = temp_path_for(path, std::process::id());
         fs::write(&temp, json).unwrap();
         fs::rename(&temp, path).unwrap();
     }
@@ -448,10 +483,11 @@ mod tests {
 
     #[test]
     fn atomic_save_leaves_no_temp_file() {
+        let _env = env_lock();
         let p = path("atomic");
         let s = Settings::default();
         save_to(&p, &s);
-        assert!(!p.with_extension("json.tmp").exists());
+        assert!(!temp_path_for(&p, std::process::id()).exists());
         assert_eq!(load_from(&p), s);
         // shortcut: kill-mid-write is not simulated; temp+rename guarantees the
         // reader sees either the old file or the new one, never a partial file.
@@ -459,10 +495,29 @@ mod tests {
     }
 
     #[test]
+    fn temp_path_is_pid_scoped() {
+        let p = path("tmp-name");
+        let mine = temp_path_for(&p, 1234);
+        let other = temp_path_for(&p, 5678);
+        assert_ne!(mine, other, "concurrent writers must not share a temp file");
+        assert!(mine.to_string_lossy().ends_with("tmp-1234"));
+    }
+
+    #[test]
     fn env_overrides_file_value() {
+        // Serialise with the page tests (they call `settings::current()`) and
+        // with every reader of this process-global env var, including the
+        // spill-threshold test in `tabs`.
+        let _guard = crate::hpages::tests::page_lock();
+        let _env = env_lock();
         std::env::set_var("HODO_SPILL_THRESHOLD", "3");
         let s = with_env_overrides(Settings::default());
-        std::env::remove_var("HODO_SPILL_THRESHOLD");
         assert_eq!(s.spill_threshold, 3);
+        // The same overrides must survive the corrupt-file fallback.
+        let p = path("corrupt-env");
+        fs::write(&p, b"{not json").unwrap();
+        assert_eq!(load_from(&p).spill_threshold, 3);
+        std::env::remove_var("HODO_SPILL_THRESHOLD");
+        let _ = fs::remove_file(&p);
     }
 }

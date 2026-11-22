@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>lit-site — Lit substrate regression</title>
+  <!-- Warms the shared cache before the entry's dynamic import asks for it. -->
+  <link rel="modulepreload" href="./chunk-dynamic.js">
+  <style>
+    body { margin: 0; background: #ffffff; color: #1a1a1a; font-family: sans-serif; }
+    #probe { padding: 6px 8px; font-size: 15px; color: #0b5a2a; }
+  </style>
+</head>
+<body>
+  <!-- Both tags exist BEFORE customElements.define: define must upgrade them. -->
+  <x-lit-card id="card-a" data-title="档案 · Archive" data-body="CDN-free 本地回归">LIGHT-FALLBACK-A</x-lit-card>
+  <x-lit-card id="card-b" data-title="书目 · Catalog" data-body="no network · no deploys">LIGHT-FALLBACK-B</x-lit-card>
+  <div id="probe">PROBE-PENDING</div>
+  <!-- Inline type=module is skipped by hodo; only src= anchors a fetchable graph. -->
+  <script type="module" src="./entry.js"></script>
+</body>
+</html>

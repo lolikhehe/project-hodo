@@ -1,1 +1,0 @@
-var e=location.hostname===`localhost`||location.host.match(/^(www|cat)-[a-z0-9]+\.archive\.org$/)||location.host.match(/\.code\.archive\.org$/)||location.host.match(/\.dev\.archive\.org$/)||location.host.match(/^ia-petabox-/)||location.host.match(/^local.archive.org/)?console.log.bind(console):()=>{};export{e as t};

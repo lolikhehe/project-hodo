@@ -92,6 +92,11 @@ impl Tab {
 // parallel unit tests isolated; the GUI drives everything on one thread.
 thread_local! {
     static PRIVATE_LOAD: Cell<bool> = const { Cell::new(false) };
+    /// Registrable site of the page currently being loaded. Subresources and
+    /// module chunks inherit this as `top_site`/partition instead of claiming
+    /// to be their own top-level site (which disabled `$third-party` rules and
+    /// collapsed cookie double-keying).
+    static TOP_SITE: RefCell<String> = const { RefCell::new(String::new()) };
     /// Redirect-final URLs from the active tab's history, used to seed
     /// `:visited` matching in `hodo_style::compute_styles_with_visited`.
     static VISITED_HREFS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
@@ -104,6 +109,22 @@ pub(crate) fn private_load() -> bool {
 
 fn set_private_load(private: bool) {
     PRIVATE_LOAD.with(|flag| flag.set(private));
+}
+
+/// Top-level site of the page whose resources are loading. Empty for headless
+/// loads with no tab: those are top-level requests, so no `$third-party` rule
+/// applies and no cookie partition is borrowed from a nonexistent parent.
+pub(crate) fn top_site() -> String {
+    TOP_SITE.with(|site| site.borrow().clone())
+}
+
+fn set_top_site(site: String) {
+    TOP_SITE.with(|slot| *slot.borrow_mut() = site);
+}
+
+#[cfg(test)]
+pub(crate) fn set_top_site_for_test(site: &str) {
+    set_top_site(site.to_string());
 }
 
 /// Snapshot of the active tab's visited URLs for the page pipeline. Headless
@@ -122,6 +143,14 @@ pub(crate) fn set_visited_hrefs_for_test(hrefs: &[&str]) {
 /// Set both load-context thread-locals from a tab before driving the pipeline.
 fn set_load_context(tab: &Tab) {
     set_private_load(tab.private);
+    // `navigate` pushes the new URL before calling this, so the history entry at
+    // the cursor is the page being loaded; `tab.url` is still the old page.
+    let page_url = tab
+        .history
+        .get(tab.history_cursor)
+        .filter(|url| !url.is_empty())
+        .unwrap_or(&tab.url);
+    set_top_site(crate::app::site_of(page_url));
     VISITED_HREFS.with(|set| *set.borrow_mut() = tab.history.iter().cloned().collect());
 }
 
@@ -261,6 +290,13 @@ impl App {
 
     pub fn active_tab(&self) -> &Tab {
         &self.tabs[self.active]
+    }
+
+    /// Ctrl+L: hand the caret back to the omnibox with a fresh query. The
+    /// present path paints the focus ring from this same flag.
+    pub fn focus_omnibox(&mut self) {
+        self.url_focused = true;
+        self.url_bar.clear();
     }
 
     /// Flip private browsing for the active tab; returns the new state.
@@ -412,9 +448,12 @@ impl App {
     /// A new entry is pushed after the cursor and any forward entries are
     /// dropped, matching standard browser history behaviour.
     pub fn navigate(&mut self, url: &str, viewport: Size) -> String {
+        // Single navigation seam for typed URLs, links and form actions: a DDG
+        // Lite result wrapper goes to its real destination instead.
+        let url = crate::search::unwrap_result(url);
         let tab = &mut self.tabs[self.active];
         tab.history.truncate(tab.history_cursor + 1);
-        tab.history.push(url.to_string());
+        tab.history.push(url);
         tab.history_cursor = tab.history.len() - 1;
         self.load_history_entry(viewport)
     }
@@ -658,6 +697,8 @@ mod tests {
                     color: Color::WHITE,
                     border_color: Some(Color::BLACK),
                     radius: 2.0,
+                    border_style: 0,
+                    border_width: 1.0,
                 }),
                 2 => list.items.push(DisplayItem::Image {
                     rect,
@@ -686,6 +727,8 @@ mod tests {
             color: Color::BLACK,
             border_color: None,
             radius: 0.0,
+            border_style: 0,
+            border_width: 0.0,
         });
         list.fixed_node_map.push(NodeId(999));
         list
@@ -724,6 +767,47 @@ mod tests {
         app.new_tab();
         assert!(!app.active_tab().private);
         assert!(!private_load());
+    }
+
+    #[test]
+    fn focus_moves_between_page_and_omnibox() {
+        let mut app = App::new(Some(ABOUT_HODO_URL));
+        app.url_focused = true;
+        // Clicking page content with no link (or form) under the cursor gives
+        // focus back to the page; the chrome repaints from the same flag.
+        assert!(!app.handle_click(500.0, 110.0));
+        assert!(!app.url_focused);
+        app.url_bar = "rust".into();
+        app.focus_omnibox();
+        assert!(app.url_focused);
+        assert!(app.url_bar.is_empty());
+    }
+
+    #[test]
+    fn bare_launch_opens_the_local_welcome_page_with_omnibox_focused() {
+        let app = App::new(None);
+        assert_eq!(app.active_tab().url, ABOUT_HODO_URL);
+        assert_eq!(app.active_tab().title, "hodo — new tab");
+        assert!(app
+            .active_tab()
+            .display_list
+            .items
+            .iter()
+            .any(|item| matches!(item, DisplayItem::Text { text, .. } if text.contains("hodo"))));
+        // Same state as Ctrl+T: typing works without clicking the bar first.
+        assert!(app.url_focused);
+    }
+
+    #[test]
+    fn navigate_unwraps_a_ddg_result_link_into_the_url_state() {
+        let mut app = App::new(Some(ABOUT_HODO_URL));
+        app.navigate(
+            "https://duckduckgo.com/l/?uddg=hodo%3A%2F%2Fprivacy&rut=deadbeef",
+            DEFAULT_VIEWPORT,
+        );
+        assert_eq!(app.active_tab().url, "hodo://privacy");
+        assert_eq!(app.url_bar, "hodo://privacy");
+        assert_eq!(app.active_tab().history.last().unwrap(), "hodo://privacy");
     }
 
     #[test]
@@ -867,8 +951,9 @@ mod tests {
 
     #[test]
     fn default_spill_threshold_is_eight() {
-        // The env var is read at each save; avoid mutating process-wide state
-        // in a parallel test by checking the default path only here.
+        // `sessions::spill_threshold` reads the process-global env var on every
+        // save; the settings test that sets it holds the same guard.
+        let _env = crate::settings::env_lock();
         let dir = crate::sessions::test_spill_dir("threshold");
         assert_eq!(crate::sessions::spill_threshold(), 8);
         let mut app = App::new(Some(ABOUT_HODO_URL));

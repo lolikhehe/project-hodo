@@ -1,1 +1,0 @@
-function e(e,t){return e.charAt(0).toLocaleUpperCase(t)+e.slice(1)}export{e as t};

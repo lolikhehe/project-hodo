@@ -17,6 +17,7 @@ mod hpages;
 mod modules;
 mod popup;
 mod present;
+mod search;
 mod sessions;
 mod settings;
 mod tabs;
@@ -27,16 +28,32 @@ use std::time::Duration;
 
 use winit::event_loop::{ControlFlow, EventLoop};
 
+/// Owns the thread-local primed boa realm from the first prime until the end of
+/// `main`. Any early return or `expect` unwinds this guard, so the `Context` is
+/// dropped on the owning thread instead of faulting during TLS teardown.
+struct PrimedGuard;
+
+impl Drop for PrimedGuard {
+    fn drop(&mut self) {
+        hodo_js::drop_primed_page_prelude();
+    }
+}
+
+/// Pick the first popup-declaration action, or a one-line CLI error.
+fn find_popup_action(actions: Vec<popup::PopupAction>) -> Result<popup::PopupAction, String> {
+    actions
+        .into_iter()
+        .find(|action| action.popup_path.is_some())
+        .ok_or_else(|| "extension must declare a popup".to_owned())
+}
+
 /// Headless popup screenshot: parse, run scripts, style/layout/render the
 /// extension's popup page and encode its offscreen frame as PNG.
 fn popup_screenshot(ext_dir: &str, out: &str) {
     let actions = popup::load_actions_from(std::path::Path::new(ext_dir));
-    let action = actions
-        .into_iter()
-        .find(|action| action.popup_path.is_some())
-        .expect("extension must declare a popup");
-    let popup =
-        popup::PopupState::open(&action, 0, app::DEFAULT_VIEWPORT).expect("popup page must load");
+    let action = find_popup_action(actions).unwrap_or_else(|err| cli_error(&err));
+    let popup = popup::PopupState::open(&action, 0, app::DEFAULT_VIEWPORT)
+        .unwrap_or_else(|err| cli_error(&format!("popup page must load: {err}")));
     let mut rgba = Vec::with_capacity(popup.frame.len() * 4);
     for pixel in &popup.frame {
         rgba.extend_from_slice(&[
@@ -52,7 +69,8 @@ fn popup_screenshot(ext_dir: &str, out: &str) {
     let pixmap =
         tiny_skia::Pixmap::from_vec(premultiplied, size).expect("frame matches popup size");
     let png = pixmap.encode_png().expect("PNG encoding failed");
-    fs::write(out, &png).expect("failed to write popup screenshot");
+    fs::write(out, &png)
+        .unwrap_or_else(|err| cli_error(&format!("failed to write popup screenshot: {err}")));
     println!("popup screenshot written: {out} ({} bytes)", png.len());
 }
 
@@ -72,6 +90,11 @@ fn screenshot_frame(
 fn screenshot(url: &str, out: &str, viewport: hodo_types::Size, wait_ms: u64) {
     // Same first-load priming as the GUI path; headless runs on this thread.
     hodo_js::prime_page_prelude();
+    // The GUI path loads this in `BrowserApp::new`; headless has no BrowserApp,
+    // so do the minimal equivalent here: one Host load and one poll before the
+    // page (and its content scripts) are fetched.
+    app::load_extension_host(std::path::Path::new("./extensions"));
+    app::poll_extension_host();
     let (title, display_list) =
         app::load_page_with_wait(url, viewport, Duration::from_millis(wait_ms));
     println!("title: {title}");
@@ -80,11 +103,11 @@ fn screenshot(url: &str, out: &str, viewport: hodo_types::Size, wait_ms: u64) {
         .expect("viewport dimensions are validated by the CLI parser");
     let pixmap = tiny_skia::Pixmap::from_vec(premultiplied, size).expect("frame matches viewport");
     let png = pixmap.encode_png().expect("PNG encoding failed");
-    fs::write(out, &png).expect("failed to write screenshot");
+    fs::write(out, &png)
+        .unwrap_or_else(|err| cli_error(&format!("failed to write screenshot: {err}")));
     println!("screenshot written: {out} ({} bytes)", png.len());
-    // No further navigation in headless mode: drop the one-shot primed realm on
-    // this thread instead of leaving a boa Context for TLS teardown to finalise.
-    hodo_js::drop_primed_page_prelude();
+    // No further navigation in headless mode: `PrimedGuard` in `main` drops the
+    // one-shot realm on this thread, including on every `expect` unwind above.
 }
 
 fn run_gui(initial_url: Option<&str>, private: bool) {
@@ -115,8 +138,9 @@ fn run_gui(initial_url: Option<&str>, private: bool) {
     if let Err(err) = event_loop.run_app(&mut app) {
         eprintln!("hodo: event loop error: {err}");
     }
-    // GUI shutdown: no next navigation will check out the primed realm.
-    hodo_js::drop_primed_page_prelude();
+    // GUI exit: no next navigation will check out the primed realm. `run_app`
+    // returning normally or failing both reach `main`'s guard; a panic inside
+    // the event loop unwinds the same guard before TLS teardown.
 }
 
 const USAGE: &str = "usage: hodo-shell [--private] [--screenshot <url> <out.png> [--viewport WxH] [--wait-ms N (0=no settle loop)]] [--popup-screenshot <ext-dir> <out.png>] [<url>] [--private]";
@@ -189,87 +213,94 @@ enum Action {
 }
 
 fn parse_args(args: &[String]) -> Result<Action, String> {
-    let mut rest = args.iter().skip(1).peekable();
+    // Collect flags wherever they appear, then interpret the positional args.
+    // This keeps `--wait-ms` (and `--viewport`) position-independent.
     let mut viewport: Option<hodo_types::Size> = None;
     let mut wait_ms = DEFAULT_WAIT_MS;
-
-    // Leading `--viewport` / `--wait-ms` pairs (before the mode), mirroring the
-    // historic `--viewport WxH --screenshot ...` spelling.
-    while matches!(
-        rest.peek().map(|item| item.as_str()),
-        Some("--viewport") | Some("--wait-ms")
-    ) {
-        let flag = rest.next().expect("peeked flag").clone();
-        let value = rest.next().ok_or("missing flag value")?;
-        if flag == "--viewport" {
-            viewport = Some(parse_viewport(value)?);
-        } else {
-            wait_ms = parse_wait_ms(value)?;
+    let mut mode: Option<&str> = None;
+    let mut private = false;
+    let mut positional: Vec<&str> = Vec::new();
+    let mut rest = args.iter().skip(1);
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--viewport" | "--wait-ms" => {
+                let flag = arg.as_str();
+                let value = rest.next().ok_or("missing flag value")?;
+                if flag == "--viewport" {
+                    viewport = Some(parse_viewport(value)?);
+                } else {
+                    wait_ms = parse_wait_ms(value)?;
+                }
+            }
+            "--private" => {
+                if private {
+                    return Err(USAGE.to_owned());
+                }
+                private = true;
+            }
+            flag @ ("--screenshot" | "--popup-screenshot") => {
+                if mode.is_some() {
+                    return Err(USAGE.to_owned());
+                }
+                mode = Some(flag);
+            }
+            other => positional.push(other),
         }
     }
 
-    let first = rest.next().map(String::as_str).unwrap_or("");
-    match first {
-        "--screenshot" => {
-            let url = rest.next().ok_or("missing screenshot url")?;
-            let out = rest.next().ok_or("missing screenshot output path")?;
-            // Trailing pairs in any order.
-            while let Some(flag) = rest.next() {
-                let value = rest.next().ok_or("missing flag value")?;
-                match flag.as_str() {
-                    "--viewport" => viewport = Some(parse_viewport(value)?),
-                    "--wait-ms" => wait_ms = parse_wait_ms(value)?,
-                    _ => return Err(USAGE.to_owned()),
-                }
+    match mode {
+        Some("--screenshot") => {
+            if private {
+                return Err(USAGE.to_owned());
+            }
+            let mut pos = positional.into_iter();
+            let url = pos.next().ok_or("missing screenshot url")?;
+            let out = pos.next().ok_or("missing screenshot output path")?;
+            if pos.next().is_some() {
+                return Err(USAGE.to_owned());
             }
             Ok(Action::Screenshot {
-                url: url.clone(),
-                out: out.clone(),
+                url: url.to_owned(),
+                out: out.to_owned(),
                 viewport: viewport.unwrap_or(app::DEFAULT_VIEWPORT),
                 wait_ms,
             })
         }
-        "--popup-screenshot" => {
-            let dir = rest.next().ok_or("missing extension directory")?;
-            let out = rest.next().ok_or("missing screenshot output path")?;
-            if rest.next().is_some() {
+        Some("--popup-screenshot") => {
+            if private {
+                return Err(USAGE.to_owned());
+            }
+            let mut pos = positional.into_iter();
+            let dir = pos.next().ok_or("missing extension directory")?;
+            let out = pos.next().ok_or("missing screenshot output path")?;
+            if pos.next().is_some() {
                 return Err(USAGE.to_owned());
             }
             Ok(Action::PopupScreenshot {
-                dir: dir.clone(),
-                out: out.clone(),
+                dir: dir.to_owned(),
+                out: out.to_owned(),
             })
         }
-        "--private" => match (rest.next(), rest.next()) {
-            (None, None) => Ok(Action::Gui {
-                url: None,
-                private: true,
-            }),
-            (Some(url), None) => Ok(Action::Gui {
-                url: Some(url.clone()),
-                private: true,
-            }),
-            _ => Err(USAGE.to_owned()),
-        },
-        "" => Ok(Action::Gui {
-            url: None,
-            private: false,
-        }),
-        url => match (rest.next().map(String::as_str), rest.next()) {
-            (None, None) => Ok(Action::Gui {
-                url: Some(url.to_owned()),
-                private: false,
-            }),
-            (Some("--private"), None) => Ok(Action::Gui {
-                url: Some(url.to_owned()),
-                private: true,
-            }),
-            _ => Err(USAGE.to_owned()),
-        },
+        Some(_) => Err(USAGE.to_owned()),
+        None => {
+            let mut pos = positional.into_iter();
+            let url = pos.next();
+            if pos.next().is_some() {
+                return Err(USAGE.to_owned());
+            }
+            Ok(Action::Gui {
+                url: url.map(str::to_owned),
+                private,
+            })
+        }
     }
 }
 
 fn main() {
+    // Held across every mode before any prime happens: the screenshot path
+    // primes at startup and the GUI path primes here too, so an early exit from
+    // either can never strand a boa Context in thread-local storage.
+    let _primed_guard = PrimedGuard;
     let args: Vec<String> = std::env::args().collect();
     match parse_args(&args).unwrap_or_else(|err| cli_error(&err)) {
         Action::Screenshot {
@@ -290,6 +321,23 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| (*part).to_owned()).collect()
+    }
+
+    #[test]
+    fn primed_guard_drops_on_forced_early_return() {
+        // Simulates a screenshot/GUI path that primes and then returns before
+        // reaching an explicit drop: the guard must still release the realm.
+        fn load_then_bail() -> Result<(), ()> {
+            hodo_js::prime_page_prelude();
+            let _guard = PrimedGuard;
+            assert!(hodo_js::has_primed_page_prelude());
+            Err(())
+        }
+        assert!(load_then_bail().is_err());
+        assert!(
+            !hodo_js::has_primed_page_prelude(),
+            "guard must drop the primed realm on an early return"
+        );
     }
 
     #[test]
@@ -423,6 +471,39 @@ mod tests {
             .expect("default wait parses");
         assert!(
             matches!(default, Action::Screenshot { wait_ms, .. } if wait_ms == DEFAULT_WAIT_MS)
+        );
+    }
+
+    #[test]
+    fn wait_ms_is_position_independent_even_between_mode_and_positionals() {
+        let action = parse_args(&argv(&[
+            "hodo-shell",
+            "--screenshot",
+            "--wait-ms",
+            "750",
+            "file:///tmp/a.html",
+            "out.png",
+        ]))
+        .expect("wait flag before positionals parses");
+        assert!(matches!(action, Action::Screenshot { wait_ms: 750, .. }));
+
+        let action = parse_args(&argv(&[
+            "hodo-shell",
+            "--screenshot",
+            "file:///tmp/a.html",
+            "--wait-ms",
+            "250",
+            "out.png",
+        ]))
+        .expect("wait flag between positionals parses");
+        assert!(matches!(action, Action::Screenshot { wait_ms: 250, .. }));
+    }
+
+    #[test]
+    fn popup_action_without_popup_is_a_cli_error_string() {
+        assert_eq!(
+            find_popup_action(Vec::new()).err().unwrap(),
+            "extension must declare a popup"
         );
     }
 

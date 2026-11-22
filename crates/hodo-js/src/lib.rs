@@ -123,6 +123,13 @@ pub fn drop_primed_page_prelude() {
     });
 }
 
+/// Whether this thread still holds a checked-out-ready primed realm. Used by
+/// hosts to verify that an early-return path still ran its cleanup guard.
+#[cfg(feature = "js")]
+pub fn has_primed_page_prelude() -> bool {
+    PRIMED_PAGE.with(|slot| slot.borrow().is_some())
+}
+
 #[cfg(feature = "js")]
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -654,6 +661,28 @@ impl ExtScriptRuntime {
             executor,
             hooks,
         }
+    }
+
+    /// MAIN-world content-script seam: install one WebExtension prelude into an
+    /// already-live *page* realm. The page's DOM natives and prelude are already
+    /// registered, so this only adds `chrome` / `browser`; the prelude's own
+    /// helpers and `__hodoState` stay inside the IIFE instead of clobbering the
+    /// page realm's identically named state. One install per realm keeps a
+    /// single shared API object for every content script in this page.
+    #[cfg(feature = "js")]
+    pub fn install_main_world(&mut self, config: &RuntimeConfig) {
+        let prelude = prelude::build_prelude(config);
+        let script = format!(
+            "if (!globalThis.__hodoContentWorld) {{\n\
+             (function () {{\n{prelude}\n\
+             globalThis.chrome = chrome;\n\
+             globalThis.browser = browser;\n\
+             globalThis.__hodoContentWorld = true;\n\
+             }})();\n}}\n0;"
+        );
+        self.context
+            .eval(Source::from_bytes(script.as_str()))
+            .expect("the MAIN-world prelude is valid JavaScript");
     }
 
     /// The single registry every `chrome.*` / `browser.*` call dispatches into.
@@ -1522,7 +1551,10 @@ fn make_calls(
         }
         "tabs.list" | "tabs.query" => calls.push(ApiCall::TabsList),
         "runtime.sendMessage" | "runtime.portMessage" => {
-            let message = args.first().cloned().unwrap_or(Value::Null);
+            let message = args
+                .get(if name == "runtime.portMessage" { 1 } else { 0 })
+                .cloned()
+                .unwrap_or(Value::Null);
             validate_api_value(&message)?;
             calls.push(ApiCall::SendMessage { message });
         }
@@ -2136,6 +2168,51 @@ mod tests {
     }
 
     #[test]
+    fn main_world_sees_page_dom_and_chrome_in_one_realm() {
+        use hodo_ext_api::RuntimeInfo;
+        let mut doc = hodo_dom::Dom::new();
+        let probe = doc.create(hodo_dom::NodeKind::Element {
+            tag: "div".into(),
+            attrs: vec![("id".into(), "probe".into())],
+        });
+        doc.append(doc.root(), probe);
+        let mut runtime =
+            ExtScriptRuntime::new_page_with_url(Rc::new(RefCell::new(doc)), "http://example.com/");
+        runtime
+            .registry()
+            .borrow_mut()
+            .set_runtime_info(Rc::new(RuntimeInfo {
+                id: "demo-id".into(),
+                url_base: "chrome-extension://demo-id".into(),
+                manifest: json!({ "name": "content-demo", "version": "1.0" }),
+                messages: None,
+            }));
+        runtime.install_main_world(&RuntimeConfig {
+            dialect: ApiDialect::ChromeMv3,
+            extension_name: "content-demo".into(),
+            ..RuntimeConfig::default()
+        });
+        // One probe: the page's DOM natives still answer, page globals survive,
+        // and the extension prelude coexists in the very same realm.
+        let result = runtime
+            .eval(
+                "JSON.stringify([document.getElementById('probe') !== null, \
+                 document.getElementById('probe').getAttribute('id'), \
+                 window.location.href, typeof chrome, typeof browser.runtime.id.then])",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            r#"[true,"probe","http://example.com/","object","function"]"#
+        );
+        runtime
+            .eval("chrome.runtime.id.then(function (id) { __hodo_log('cs-id:' + id); });")
+            .unwrap();
+        runtime.tick();
+        assert_eq!(trace(&mut runtime), vec!["cs-id:demo-id".to_string()]);
+    }
+
+    #[test]
     #[ignore = "bench"]
     fn bench_page_prelude_prime() {
         let n = 12u32;
@@ -2677,6 +2754,114 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // name mirrors the host event runtime.onMessageReply
+    fn send_message_promise_waits_for_onMessage_reply_not_the_ack() {
+        let clock = Rc::new(FakeClock::new(0));
+        let mut runtime = runtime_with(clock, &[]);
+        let posted = Rc::new(RefCell::new(None));
+        let seen = Rc::clone(&posted);
+        runtime.set_dispatch_hook(Some(Rc::new(move |call| {
+            if let ApiCall::SendMessage { message } = call {
+                *seen.borrow_mut() = Some(message.clone());
+            }
+            ApiResult::Ok(json!(null)) // bare ACK, no reply
+        })));
+        runtime
+            .eval("browser.runtime.sendMessage({text: 'ping'}).then(function (r) { __hodo_log('r:' + r); });")
+            .unwrap();
+        runtime.tick();
+        assert!(
+            trace(&mut runtime).is_empty(),
+            "the sendMessage ACK must not settle the promise"
+        );
+        let message = posted.borrow().clone().expect("sendMessage was posted");
+        assert_eq!(
+            message.get("__hodoMsgId").and_then(Value::as_str),
+            Some("m1")
+        );
+        runtime.fire_event(
+            "runtime.onMessageReply",
+            json!({ "message": message, "response": "pong" }),
+        );
+        runtime.tick();
+        assert_eq!(trace(&mut runtime), vec!["r:pong".to_string()]);
+    }
+
+    #[test]
+    fn send_message_settles_callback_and_promise() {
+        let clock = Rc::new(FakeClock::new(0));
+        let mut runtime = runtime_with(clock, &[]);
+        let posted = Rc::new(RefCell::new(None));
+        let seen = Rc::clone(&posted);
+        runtime.set_dispatch_hook(Some(Rc::new(move |call| {
+            if let ApiCall::SendMessage { message } = call {
+                *seen.borrow_mut() = Some(message.clone());
+            }
+            ApiResult::Ok(json!(null))
+        })));
+        runtime
+            .eval(
+                "chrome.runtime.sendMessage({text: 'ping'}, function (r) { __hodo_log('cb:' + r); }) \
+                 .then(function (r) { __hodo_log('p:' + r); });",
+            )
+            .unwrap();
+        runtime.tick();
+        assert!(trace(&mut runtime).is_empty());
+        let message = posted.borrow().clone().expect("sendMessage was posted");
+        runtime.fire_event(
+            "runtime.onMessageReply",
+            json!({ "message": message, "response": "pong" }),
+        );
+        runtime.tick();
+        assert_eq!(
+            trace(&mut runtime),
+            vec!["cb:pong".to_string(), "p:pong".to_string()]
+        );
+        runtime
+            .eval("__hodo_log('lastError:' + chrome.runtime.lastError);")
+            .unwrap();
+        assert_eq!(trace(&mut runtime), vec!["lastError:null".to_string()]);
+    }
+
+    #[test]
+    fn send_message_reply_with_unknown_id_is_ignored() {
+        let clock = Rc::new(FakeClock::new(0));
+        let mut runtime = runtime_with(clock, &[]);
+        let posted = Rc::new(RefCell::new(None));
+        let seen = Rc::clone(&posted);
+        runtime.set_dispatch_hook(Some(Rc::new(move |call| {
+            if let ApiCall::SendMessage { message } = call {
+                *seen.borrow_mut() = Some(message.clone());
+            }
+            ApiResult::Ok(json!(null))
+        })));
+        runtime
+            .eval(
+                "chrome.runtime.onMessageReply.addListener(function (info) { __hodo_log('ev:' + info.response); }); \
+                 browser.runtime.sendMessage({text: 'ping'}).then(function (r) { __hodo_log('r:' + r); });",
+            )
+            .unwrap();
+        runtime.tick();
+        assert!(trace(&mut runtime).is_empty());
+        runtime.fire_event(
+            "runtime.onMessageReply",
+            json!({ "message": { "__hodoMsgId": "m999" }, "response": "bogus" }),
+        );
+        runtime.tick();
+        assert_eq!(trace(&mut runtime), vec!["ev:bogus".to_string()]);
+        let message = posted.borrow().clone().expect("sendMessage was posted");
+        runtime.fire_event(
+            "runtime.onMessageReply",
+            json!({ "message": message, "response": "real" }),
+        );
+        runtime.tick();
+        assert_eq!(
+            trace(&mut runtime),
+            vec!["ev:real".to_string(), "r:real".to_string()]
+        );
+    }
+
+    #[test]
     fn connect_creates_a_port_and_notifies_on_connect() {
         let mut runtime = ExtScriptRuntime::new();
         runtime
@@ -2806,6 +2991,21 @@ mod tests {
             ApiCall::StorageSet { key, value } if key == "k" && *value == json!(1)
         ));
         assert!(decode_api_call("nope", json!([])).is_err());
+    }
+
+    #[test]
+    fn decode_api_call_port_message_uses_second_arg_as_message() {
+        let calls =
+            decode_api_call("runtime.portMessage", json!(["chan", { "text": "hi" }])).unwrap();
+        assert!(matches!(
+            &calls[0],
+            ApiCall::SendMessage { message } if *message == json!({ "text": "hi" })
+        ));
+        let calls = decode_api_call("runtime.sendMessage", json!({ "text": "hi" })).unwrap();
+        assert!(matches!(
+            &calls[0],
+            ApiCall::SendMessage { message } if *message == json!({ "text": "hi" })
+        ));
     }
 
     #[test]

@@ -1,1 +1,0 @@
-var e=class extends Error{constructor(e,t={}){super(e,{cause:t.cause}),this.name=`UploadServiceRequestError`,this.status=t.status}};export{e as t};

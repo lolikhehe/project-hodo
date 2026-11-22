@@ -1,1 +1,0 @@
-var e=`/offshoot_assets/logo-CGBepQ_r.png`;export{e as t};
