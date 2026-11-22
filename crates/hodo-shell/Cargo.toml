@@ -13,10 +13,18 @@ hodo-style.workspace = true
 hodo-layout.workspace = true
 hodo-render.workspace = true
 hodo-net.workspace = true
+hodo-adblock.workspace = true
 hodo-cache = { path = "../hodo-cache", version = "0.1.0" }
 hodo-ext-host.workspace = true
 hodo-ext-manifest.workspace = true
 hodo-ext-api.workspace = true
+hodo-js.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Pinned: bincode 2.x is the last 2.x release (3.x changed the API); lz4_flex
+# default features are the safe, pure-Rust encoder/decoder.
+bincode = { version = "=2.0.1", features = ["serde"] }
+lz4_flex = "=0.14.2"
 winit = "0.30"
 softbuffer = "0.4.8"
 tiny-skia = "0.12.0"

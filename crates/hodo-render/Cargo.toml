@@ -12,6 +12,8 @@ tiny-skia = "0.12.0"
 fontdue = "0.9.5"
 png = "0.18"
 jpeg-decoder = "0.3"
+image-webp = "=0.2.4"
+gif = { version = "=0.14.2", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true
