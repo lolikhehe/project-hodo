@@ -213,16 +213,16 @@ pub fn set_dark_enabled(enabled: bool) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::about::ABOUT_HODO_URL;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Several tests touch process-global adblock state; serialize them.
-    static PAGE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    pub(crate) static PAGE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
-    fn page_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn page_lock() -> std::sync::MutexGuard<'static, ()> {
         PAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 

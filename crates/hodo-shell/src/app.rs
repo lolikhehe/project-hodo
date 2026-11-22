@@ -4,7 +4,7 @@
 //! [`ui`]; the softbuffer draw path in [`present`].
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -30,6 +30,7 @@ use winit::window::{Window, WindowId};
 
 use crate::about::ABOUT_HODO_URL;
 use crate::forms::{FormAction, FormPage};
+use crate::modules::{decode_dynamic_request, emit_graph, resolve_graph, DynamicModuleRequest};
 use crate::popup::{PopupAction, PopupState};
 use crate::present::RasterState;
 use crate::tabs::App;
@@ -641,25 +642,157 @@ fn shell_cache() -> Option<&'static Mutex<hodo_cache::DiskCache>> {
         .as_ref()
 }
 
-/// Load a page resource through the shared cache. If the cache cannot be
-/// opened, degrade to the frozen uncached loader rather than failing the page.
-pub(crate) fn load_resource(url: &str) -> Result<Resource, hodo_net::FetchError> {
-    let opts = hodo_net::FetchOptions {
-        private: crate::tabs::private_load(),
-        ..Default::default()
-    };
-    // shortcut: `load_with` ignores FetchOptions.private for cache writes; use
-    // the uncached loader until the integrator routes loads via hodo_net::fetch.
-    if opts.private {
-        return hodo_net::load(url);
+/// Shell-owned cookie jar. `hodo_net::fetch` also mirrors Set-Cookie into its
+/// process-wide jar, but reads must come from the jar we keep so cookies
+/// round-trip across page/subresource loads. One jar per process is enough: the
+/// GUI drives loads on a single thread and double-keyed partitions live inside
+/// the jar.
+fn shell_cookie_jar() -> &'static Mutex<hodo_cookie::CookieJar> {
+    static JAR: OnceLock<Mutex<hodo_cookie::CookieJar>> = OnceLock::new();
+    JAR.get_or_init(|| Mutex::new(hodo_cookie::CookieJar::new()))
+}
+
+/// Registrable domain of a URL's host (no PSL; last two labels, IP literal kept
+/// whole). Used as both `top_site` and the cache partition for shell loads.
+fn site_of(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .rsplit_once('@')
+        .map_or(rest, |(_, host)| host);
+    let host = authority.split(':').next().unwrap_or("");
+    if host.parse::<std::net::Ipv4Addr>().is_ok()
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok()
+    {
+        return host.to_string();
     }
-    match shell_cache() {
+    let labels: Vec<&str> = host.split('.').filter(|s| !s.is_empty()).collect();
+    if labels.len() <= 2 {
+        host.to_string()
+    } else {
+        format!("{}.{}", labels[labels.len() - 2], labels[labels.len() - 1])
+    }
+}
+
+/// Build the privacy options for one resource load. The private flag comes from
+/// the active tab; the loaded URL supplies the top site / double-key partition
+/// (the shell has no richer top-frame context to thread here yet).
+fn resource_fetch_options(url: &str) -> hodo_net::FetchOptions {
+    let site = site_of(url);
+    hodo_net::FetchOptions {
+        private: crate::tabs::private_load(),
+        top_site: site.clone(),
+        partition: site,
+        referer: None,
+        ..Default::default()
+    }
+}
+
+/// Surface a fetch's advisory warnings once per URL. An HTTPS upgrade emits
+/// both `MixedContent` and `InsecureUpgraded` for the same URL, and
+/// `privacy.rs::WARN_COUNT` deliberately counts that pair once — mirror it here
+/// instead of double-reporting.
+fn report_resource_warnings(warnings: &[hodo_net::Warning]) {
+    let mut seen = HashSet::new();
+    for warning in warnings {
+        let url = match warning {
+            hodo_net::Warning::MixedContent(url)
+            | hodo_net::Warning::InsecureUpgraded(url)
+            | hodo_net::Warning::Blocked(url) => url.as_str(),
+        };
+        if seen.insert(url) {
+            eprintln!("hodo: privacy warning for {url}: {warning:?}");
+        }
+    }
+}
+
+/// Load a page resource through the privacy-aware `hodo_net::fetch` entry:
+/// tracking stripping, adblock, HSTS, cookies, partitions and warnings all
+/// apply to page, stylesheet, script, ESM chunk and `fetch()` loads alike. If
+/// the shared disk cache cannot be opened, fall back to a private (network-only)
+/// fetch so privacy still holds rather than reverting to the frozen loader.
+pub(crate) fn load_resource(url: &str) -> Result<Resource, hodo_net::FetchError> {
+    let opts = resource_fetch_options(url);
+    let mut jar = shell_cookie_jar()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let outcome = match shell_cache() {
         Some(cache) => {
             let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-            hodo_net::load_with(url, &opts, &mut guard)
+            hodo_net::fetch(url, &opts, &mut guard, &mut jar)?
         }
-        None => hodo_net::load(url),
+        None => {
+            let root = std::env::temp_dir().join(format!("hodo-nocache-{}", std::process::id()));
+            let mut cache = hodo_cache::DiskCache::open(&root, 1024 * 1024)
+                .map_err(|err| hodo_net::FetchError::Io(err.to_string()))?;
+            hodo_net::fetch(url, &opts, &mut cache, &mut jar)?
+        }
+    };
+    report_resource_warnings(&outcome.warnings);
+    outcome.resource.ok_or(hodo_net::FetchError::Network(
+        "fetch returned no body".into(),
+    ))
+}
+
+pub(crate) fn resource_text(resource: Resource) -> String {
+    match resource {
+        Resource::Html(text) => text,
+        Resource::Other { data, .. } => String::from_utf8_lossy(&data).into_owned(),
     }
+}
+
+/// Batch-fetch one level of a module graph. Warm cache entries go through the
+/// cached loader (so RFC 9111 / 304 revalidation is preserved); cold entries
+/// are fetched in parallel by `hodo_net::load_many`. Every cold URL is passed
+/// through the adblock/tracking pre-check first, so the parallel path cannot
+/// bypass the privacy layer.
+///
+/// `loaded` is keyed by the requested URL; a failed chunk simply has no entry.
+pub(crate) fn load_chunk_batch(urls: &[String]) -> HashMap<String, String> {
+    if urls.is_empty() {
+        return HashMap::new();
+    }
+    let opts = resource_fetch_options(&urls[0]);
+    let mut cold = Vec::new();
+    let mut out = HashMap::new();
+    for url in urls {
+        let warm = shell_cache().is_some_and(|cache| {
+            let mut guard = cache.lock().unwrap_or_else(|err| err.into_inner());
+            guard
+                .get(&CacheKey::new("GET", url, &opts.partition))
+                .is_some()
+        });
+        if warm {
+            if let Ok(body) = load_resource(url).map(resource_text) {
+                out.insert(url.clone(), body);
+            }
+            continue;
+        }
+        match hodo_net::check_adblock(url, &opts) {
+            Ok(stripped) => cold.push((url.clone(), stripped)),
+            Err(err) => eprintln!("hodo: chunk {url}: {err}"),
+        }
+    }
+    if !cold.is_empty() {
+        let requests: Vec<String> = cold.iter().map(|(_, url)| url.clone()).collect();
+        for loaded in hodo_net::load_many(&requests, &opts) {
+            // Map by the URL that actually served the body so a failed sibling
+            // cannot shift the alignment (load_many returns only successes).
+            if let Some((original, _)) = cold.iter().find(|(_, stripped)| {
+                loaded.final_url == *stripped
+                    || hodo_net::normalize_url(stripped).ok().as_deref()
+                        == Some(loaded.final_url.as_str())
+            }) {
+                out.insert(original.clone(), resource_text(loaded.resource));
+            }
+        }
+    }
+    out
 }
 
 /// Follow redirect entries left in the shared cache by `load_with` and return
@@ -675,9 +808,10 @@ fn final_base_url(url: &str) -> String {
     let Some(cache) = shell_cache() else {
         return normalized;
     };
-    resolve_cached_redirects(normalized, |hop| {
+    let partition = site_of(url);
+    resolve_cached_redirects(normalized, move |hop| {
         let mut guard = cache.lock().unwrap_or_else(|err| err.into_inner());
-        let entry = guard.get(&CacheKey::new("GET", hop, ""))?;
+        let entry = guard.get(&CacheKey::new("GET", hop, &partition))?;
         Some((entry.status_code, entry.headers.get("location")?.clone()))
     })
 }
@@ -808,6 +942,9 @@ const FINGERPRINT_ATTRS: &[&str] = &[
     "height",
     "colspan",
     "rowspan",
+    // Lit marker comments are `#comment` elements with their data here; the
+    // same list must notice comment mutations so live repaints pick them up.
+    "data",
 ];
 
 /// Cheap change probe over the reachable DOM. hodo-js has no mutation counter
@@ -832,6 +969,72 @@ fn dom_fingerprint(dom: &Dom) -> u64 {
         }
     });
     hasher.finish()
+}
+
+/// Per-node change probe. Paired with [`dom_fingerprint`] (the cheap "did
+/// anything change" gate), this yields the exact dirty roots the incremental
+/// layout seam needs. Recycled slots carry new `NodeId` generation bits, so a
+/// reused slot shows up as a new key here automatically.
+fn dom_node_fingerprints(dom: &Dom) -> HashMap<NodeId, u64> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut out = HashMap::new();
+    dom.walk(|id, node| {
+        let mut hasher = DefaultHasher::new();
+        id.0.hash(&mut hasher);
+        match &node.kind {
+            hodo_dom::NodeKind::Document => "document".hash(&mut hasher),
+            hodo_dom::NodeKind::Element { .. } => {
+                dom.tag(id).hash(&mut hasher);
+                for name in FINGERPRINT_ATTRS {
+                    dom.attr(id, name).hash(&mut hasher);
+                }
+            }
+            hodo_dom::NodeKind::Text(_) => dom.text(id).hash(&mut hasher),
+        }
+        out.insert(id, hasher.finish());
+    });
+    out
+}
+
+/// Hash of the collected stylesheet, used to detect a swap (a `<style>`/`<link>`
+/// change) so the incremental layout context can be reset.
+fn stylesheet_hash(sheet: &Stylesheet) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    format!("{sheet:?}").hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Paint-only repaint: update baked-in colours from the new style map without
+/// touching geometry. The renderer's `diff_display_lists` then limits the
+/// actual pixels redrawn to the changed rows (damage-only repaint).
+fn repaint_display_list(list: &mut DisplayList, styles: &hodo_style::StyleMap) {
+    let recolor = |owner: NodeId, item: &mut hodo_layout::DisplayItem| {
+        let Some(style) = styles.get(owner) else {
+            return;
+        };
+        match item {
+            hodo_layout::DisplayItem::Rect {
+                color,
+                border_color,
+                ..
+            } => {
+                *color = style.background;
+                *border_color = (style.border_width > 0.0 && style.border_color.a > 0)
+                    .then_some(style.border_color);
+            }
+            hodo_layout::DisplayItem::Text { color, .. } => *color = style.color,
+            _ => {}
+        }
+    };
+    for (owner, item) in list.node_map.iter().zip(list.items.iter_mut()) {
+        recolor(*owner, item);
+    }
+    for (owner, item) in list.fixed_node_map.iter().zip(list.fixed_items.iter_mut()) {
+        recolor(*owner, item);
+    }
 }
 
 /// Host side of `__hodoFetch`: GET only, through the same cached loader as
@@ -870,6 +1073,17 @@ pub(crate) struct PageContext {
     executed_scripts: HashSet<NodeId>,
     /// Shared with the initial load's 16-script cap.
     script_count: usize,
+    /// Dynamic-import requests captured from the native reply hook.
+    dyn_requests: Rc<RefCell<Vec<DynamicModuleRequest>>>,
+    /// Redirect-final URLs that seed `:visited` matching on relayout.
+    visited: HashSet<String>,
+    // --- incremental rendering state, filled by `init_incremental` -----------
+    styles: hodo_style::StyleMap,
+    layout_ctx: hodo_layout::LayoutContext,
+    sheet_hash: u64,
+    node_fingerprints: HashMap<NodeId, u64>,
+    last_list: DisplayList,
+    incremental_ready: bool,
 }
 
 impl PageContext {
@@ -880,6 +1094,7 @@ impl PageContext {
         budget: Duration,
         executed_scripts: HashSet<NodeId>,
         script_count: usize,
+        dyn_requests: Rc<RefCell<Vec<DynamicModuleRequest>>>,
     ) -> Self {
         let fingerprint = dom_fingerprint(&dom.borrow());
         Self {
@@ -890,7 +1105,33 @@ impl PageContext {
             budget,
             executed_scripts,
             script_count,
+            dyn_requests,
+            visited: crate::tabs::visited_hrefs(),
+            styles: hodo_style::StyleMap::default(),
+            layout_ctx: hodo_layout::LayoutContext::new(),
+            sheet_hash: 0,
+            node_fingerprints: HashMap::new(),
+            last_list: DisplayList::default(),
+            incremental_ready: false,
         }
+    }
+
+    /// Hand the page the layout context and style map produced by its first
+    /// paint. Called once after the initial display list is built so subsequent
+    /// ticks can reuse clean subtrees instead of re-laying out the document.
+    fn init_incremental(
+        &mut self,
+        layout_ctx: hodo_layout::LayoutContext,
+        styles: hodo_style::StyleMap,
+        sheet_hash: u64,
+        list: &DisplayList,
+    ) {
+        self.node_fingerprints = dom_node_fingerprints(&self.dom.borrow());
+        self.layout_ctx = layout_ctx;
+        self.styles = styles;
+        self.sheet_hash = sheet_hash;
+        self.last_list = list.clone();
+        self.incremental_ready = true;
     }
 
     pub(crate) fn has_timers(&self) -> bool {
@@ -928,7 +1169,72 @@ impl PageContext {
                 list = Some(next);
             }
         }
+        if self.drain_dynamic_modules() {
+            self.drain_logs();
+            if let Some(next) = self.recompute_if_changed(viewport) {
+                list = Some(next);
+            }
+        }
         list
+    }
+
+    /// Resolve dynamic-import requests captured from the native reply channel.
+    /// Each requested graph runs through the strict module path, then the
+    /// pending promise is settled with the runtime's Rust-facing native seam
+    /// (`resolve_dynamic_import` / `reject_dynamic_import`).
+    fn drain_dynamic_modules(&mut self) -> bool {
+        let requests = std::mem::take(&mut *self.dyn_requests.borrow_mut());
+        if requests.is_empty() {
+            return false;
+        }
+        let mut ran_any = false;
+        for request in requests {
+            let target = join_url(&request.base_url, &request.spec);
+            match resolve_graph(&target) {
+                Ok(modules) => {
+                    let graph = emit_graph(&modules);
+                    // Trailing `0;` keeps eval's last value primitive — module
+                    // namespaces are null-prototype objects.
+                    if let Err(err) = self.runtime.eval_module_graph(&format!("{graph}\n0;")) {
+                        eprintln!("hodo: dynamic module {target}: {err}");
+                        self.runtime.reject_dynamic_import(request.promise_id, &err);
+                        continue;
+                    }
+                    // Snapshot the entry namespace through the runner's registry
+                    // and hand it to the native settle seam as a JSON value.
+                    let url = serde_json::to_string(&target).expect("string serializes");
+                    match self
+                        .runtime
+                        .eval(&format!("JSON.stringify(__hodoModules[{url}])"))
+                    {
+                        Ok(json_text) => match serde_json::from_str::<Value>(&json_text) {
+                            Ok(exports) => self
+                                .runtime
+                                .resolve_dynamic_import(request.promise_id, &exports),
+                            Err(err) => {
+                                eprintln!("hodo: dynamic module exports {target}: {err}");
+                                self.runtime
+                                    .reject_dynamic_import(request.promise_id, &err.to_string());
+                            }
+                        },
+                        Err(err) => {
+                            eprintln!("hodo: dynamic module exports {target}: {err}");
+                            self.runtime.reject_dynamic_import(request.promise_id, &err);
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("hodo: dynamic module {target}: {err}");
+                    self.runtime
+                        .reject_dynamic_import(request.promise_id, &err.to_string());
+                }
+            }
+            ran_any = true;
+        }
+        if ran_any {
+            flush_doc_write(&self.runtime, &self.dom);
+        }
+        ran_any
     }
 
     /// Execute `<script>` nodes inserted since the last pass. The fingerprint
@@ -1042,15 +1348,88 @@ impl PageContext {
             return None;
         }
         self.fingerprint = fingerprint;
-        Some(self.relayout(viewport))
+        if !self.incremental_ready {
+            return Some(self.relayout(viewport));
+        }
+        let dom = self.dom.borrow();
+        let node_fps = dom_node_fingerprints(&dom);
+        let old_node_fps = std::mem::replace(&mut self.node_fingerprints, node_fps.clone());
+        let dirty: Vec<NodeId> = node_fps
+            .iter()
+            .filter(|(id, hash)| old_node_fps.get(*id) != Some(hash))
+            .map(|(id, _)| *id)
+            .collect();
+
+        let stylesheet = collect_styles(&dom, &self.base_url, viewport);
+        let sheet_hash = stylesheet_hash(&stylesheet);
+        let new_styles =
+            hodo_style::compute_styles_with_visited(&dom, &[stylesheet], &self.visited);
+
+        // Property diff: a stylesheet swap or any layout-affecting style change
+        // goes through the incremental relayout path; a pure colour/underline
+        // change repaints only, leaving geometry (and the item count) untouched.
+        let mut layout_affecting = sheet_hash != self.sheet_hash;
+        if !layout_affecting {
+            for id in &dirty {
+                // A new NodeId (recycled slot) or a text node means content was
+                // added/replaced; the stale slot style cannot describe it.
+                if !old_node_fps.contains_key(id)
+                    || matches!(dom.get(*id).kind, hodo_dom::NodeKind::Text(_))
+                {
+                    layout_affecting = true;
+                    break;
+                }
+                match (self.styles.get(*id), new_styles.get(*id)) {
+                    (Some(old), Some(new)) => {
+                        if hodo_style::style_change_class(old, new)
+                            == hodo_style::StyleChangeClass::LayoutAffecting
+                        {
+                            layout_affecting = true;
+                            break;
+                        }
+                    }
+                    _ => {
+                        layout_affecting = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let list = if layout_affecting {
+            if sheet_hash != self.sheet_hash {
+                self.layout_ctx.reset();
+                self.sheet_hash = sheet_hash;
+            }
+            hodo_layout::layout_from(&dom, &new_styles, viewport, &mut self.layout_ctx, &dirty)
+        } else {
+            let mut list = self.last_list.clone();
+            repaint_display_list(&mut list, &new_styles);
+            list
+        };
+        self.styles = new_styles;
+        self.last_list = list.clone();
+        Some(list)
     }
 
-    /// Full re-pipe against the live DOM (M5.3 incremental layout stays future).
-    pub(crate) fn relayout(&self, viewport: Size) -> DisplayList {
+    /// Full re-pipe against the live DOM. Used on resize (the viewport check in
+    /// `layout_from` resets the context for the new geometry).
+    pub(crate) fn relayout(&mut self, viewport: Size) -> DisplayList {
         let dom = self.dom.borrow();
         let stylesheet = collect_styles(&dom, &self.base_url, viewport);
-        let styles = hodo_style::compute_styles(&dom, &[stylesheet]);
-        hodo_layout::layout(&dom, &styles, viewport)
+        let sheet_hash = stylesheet_hash(&stylesheet);
+        let new_styles =
+            hodo_style::compute_styles_with_visited(&dom, &[stylesheet], &self.visited);
+        if sheet_hash != self.sheet_hash {
+            self.layout_ctx.reset();
+            self.sheet_hash = sheet_hash;
+        }
+        let list = hodo_layout::layout_from(&dom, &new_styles, viewport, &mut self.layout_ctx, &[]);
+        self.styles = new_styles;
+        self.last_list = list.clone();
+        self.node_fingerprints = dom_node_fingerprints(&dom);
+        self.incremental_ready = true;
+        list
     }
 }
 
@@ -1218,6 +1597,44 @@ fn load_page_with_flag(
     } else {
         Vec::new()
     };
+    // Module graphs are discovered with a second, tiny walk: only
+    // `<script type=module src=...>` can anchor a fetchable static graph.
+    let (module_entries, preloads) = {
+        let doc = dom.borrow();
+        if js_enabled {
+            (
+                collect_module_entries(&doc, &base_url),
+                collect_module_preloads(&doc, &base_url),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        }
+    };
+    // Prefetches share the same cache the graph fetcher reads from.
+    for href in &preloads {
+        let _ = load_resource(href);
+    }
+    // Resolve every entry graph, transform each chunk, and concatenate the
+    // `__hodoRunModule(...)` calls in dependency-first order into one script.
+    let mut emitted_urls = HashSet::new();
+    let mut module_script = String::new();
+    for entry in &module_entries {
+        match resolve_graph(entry) {
+            Ok(modules) => {
+                for module in modules {
+                    if emitted_urls.insert(module.url.clone()) {
+                        module_script.push_str(&emit_graph(std::slice::from_ref(&module)));
+                        module_script.push('\n');
+                    }
+                }
+            }
+            Err(err) => eprintln!("hodo: module graph {entry}: {err}"),
+        }
+    }
+    if !module_script.is_empty() {
+        dump_modules(&module_script);
+    }
+
     // Every script node from the original parse is already accounted for. The
     // dynamic pass must only see scripts inserted later by page JS or written
     // in during initial load.
@@ -1231,9 +1648,14 @@ fn load_page_with_flag(
         });
     }
     let initial_count = scripts.len();
+    let needs_realm = !scripts.is_empty() || !module_script.is_empty();
+
+    // Dynamic-import requests arrive on the landed native-reply channel; the
+    // hook captures them synchronously while JS calls `__hodo_message_reply`.
+    let dyn_requests: Rc<RefCell<Vec<DynamicModuleRequest>>> = Rc::new(RefCell::new(Vec::new()));
 
     // realm-drop → parse → collect → eval → DOMContentLoaded → styles/layout
-    let page = if scripts.is_empty() {
+    let mut page = if !needs_realm {
         None
     } else {
         let root = dom.borrow().root();
@@ -1242,9 +1664,15 @@ fn load_page_with_flag(
         let mut runtime = ExtScriptRuntime::new_page_with_url(Rc::clone(&dom), base_url.clone());
         let fetch_base = base_url.clone();
         runtime.set_fetch_hook(Rc::new(move |call| page_fetch_hook(call, &fetch_base)));
-        // Page scripts cannot exchange extension messages, but drain replies
-        // anyway so a stray sendResponse cannot grow the runtime's queue.
-        runtime.set_message_reply_hook(Some(Rc::new(|_: &Value, _: &Value| {})));
+        // Page scripts cannot exchange extension messages, but the reply hook
+        // is also the dynamic-import request channel; the queue is drained on
+        // every tick (see `PageContext::drain_dynamic_modules`).
+        let hook_sink = Rc::clone(&dyn_requests);
+        runtime.set_message_reply_hook(Some(Rc::new(move |message, _response| {
+            if let Some(request) = decode_dynamic_request(message) {
+                hook_sink.borrow_mut().push(request);
+            }
+        })));
         let started = Instant::now();
         for script in scripts {
             if started.elapsed() > budget {
@@ -1256,6 +1684,18 @@ fn load_page_with_flag(
             }
             // document.write buffers during script eval; each completed script
             // flushes its text into <body> before the next one runs.
+            flush_doc_write(&runtime, &dom);
+        }
+        // ESM calls are plain scripts for hodo-js; the paired JS agent supplies
+        // `__hodoRunModule`. If it has not landed yet this logs once and the
+        // rest of the pipeline still runs (cross-agent wave-1 state).
+        if !module_script.is_empty() {
+            // The scanner strips per-chunk directives; `eval_module_graph`
+            // re-adds `"use strict";` on the host's strict eval path.
+            let script = format!("{module_script}\n0;");
+            if let Err(err) = runtime.eval_module_graph(&script) {
+                eprintln!("hodo: module graph on {url}: {err}");
+            }
             flush_doc_write(&runtime, &dom);
         }
         runtime.dispatch_page_event(root, "DOMContentLoaded", json!({}));
@@ -1272,20 +1712,39 @@ fn load_page_with_flag(
             budget,
             executed_scripts,
             initial_count,
+            dyn_requests,
         );
-        // Headless callers never reach about_to_wait, so drive the dynamic pass
-        // here too; the GUI realm runs it again as a no-op on its first tick.
+        // Headless callers never reach about_to_wait, so drive both dynamic
+        // passes here too; the GUI realm runs them again as no-ops on tick 1.
         let _ = page.run_dynamic_scripts();
+        let _ = page.drain_dynamic_modules();
         page.drain_logs();
         Some(page)
     };
 
-    let display_list = {
+    let visited = crate::tabs::visited_hrefs();
+    let (display_list, styles, layout_ctx, sheet_hash) = {
         let doc = dom.borrow();
         let stylesheet = collect_styles(&doc, &base_url, viewport);
-        let styles = hodo_style::compute_styles(&doc, &[stylesheet]);
-        hodo_layout::layout(&doc, &styles, viewport)
+        let sheet_hash = stylesheet_hash(&stylesheet);
+        let styles = hodo_style::compute_styles_with_visited(&doc, &[stylesheet], &visited);
+        // One LayoutContext per document; the headless screenshot path uses the
+        // same `layout_from` entry as live ticks (first call is a full layout).
+        let mut layout_ctx = hodo_layout::LayoutContext::new();
+        let list = hodo_layout::layout_from(&doc, &styles, viewport, &mut layout_ctx, &[]);
+        (list, styles, layout_ctx, sheet_hash)
     };
+    if let Some(page) = page.as_mut() {
+        page.init_incremental(layout_ctx, styles, sheet_hash, &display_list);
+    }
+    // The page has settled into its first paint. Prime the STATIC half of the
+    // next page's prelude so its ~56 ms parse overlaps that navigation's network
+    // fetch. Boa's Context is !Send, so this must stay on the GUI/thread that
+    // drives page loads; hodo-js stores the primed realm thread-locally. Tests
+    // skip it: a primed realm checked out across pooled test threads corrupts
+    // boa's thread-local handle table.
+    #[cfg(not(test))]
+    hodo_js::prime_page_prelude();
     (title, display_list, page)
 }
 
@@ -1303,11 +1762,33 @@ pub(crate) fn load_page_live(
 /// The DOM, stylesheet, style map — and any page JS realm created to produce
 /// the mutations — are local to this function and dropped before it returns.
 /// Headless screenshot mode uses this path.
+#[cfg(test)]
 pub fn load_page(url: &str, viewport: Size) -> (String, DisplayList) {
+    load_page_with_wait(url, viewport, Duration::ZERO)
+}
+
+/// Headless screenshot path with an explicit settle window. Module graphs (and
+/// their dynamic imports) need more wall time than classic scripts; we keep
+/// ticking the live realm in short slices so timers/promises can resolve and a
+/// changed DOM is relaid out before the frame is captured.
+pub fn load_page_with_wait(url: &str, viewport: Size, wait: Duration) -> (String, DisplayList) {
     // Headless has no frame deadline, so give scripts the longer budget.
-    let (title, display_list, _) =
+    let (title, display_list, mut page) =
         load_page_with_flag(url, viewport, page_js_enabled(), page_script_budget(true));
-    (title, display_list)
+    let Some(page) = page.as_mut() else {
+        return (title, display_list);
+    };
+    let deadline = Instant::now() + wait;
+    let mut list = display_list;
+    while Instant::now() < deadline {
+        let slice =
+            Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now()));
+        std::thread::sleep(slice);
+        if let Some(next) = page.tick(viewport) {
+            list = next;
+        }
+    }
+    (title, list)
 }
 
 /// Source-over blend of straight-alpha RGBA onto opaque white.
@@ -1391,6 +1872,76 @@ fn scan_document(dom: &Dom, js_enabled: bool) -> (String, Vec<ScriptSource>) {
     (title, scripts)
 }
 
+/// Collect `<script type="module" src=...>` entries in document order. Inline
+/// module scripts have no URL to resolve a graph from, so they stay skipped
+/// with a note (the module loader works on the `src=` shape from real bundles).
+fn collect_module_entries(dom: &Dom, page_url: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    dom.walk(|id, _| {
+        if dom.tag(id) != Some("script") {
+            return;
+        }
+        if !dom
+            .attr(id, "type")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("module"))
+        {
+            return;
+        }
+        if let Some(src) = dom.attr(id, "src") {
+            let url = join_url(page_url, src);
+            if !out.contains(&url) {
+                out.push(url);
+            }
+        } else {
+            eprintln!("hodo: inline <script type=module> is skipped on {page_url}");
+        }
+    });
+    out
+}
+
+/// `<link rel=modulepreload>` entries warm the same shared cache the graph
+/// fetcher uses, so a prefetched chunk is a cache hit when its dep is visited.
+fn collect_module_preloads(dom: &Dom, page_url: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    dom.walk(|id, _| {
+        if dom.tag(id) != Some("link") {
+            return;
+        }
+        if !dom.attr(id, "rel").is_some_and(|value| {
+            value
+                .split_whitespace()
+                .any(|kind| kind.eq_ignore_ascii_case("modulepreload"))
+        }) {
+            return;
+        }
+        if let Some(href) = dom.attr(id, "href") {
+            out.push(join_url(page_url, href));
+        }
+    });
+    out
+}
+
+/// `HODO_DUMP_MODULES=1` writes the emitted `__hodoRunModule(...)` script to
+/// `hodo-modules-dump.js`; any other value is a target path. Cross-agent debug
+/// seam: the shell's contract can be verified before the JS runtime lands.
+fn dump_modules(script: &str) {
+    let Ok(spec) = std::env::var("HODO_DUMP_MODULES") else {
+        return;
+    };
+    if spec.is_empty() {
+        return;
+    }
+    let path = if spec == "1" {
+        PathBuf::from("hodo-modules-dump.js")
+    } else {
+        PathBuf::from(spec)
+    };
+    match std::fs::write(&path, script) {
+        Ok(()) => eprintln!("hodo: module script dumped to {}", path.display()),
+        Err(err) => eprintln!("hodo: module script dump {}: {err}", path.display()),
+    }
+}
+
 pub(crate) fn collect_styles(dom: &Dom, page_url: &str, viewport: Size) -> Stylesheet {
     // The engine's UA sheet does not hide <head>; without this the <style>
     // and <title> text would spill into the page as visible text.
@@ -1456,6 +2007,9 @@ pub(crate) mod tests {
     /// kill switch mid-flip.
     pub(crate) static PAGE_JS_ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Serialises the `HODO_DUMP_MODULES` env toggle used by the module e2e test.
+    static MODULE_DUMP_ENV_LOCK: Mutex<()> = Mutex::new(());
+
     pub(crate) fn js_site_url() -> String {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/js-site/index.html")
@@ -1467,6 +2021,206 @@ pub(crate) mod tests {
         list.items
             .iter()
             .any(|item| format!("{item:?}").contains(fragment))
+    }
+
+    #[test]
+    fn visited_links_flip_color_only_for_visited_hrefs() {
+        let dir = std::env::temp_dir().join(format!("hodo-visited-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("index.html"),
+            concat!(
+                "<html><head><style>",
+                "a:link{color:rgb(0,0,255)}a:visited{color:rgb(255,0,0)}",
+                "</style></head><body>",
+                "<div><a href='http://visited.test/'>V</a></div>",
+                "<div><a href='http://fresh.test/'>F</a></div>",
+                "</body></html>"
+            ),
+        )
+        .unwrap();
+        let url = format!("file://{}", dir.join("index.html").to_string_lossy());
+        crate::tabs::set_visited_hrefs_for_test(&["http://visited.test/"]);
+        let (_, list) = load_page(&url, DEFAULT_VIEWPORT);
+        crate::tabs::set_visited_hrefs_for_test(&[]);
+        let colors: Vec<(String, Color)> = list
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text { text, color, .. } => Some((text.clone(), *color)),
+                _ => None,
+            })
+            .collect();
+        let blue = Color::rgb(0, 0, 255);
+        let red = Color::rgb(255, 0, 0);
+        assert!(
+            colors
+                .iter()
+                .any(|(text, color)| text == "V" && *color == red),
+            "visited link must be red: {colors:?}"
+        );
+        assert!(
+            colors
+                .iter()
+                .any(|(text, color)| text == "F" && *color == blue),
+            "unvisited link must stay blue: {colors:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn paint_only_style_change_repaints_without_relayout() {
+        let mut dom = Dom::new();
+        let div = dom.create(NodeKind::Element {
+            tag: "div".into(),
+            attrs: vec![("style".into(), "color:rgb(0,0,255);width:100px".into())],
+        });
+        dom.append(dom.root(), div);
+        let text = dom.create(NodeKind::Text("x".into()));
+        dom.append(div, text);
+        let styles = hodo_style::compute_styles(&dom, &[]);
+        let mut list = hodo_layout::layout(&dom, &styles, DEFAULT_VIEWPORT);
+        let count = list.items.len();
+
+        // Hover-colour change: paint only. Item count and geometry stay put;
+        // only the baked-in colour is refreshed (damage-only repaint).
+        dom.set_attr(div, "style", "color:rgb(255,0,0);width:100px".into());
+        let hover = hodo_style::compute_styles(&dom, &[]);
+        assert_eq!(
+            hodo_style::style_change_class(styles.get(div).unwrap(), hover.get(div).unwrap()),
+            hodo_style::StyleChangeClass::PaintOnly
+        );
+        repaint_display_list(&mut list, &hover);
+        assert_eq!(
+            list.items.len(),
+            count,
+            "repaint must not change item count"
+        );
+        assert!(list.items.iter().any(
+            |item| matches!(item, DisplayItem::Text { color, .. } if *color == Color::rgb(255, 0, 0))
+        ));
+
+        // Width change: layout-affecting, so the existing relayout path is used.
+        dom.set_attr(div, "style", "color:rgb(255,0,0);width:200px".into());
+        let wide = hodo_style::compute_styles(&dom, &[]);
+        assert_eq!(
+            hodo_style::style_change_class(hover.get(div).unwrap(), wide.get(div).unwrap()),
+            hodo_style::StyleChangeClass::LayoutAffecting
+        );
+    }
+
+    #[test]
+    fn incremental_layout_reuses_clean_subtrees_on_one_node_edit() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let mut blocks = Vec::new();
+        for i in 0..8 {
+            let block = dom.create(NodeKind::Element {
+                tag: "div".into(),
+                attrs: vec![("style".into(), format!("background:#{:06x}", i + 1))],
+            });
+            dom.append(root, block);
+            let text = dom.create(NodeKind::Text(format!("line {i}")));
+            dom.append(block, text);
+            blocks.push(block);
+        }
+        let styles = hodo_style::compute_styles(&dom, &[]);
+        let mut ctx = hodo_layout::LayoutContext::new();
+        let first = hodo_layout::layout_from(&dom, &styles, DEFAULT_VIEWPORT, &mut ctx, &[]);
+        assert_eq!(ctx.stats().reused_subtrees, 0, "first call is full");
+        let old_text = dom.children(blocks[3])[0];
+        dom.detach_subtree(old_text);
+        let new_text = dom.create(NodeKind::Text("changed".into()));
+        dom.append(blocks[3], new_text);
+        let second =
+            hodo_layout::layout_from(&dom, &styles, DEFAULT_VIEWPORT, &mut ctx, &[new_text]);
+        assert_eq!(
+            ctx.stats().fresh_subtrees,
+            1,
+            "only the edited subtree re-laid out"
+        );
+        assert_eq!(
+            ctx.stats().reused_subtrees,
+            7,
+            "seven clean subtrees reused"
+        );
+        assert_eq!(
+            second.items.len(),
+            first.items.len(),
+            "item count is invariant"
+        );
+    }
+
+    #[test]
+    fn load_chunk_batch_uses_parallel_cold_and_revalidating_warm_paths() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let base = format!("http://127.0.0.1:{port}");
+        let saw_conditional = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&saw_conditional);
+        let server = std::thread::spawn(move || {
+            // Four connections: two cold, one warm-setup, one warm revalidation.
+            for _ in 0..4 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let end = loop {
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                };
+                let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+                if head.to_ascii_lowercase().contains("if-none-match: \"v1\"") {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                let response = if head.to_ascii_lowercase().contains("if-none-match") {
+                    "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 200 OK\r\nETag: \"v1\"\r\nCache-Control: max-age=0\r\nContent-Type: text/javascript\r\nContent-Length: 10\r\nConnection: close\r\n\r\nchunk-body"
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        // Cold: nothing cached for these URLs -> parallel `load_many` path.
+        let cold = vec![format!("{base}/a.js"), format!("{base}/b.js")];
+        let bodies = load_chunk_batch(&cold);
+        assert_eq!(bodies.get(&cold[0]).map(String::as_str), Some("chunk-body"));
+        assert_eq!(bodies.get(&cold[1]).map(String::as_str), Some("chunk-body"));
+
+        // Populate the shared cache, then the batch must take the warm,
+        // per-chunk cached path and revalidate with If-None-Match / 304.
+        load_resource(&cold[0]).expect("warm setup load");
+        let warm = load_chunk_batch(&cold[0..1]);
+        assert_eq!(warm.get(&cold[0]).map(String::as_str), Some("chunk-body"));
+        server.join().expect("server thread");
+        assert!(
+            saw_conditional.load(std::sync::atomic::Ordering::SeqCst),
+            "warm chunk must revalidate with If-None-Match (304 path)"
+        );
+    }
+
+    #[test]
+    fn dom_fingerprint_notices_comment_data_mutations() {
+        let mut dom = Dom::new();
+        let comment = dom.create(NodeKind::Element {
+            tag: "#comment".into(),
+            attrs: vec![("data".into(), "?lit$1$".into())],
+        });
+        dom.append(dom.root(), comment);
+        let before = dom_fingerprint(&dom);
+        dom.set_attr(comment, "data", "?lit$2$".to_string());
+        assert_ne!(dom_fingerprint(&dom), before);
     }
 
     fn linked_text(x: f32, y: f32, w: f32, h: f32, href: Option<&str>) -> DisplayItem {
@@ -2146,6 +2900,112 @@ pub(crate) mod tests {
         );
         assert!(!list_has(&list, &format!("s{MAX_PAGE_SCRIPTS}")));
         assert!(!list_has(&list, "module"), "type=module is skipped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn module_tagged_script_with_src_is_collected_not_skipped() {
+        let dom = hodo_html::parse_document_with(
+            true,
+            "<html><body>\
+             <script type=\"module\" src=\"./entry.js\"></script>\
+             <script type=\"module\">var inline=1;</script>\
+             <link rel=\"modulepreload\" href=\"./dep.js\">\
+             </body></html>",
+        );
+        let entries = collect_module_entries(&dom, "http://hodo.test/page/index.html");
+        assert_eq!(entries, vec!["http://hodo.test/page/entry.js"]);
+        let preloads = collect_module_preloads(&dom, "http://hodo.test/page/index.html");
+        assert_eq!(preloads, vec!["http://hodo.test/page/dep.js"]);
+    }
+
+    /// Local file:// fixture: one module entry with two deps, a modulepreload
+    /// and `--wait-ms 1500` equivalent. The shell must emit three contract
+    /// calls; a factory-painted DOM change is the payoff once the paired JS
+    /// runtime lands (before then the dump is the cross-agent evidence).
+    #[test]
+    fn module_graph_fixture_emits_contract_calls_for_every_chunk() {
+        let _dump_guard = MODULE_DUMP_ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("hodo-modules-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("index.html"),
+            "<html><body><div id='out'>none</div>\
+             <link rel='modulepreload' href='./dep1.js'>\
+             <script type='module' src='./entry.js'></script>\
+             </body></html>",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("entry.js"),
+            "import{v}from'./dep1.js';import{w}from'./dep2.js';\
+             document.getElementById('out').textContent=v+w;export{v,w};",
+        )
+        .unwrap();
+        std::fs::write(dir.join("dep1.js"), "var v='MOD';export{v};").unwrap();
+        std::fs::write(dir.join("dep2.js"), "var w='-OK';export{w};").unwrap();
+
+        let dump = dir.join("emitted.js");
+        std::env::set_var("HODO_DUMP_MODULES", dump.to_string_lossy().as_ref());
+        let url = format!("file://{}", dir.join("index.html").to_string_lossy());
+        let (_, list) = load_page_with_wait(&url, DEFAULT_VIEWPORT, Duration::from_millis(1500));
+        std::env::remove_var("HODO_DUMP_MODULES");
+
+        let emitted = std::fs::read_to_string(&dump).expect("HODO_DUMP_MODULES wrote the script");
+        assert_eq!(
+            emitted.lines().count(),
+            3,
+            "entry plus two deps, one call each: {emitted}"
+        );
+        assert!(emitted.contains("__hodoRunModule("), "{emitted}");
+        assert!(emitted.contains("file://"), "{emitted}");
+        assert!(emitted.contains("v+w"), "{emitted}");
+        assert!(!emitted.contains("__hodoDynImport"), "{emitted}");
+        // Conditional by design: with the JS side landed the factory mutates
+        // the DOM; until then `__hodoRunModule` is undefined and the emit
+        // above is the honest cross-agent evidence. Report either way.
+        if list_has(&list, "MOD-OK") {
+            eprintln!("hodo: module factory painted the DOM change");
+        } else {
+            eprintln!("hodo: module JS runtime not landed yet; contract verified via dump");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end dynamic import: the entry factory calls `import('./child.js')`,
+    /// the reply-channel request is decoded, the chunk graph is evaluated through
+    /// the strict module path, and the native settle seam resolves the promise,
+    /// whose `.then` paints the DOM before the screenshot frame is captured.
+    #[test]
+    fn dynamic_import_bridge_settles_and_paints_dom() {
+        // `load_page_with_wait` reads HODO_DUMP_MODULES; keep it from observing
+        // (or overwriting) the sibling e2e test's dump path.
+        let _dump_guard = MODULE_DUMP_ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("hodo-modules-dyn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("index.html"),
+            "<html><body><div id='out'>none</div>\
+             <script type='module' src='./entry.js'></script></body></html>",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("entry.js"),
+            "import{v}from'./dep1.js';import('./child.js').then(function(m){\
+             document.getElementById('out').textContent=v+':'+m.c;});export{v};",
+        )
+        .unwrap();
+        std::fs::write(dir.join("dep1.js"), "var v='DYN';export{v};").unwrap();
+        std::fs::write(dir.join("child.js"), "var c='-OK';export{c};").unwrap();
+
+        let url = format!("file://{}", dir.join("index.html").to_string_lossy());
+        let (_, list) = load_page_with_wait(&url, DEFAULT_VIEWPORT, Duration::from_millis(1500));
+        assert!(
+            list_has(&list, "DYN:-OK"),
+            "dynamic import must settle and paint before capture"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

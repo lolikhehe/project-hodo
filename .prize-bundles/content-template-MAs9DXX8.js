@@ -1,0 +1,1 @@
+var e=function(e){return e.brewster=`brewster`,e.wayback=`wayback`,e.openlibrary=`openlibrary`,e}({});export{e as t};

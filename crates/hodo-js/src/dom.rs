@@ -9,11 +9,12 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use boa_engine::error::JsNativeError;
 use boa_engine::native_function::NativeFunction;
 use boa_engine::property::PropertyKey;
 use boa_engine::{JsArgs, JsString, JsValue};
 use hodo_css::{matches_selector, Selector};
-use hodo_dom::{Dom, NodeId, NodeKind};
+use hodo_dom::{Dom, NodeId, NodeKind, SHADOW_ROOT_TAG};
 use serde_json::json;
 
 use super::{error_message, js_error, register, string_arg, with_state, RuntimeState};
@@ -130,6 +131,15 @@ fn handle_arg(args: &[JsValue], index: usize) -> Result<u32, String> {
     Ok(number as u32)
 }
 
+/// `insertBefore`'s ref node is nullable: null/undefined means "append".
+fn nullable_handle_arg(args: &[JsValue], index: usize) -> Result<Option<u32>, String> {
+    let value = args.get_or_undefined(index);
+    if value.is_null() || value.is_undefined() {
+        return Ok(None);
+    }
+    handle_arg(args, index).map(Some)
+}
+
 fn preorder(dom: &Dom, start: NodeId, mut visit: impl FnMut(NodeId)) {
     let mut stack = vec![start];
     while let Some(id) = stack.pop() {
@@ -185,17 +195,30 @@ fn query_selectors(selector: &str) -> Vec<Selector> {
         .collect()
 }
 
-fn query(dom: &Dom, selector: &str) -> Vec<NodeId> {
+/// Query from `start`, not always the document root: shadow roots and detached
+/// DOMParser documents are subtrees of the same arena and must not leak into
+/// each other's `querySelector` results. A document query hides `#shadow-root`
+/// subtrees (light-DOM view); a query rooted *at* a shadow root sees them.
+fn query(dom: &Dom, start: NodeId, selector: &str) -> Vec<NodeId> {
     let selectors = query_selectors(selector);
     if selectors.is_empty() {
         return Vec::new();
     }
+    let include_shadow = dom.tag(start) == Some(SHADOW_ROOT_TAG);
     let mut found = Vec::new();
-    preorder(dom, dom.root(), |id| {
-        if selectors.iter().any(|sel| matches_selector(sel, dom, id)) {
+    let mut stack = vec![start];
+    while let Some(id) = stack.pop() {
+        if dom.tag(id) == Some(SHADOW_ROOT_TAG) && !include_shadow {
+            continue;
+        }
+        // querySelector* searches descendants, never the node itself.
+        if id != start && selectors.iter().any(|sel| matches_selector(sel, dom, id)) {
             found.push(id);
         }
-    });
+        for &child in dom.children(id).iter().rev() {
+            stack.push(child);
+        }
+    }
     found
 }
 
@@ -291,12 +314,12 @@ fn op_dom_get_element_by_id(id: u64) -> NativeFunction {
 fn op_dom_query(id: u64, all: bool) -> NativeFunction {
     NativeFunction::from_copy_closure(move |_this, args, ctx| {
         let state = with_state(id, Rc::clone).map_err(js_error)?;
-        let (dom, _) =
+        let (dom, node) =
             resolve_for(&state, handle_arg(args, 0).map_err(js_error)?).map_err(js_error)?;
         let selector = string_arg(args, 1, ctx).map_err(js_error)?;
         let found = {
             let dom = dom.borrow();
-            query(&dom, &selector)
+            query(&dom, node, &selector)
         };
         let mut handles = Vec::new();
         for node in found {
@@ -347,6 +370,118 @@ fn op_dom_create_fragment(id: u64) -> NativeFunction {
     })
 }
 
+/// Page-only: replace a node's children with parsed HTML. Reuses hodo-html's
+/// fragment path (no html/body wrapping, template side-map, depth cap). Old
+/// children are trashed, so their JS handles go stale — the browser replaces
+/// them too. `Element.innerHTML` and `template.innerHTML` (which passes the
+/// content fragment handle here) both land on this one native.
+fn op_dom_set_inner_html(id: u64) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |_this, args, ctx| {
+        let state = with_state(id, Rc::clone).map_err(js_error)?;
+        let (dom, node) =
+            resolve_for(&state, handle_arg(args, 0).map_err(js_error)?).map_err(js_error)?;
+        let html = string_arg(args, 1, ctx).map_err(js_error)?;
+        let mut dom = dom.borrow_mut();
+        for child in dom.children(node).to_vec() {
+            dom.detach_subtree(child);
+        }
+        hodo_html::parse_fragment(&mut dom, node, &html)
+            .map_err(|err| js_error(err.to_string()))?;
+        Ok(JsValue::undefined())
+    })
+}
+
+/// Page-only: parse an HTML string into an *unparented* `#document` node in the
+/// page arena. Nothing parsed here is reachable from the live root, so it never
+/// paints; the handle backs DOMParser / createHTMLDocument wrappers.
+/// shortcut: literal `<html>`/`<body>` tags may be dropped by html5ever's
+/// in-body fragment mode; the wrappers fall back to the parsed root/body tag.
+fn op_dom_parse_detached(id: u64) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |_this, args, ctx| {
+        let state = with_state(id, Rc::clone).map_err(js_error)?;
+        let page = page_of(&state).map_err(js_error)?;
+        let html = string_arg(args, 0, ctx).map_err(js_error)?;
+        let root = {
+            let mut dom = page.dom.borrow_mut();
+            let root = dom.create(NodeKind::Element {
+                tag: "#document".to_string(),
+                attrs: Vec::new(),
+            });
+            if root == dom.root() {
+                return Err(js_error("DOMParser: DOM node limit reached".to_string()));
+            }
+            root
+        };
+        {
+            let mut dom = page.dom.borrow_mut();
+            hodo_html::parse_fragment(&mut dom, root, &html)
+                .map_err(|err| js_error(err.to_string()))?;
+        }
+        let handle = alloc_handle(&state, root).map_err(js_error)?;
+        Ok(JsValue::from(handle as f64))
+    })
+}
+
+/// Page-only: a real `Text` node, unparented until `appendChild`/`insertBefore`
+/// attaches it (fragments included). Modeled on `op_dom_create_element`.
+fn op_dom_create_text_node(id: u64) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |_this, args, ctx| {
+        let state = with_state(id, Rc::clone).map_err(js_error)?;
+        let data = string_arg(args, 0, ctx).map_err(js_error)?;
+        let page = page_of(&state).map_err(js_error)?;
+        let node = page.dom.borrow_mut().create(NodeKind::Text(data));
+        if node == page.dom.borrow().root() {
+            return Err(js_error(
+                "createTextNode: DOM node limit reached".to_string(),
+            ));
+        }
+        let handle = alloc_handle(&state, node).map_err(js_error)?;
+        Ok(JsValue::from(handle as f64))
+    })
+}
+
+/// Page-only: comments are `#comment` elements with their data in a `data`
+/// attribute. They have no text children, so layout/render emit nothing.
+fn op_dom_create_comment(id: u64) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |_this, args, ctx| {
+        let state = with_state(id, Rc::clone).map_err(js_error)?;
+        let data = string_arg(args, 0, ctx).map_err(js_error)?;
+        let page = page_of(&state).map_err(js_error)?;
+        let node = page.dom.borrow_mut().create(NodeKind::Element {
+            tag: "#comment".to_string(),
+            attrs: vec![("data".to_string(), data)],
+        });
+        if node == page.dom.borrow().root() {
+            return Err(js_error(
+                "createComment: DOM node limit reached".to_string(),
+            ));
+        }
+        let handle = alloc_handle(&state, node).map_err(js_error)?;
+        Ok(JsValue::from(handle as f64))
+    })
+}
+
+/// Page-only node kind for wrapper fidelity: 1 element, 3 text, 8 comment,
+/// 9 document, 11 fragment. `hodo-dom` has no comment kind, so `#comment` is
+/// the marker; text is the only kind with `Dom::text` data.
+fn op_dom_node_type(id: u64) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |_this, args, _ctx| {
+        let state = with_state(id, Rc::clone).map_err(js_error)?;
+        let (dom, node) =
+            resolve_for(&state, handle_arg(args, 0).map_err(js_error)?).map_err(js_error)?;
+        let dom = dom.borrow();
+        let kind = match dom.tag(node) {
+            Some("#document") => 9,
+            Some("#document-fragment") | Some(SHADOW_ROOT_TAG) => 11,
+            Some("#comment") => 8,
+            Some(_) => 1,
+            None if dom.text(node).is_some() => 3,
+            None => 9,
+        };
+        Ok(JsValue::from(kind as f64))
+    })
+}
+
 fn op_dom_append_child(id: u64) -> NativeFunction {
     NativeFunction::from_copy_closure(move |_this, args, _ctx| {
         let state = with_state(id, Rc::clone).map_err(js_error)?;
@@ -383,6 +518,54 @@ fn op_dom_remove_child(id: u64) -> NativeFunction {
     })
 }
 
+/// Page-only `insertBefore`. `Dom::append` moves (never trashes) a node and
+/// always appends, so the tail is rotated after the insert to keep order and
+/// stable handles for every sibling. A null ref means append.
+fn op_dom_insert_before(id: u64) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |_this, args, _ctx| {
+        let state = with_state(id, Rc::clone).map_err(js_error)?;
+        let parent_handle = handle_arg(args, 0).map_err(js_error)?;
+        let new_handle = handle_arg(args, 1).map_err(js_error)?;
+        let ref_handle = nullable_handle_arg(args, 2).map_err(js_error)?;
+        let (dom, parent) = resolve_for(&state, parent_handle).map_err(js_error)?;
+        let (_, new_node) = resolve_for(&state, new_handle).map_err(js_error)?;
+        let ref_node = match ref_handle {
+            Some(handle) => {
+                let (_, node) = resolve_for(&state, handle).map_err(js_error)?;
+                if !dom.borrow().children(parent).contains(&node) {
+                    return Err(JsNativeError::typ()
+                        .with_message("insertBefore: reference node is not a child")
+                        .into());
+                }
+                Some(node)
+            }
+            None => None,
+        };
+        let mut dom = dom.borrow_mut();
+        // Fragment children are moved, the fragment itself stays empty/reusable.
+        let moved: Vec<NodeId> = if dom.tag(new_node) == Some("#document-fragment") {
+            dom.children(new_node).to_vec()
+        } else {
+            vec![new_node]
+        };
+        let trailing: Vec<NodeId> = ref_node.map_or_else(Vec::new, |reference| {
+            let children = dom.children(parent);
+            let index = children
+                .iter()
+                .position(|&child| child == reference)
+                .unwrap_or(children.len());
+            children[index..].to_vec()
+        });
+        for node in moved {
+            dom.append(parent, node);
+        }
+        for node in trailing {
+            dom.append(parent, node);
+        }
+        Ok(JsValue::undefined())
+    })
+}
+
 fn op_dom_text(id: u64) -> NativeFunction {
     NativeFunction::from_copy_closure(move |_this, args, _ctx| {
         let state = with_state(id, Rc::clone).map_err(js_error)?;
@@ -390,7 +573,11 @@ fn op_dom_text(id: u64) -> NativeFunction {
             resolve_for(&state, handle_arg(args, 0).map_err(js_error)?).map_err(js_error)?;
         let text = {
             let dom = dom.borrow();
-            collect_text(&dom, node)
+            if dom.tag(node) == Some("#comment") {
+                dom.attr(node, "data").unwrap_or("").to_string()
+            } else {
+                collect_text(&dom, node)
+            }
         };
         Ok(JsValue::from(JsString::from(text)))
     })
@@ -402,6 +589,49 @@ fn op_dom_set_text(id: u64) -> NativeFunction {
         let handle = handle_arg(args, 0).map_err(js_error)?;
         let text = string_arg(args, 1, ctx).map_err(js_error)?;
         let (dom, node) = resolve_for(&state, handle).map_err(js_error)?;
+        if dom.borrow().tag(node) == Some("#comment") {
+            dom.borrow_mut().set_attr(node, "data", text);
+            return Ok(JsValue::undefined());
+        }
+        if dom.borrow().text(node).is_some() {
+            // `Dom` has no in-place text setter. Replace the arena node but keep
+            // the JS handle (and wrapper identity) pointed at the new slot.
+            let (parent, index) = {
+                let dom = dom.borrow();
+                let parent = dom.parent(node);
+                let index = parent.and_then(|p| dom.children(p).iter().position(|&c| c == node));
+                (parent, index)
+            };
+            let dom_rc = Rc::clone(&dom);
+            let mut dom = dom.borrow_mut();
+            let new_node = dom.create(NodeKind::Text(text));
+            if new_node == dom.root() {
+                return Err(js_error("set text: DOM node limit reached".to_string()));
+            }
+            let trailing: Vec<NodeId> = parent
+                .zip(index)
+                .map(|(p, i)| dom.children(p)[i + 1..].to_vec())
+                .unwrap_or_default();
+            if let Some(parent) = parent {
+                dom.append(parent, new_node);
+                dom.detach_subtree(node);
+                for child in trailing {
+                    dom.append(parent, child);
+                }
+            }
+            drop(dom);
+            DOM_HANDLES.with(|table| {
+                if let Some(entry) = table.borrow_mut().get_mut(&handle) {
+                    *entry = (Rc::clone(&dom_rc), new_node);
+                }
+            });
+            if let Some(page) = state.page.as_ref() {
+                let mut keys = page.keys.borrow_mut();
+                keys.remove(&node);
+                keys.insert(new_node, handle);
+            }
+            return Ok(JsValue::undefined());
+        }
         let mut dom = dom.borrow_mut();
         if dom.tag(node).is_none() {
             return Err(js_error(
@@ -444,7 +674,9 @@ fn op_dom_children(id: u64) -> NativeFunction {
         {
             let dom = dom.borrow();
             for &child in dom.children(node) {
-                if dom.tag(child).is_some() {
+                // Light-DOM view: the shadow root is a real arena child (so
+                // walk/upgrade still reach it) but JS must not see it here.
+                if dom.tag(child).is_some_and(|tag| tag != SHADOW_ROOT_TAG) {
                     handles.push(alloc_handle(&state, child).map_err(js_error)?);
                 }
             }
@@ -463,7 +695,9 @@ fn op_dom_child_nodes(id: u64) -> NativeFunction {
         {
             let dom = dom.borrow();
             for &child in dom.children(node) {
-                handles.push(alloc_handle(&state, child).map_err(js_error)?);
+                if dom.tag(child) != Some(SHADOW_ROOT_TAG) {
+                    handles.push(alloc_handle(&state, child).map_err(js_error)?);
+                }
             }
         }
         JsValue::from_json(&json!(handles), ctx).map_err(|err| js_error(err.to_string()))
@@ -534,6 +768,24 @@ fn op_dom_find_all_tag(id: u64) -> NativeFunction {
             handles.push(alloc_handle(&state, node).map_err(js_error)?);
         }
         JsValue::from_json(&json!(handles), ctx).map_err(|err| js_error(err.to_string()))
+    })
+}
+
+/// Page-only: Zone A's `Dom::attach_shadow`. The root is parented under its
+/// host, so `walk` (and therefore `__hodo_dom_find_all_tag`) still upgrades
+/// shadow-nested custom elements; JS views hide it via `SHADOW_ROOT_TAG`.
+fn op_dom_attach_shadow(id: u64) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |_this, args, _ctx| {
+        let state = with_state(id, Rc::clone).map_err(js_error)?;
+        let (dom, host) =
+            resolve_for(&state, handle_arg(args, 0).map_err(js_error)?).map_err(js_error)?;
+        let attached = dom.borrow_mut().attach_shadow(host);
+        match attached {
+            Some(root) => Ok(JsValue::from(
+                alloc_handle(&state, root).map_err(js_error)? as f64
+            )),
+            None => Ok(JsValue::null()),
+        }
     })
 }
 
@@ -645,6 +897,57 @@ fn op_dom_add_listener(id: u64) -> NativeFunction {
             kind,
             callback_id,
         });
+        Ok(JsValue::undefined())
+    })
+}
+
+/// Page-only: drop one listener by identity. The callback lives on a global
+/// `__hodoListener_*` slot, so comparing that slot with the passed function is
+/// both exact and cheap; the matching task is removed from the page registry.
+fn op_dom_remove_listener(id: u64) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |_this, args, ctx| {
+        let state = with_state(id, Rc::clone).map_err(js_error)?;
+        let (_, node) =
+            resolve_for(&state, handle_arg(args, 0).map_err(js_error)?).map_err(js_error)?;
+        let kind = string_arg(args, 1, ctx).map_err(js_error)?;
+        let callback = args.get_or_undefined(2).clone();
+        if callback.as_callable().is_none() {
+            return Err(js_error(
+                "removeEventListener expects a function".to_string(),
+            ));
+        }
+        let page = page_of(&state).map_err(js_error)?;
+        let mut removed = Vec::new();
+        {
+            let listeners = page.listeners.borrow();
+            for listener in listeners.iter() {
+                if listener.node != node || listener.kind != kind {
+                    continue;
+                }
+                let key = PropertyKey::from(JsString::from(format!(
+                    "__hodoListener_{}",
+                    listener.callback_id
+                )));
+                if ctx
+                    .global_object()
+                    .get(key, ctx)
+                    .is_ok_and(|stored| stored.strict_equals(&callback))
+                {
+                    removed.push(listener.callback_id);
+                }
+            }
+        }
+        for callback_id in &removed {
+            let key = PropertyKey::from(JsString::from(format!("__hodoListener_{callback_id}")));
+            let _ = ctx
+                .global_object()
+                .set(key, JsValue::undefined(), false, ctx);
+        }
+        if !removed.is_empty() {
+            page.listeners
+                .borrow_mut()
+                .retain(|listener| !removed.contains(&listener.callback_id));
+        }
         Ok(JsValue::undefined())
     })
 }
@@ -814,6 +1117,37 @@ pub(crate) fn register_natives(context: &mut boa_engine::Context, id: u64) {
     );
     register(
         context,
+        "__hodo_dom_set_inner_html",
+        2,
+        op_dom_set_inner_html(id),
+    );
+    register(
+        context,
+        "__hodo_dom_parse_detached",
+        1,
+        op_dom_parse_detached(id),
+    );
+    register(
+        context,
+        "__hodo_dom_attach_shadow",
+        1,
+        op_dom_attach_shadow(id),
+    );
+    register(
+        context,
+        "__hodo_dom_create_text_node",
+        1,
+        op_dom_create_text_node(id),
+    );
+    register(
+        context,
+        "__hodo_dom_create_comment",
+        1,
+        op_dom_create_comment(id),
+    );
+    register(context, "__hodo_dom_node_type", 1, op_dom_node_type(id));
+    register(
+        context,
         "__hodo_dom_append_child",
         2,
         op_dom_append_child(id),
@@ -823,6 +1157,12 @@ pub(crate) fn register_natives(context: &mut boa_engine::Context, id: u64) {
         "__hodo_dom_remove_child",
         2,
         op_dom_remove_child(id),
+    );
+    register(
+        context,
+        "__hodo_dom_insert_before",
+        3,
+        op_dom_insert_before(id),
     );
     register(context, "__hodo_dom_text", 1, op_dom_text(id));
     register(context, "__hodo_dom_set_text", 2, op_dom_set_text(id));
@@ -855,6 +1195,12 @@ pub(crate) fn register_natives(context: &mut boa_engine::Context, id: u64) {
         "__hodo_dom_add_listener",
         3,
         op_dom_add_listener(id),
+    );
+    register(
+        context,
+        "__hodo_dom_remove_listener",
+        3,
+        op_dom_remove_listener(id),
     );
     register(
         context,
@@ -895,9 +1241,10 @@ mod tests {
                  typeof i18n, typeof action, typeof document, typeof console])",
             )
             .unwrap();
+        // Page fetch is the shell's GET-only loader, not an extension API.
         assert_eq!(
             probe,
-            r#"["undefined","undefined","undefined","undefined","undefined","object","object"]"#
+            r#"["undefined","undefined","function","undefined","undefined","object","object"]"#
         );
     }
 
@@ -1071,6 +1418,26 @@ mod tests {
     }
 
     #[test]
+    fn remove_event_listener_drops_only_the_matching_callback() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var a = function () { console.log('a'); }; \
+                 var b = function () { console.log('b'); }; \
+                 window.addEventListener('click', a); \
+                 window.addEventListener('click', b); \
+                 window.removeEventListener('click', a); \
+                 window.dispatchEvent({ type: 'click', bubbles: false }); \
+                 JSON.stringify(true)",
+            )
+            .unwrap();
+        assert_eq!(probe, "true");
+        runtime.tick();
+        assert_eq!(runtime.take_logs(), ["b"]);
+    }
+
+    #[test]
     fn window_add_event_listener_fires_on_document_event() {
         let (dom, _, _) = sample_dom();
         let root = dom.borrow().root();
@@ -1109,12 +1476,13 @@ mod tests {
             runtime.eval("window.location.href").unwrap(),
             "https://archive.org/details/foo?a=1"
         );
-        // Both the holder and the property are read-only.
+        // Wave-2 navigation surface: href is writable and re-parsed in JS; no
+        // network or popstate reaction happens.
         assert_eq!(
             runtime
                 .eval("window.location.href = 'https://elsewhere.test/'; window.location.href")
                 .unwrap(),
-            "https://archive.org/details/foo?a=1"
+            "https://elsewhere.test/"
         );
     }
 
@@ -1307,6 +1675,204 @@ mod tests {
     }
 
     #[test]
+    fn character_data_family_has_real_chains_and_illegal_direct_constructors() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var t = document.createTextNode('hi'); \
+                 var c = document.createComment('note'); \
+                 var illegal = []; \
+                 ['CharacterData', 'Text', 'Comment'].forEach(function (n) { \
+                   var C = window[n]; \
+                   try { new C(); illegal.push('no-throw'); } \
+                   catch (e) { illegal.push(e instanceof TypeError); } \
+                 }); \
+                 function MyText() { Text.call(this); } \
+                 MyText.prototype = Object.create(Text.prototype); \
+                 MyText.prototype.constructor = MyText; \
+                 var mt = new MyText(); \
+                 JSON.stringify([\
+                   t instanceof Text, t instanceof CharacterData, t instanceof Node, \
+                   c instanceof Comment, c instanceof CharacterData, c instanceof Node, \
+                   t.nodeType, t.nodeName, c.nodeType, c.nodeName, \
+                   illegal[0], illegal[1], illegal[2], \
+                   mt instanceof Text, mt instanceof CharacterData, mt instanceof Node])",
+            )
+            .unwrap();
+        assert_eq!(
+            probe,
+            r##"[true,true,true,true,true,true,3,"#text",8,"#comment",true,true,true,true,true,true]"##
+        );
+    }
+
+    #[test]
+    fn create_text_node_appends_a_real_arena_text_node() {
+        let (dom, host, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(Rc::clone(&dom));
+        runtime
+            .eval(
+                "var t = document.createTextNode('HELLO'); \
+                 document.getElementById('host').appendChild(t);",
+            )
+            .unwrap();
+        runtime.tick();
+        {
+            let dom = dom.borrow();
+            let children = dom.children(host);
+            assert_eq!(children.len(), 2);
+            assert_eq!(dom.text(children[0]), None);
+            assert_eq!(dom.text(children[1]), Some("HELLO"));
+        }
+        assert_eq!(
+            runtime
+                .eval("document.getElementById('host').textContent")
+                .unwrap(),
+            "HELLO"
+        );
+    }
+
+    #[test]
+    fn create_comment_never_contributes_text_or_children() {
+        let (dom, host, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(Rc::clone(&dom));
+        let probe = runtime
+            .eval(
+                "var h = document.getElementById('host'); \
+                 var c = document.createComment('SECRET'); h.appendChild(c); \
+                 JSON.stringify([c.nodeType, c.nodeName, c.data, c.nodeValue, \
+                                 c.textContent, h.textContent, c.childNodes.length, \
+                                 h.childNodes.length])",
+            )
+            .unwrap();
+        assert_eq!(
+            probe,
+            r##"[8,"#comment","SECRET","SECRET","SECRET","",0,2]"##
+        );
+        {
+            let dom = dom.borrow();
+            let children = dom.children(host);
+            assert_eq!(dom.tag(children[1]), Some("#comment"));
+            assert_eq!(dom.attr(children[1], "data"), Some("SECRET"));
+            assert!(dom.children(children[1]).is_empty());
+        }
+    }
+
+    #[test]
+    fn character_data_writes_mutate_the_arena_and_keep_sibling_order() {
+        let (dom, host, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(Rc::clone(&dom));
+        runtime
+            .eval(
+                "var h = document.getElementById('host'); \
+                 var a = document.createTextNode('A'); \
+                 var b = document.createElement('b'); \
+                 var c = document.createTextNode('C'); \
+                 h.appendChild(a); h.appendChild(b); h.appendChild(c); \
+                 a.data = 'AA'; \
+                 b.appendChild(document.createTextNode('B')); \
+                 c.nodeValue = 'CC';",
+            )
+            .unwrap();
+        runtime.tick();
+        {
+            let dom = dom.borrow();
+            let children = dom.children(host);
+            let texts: Vec<_> = children
+                .iter()
+                .map(|&id| dom.text(id).unwrap_or("").to_string())
+                .collect();
+            assert_eq!(texts, ["", "AA", "", "CC"]);
+            assert_eq!(dom.tag(children[0]), Some("span"));
+            assert_eq!(dom.tag(children[2]), Some("b"));
+        }
+        assert_eq!(
+            runtime
+                .eval("document.getElementById('host').textContent")
+                .unwrap(),
+            "AABCC"
+        );
+        let probe = runtime
+            .eval(
+                "var h = document.getElementById('host'); \
+                 JSON.stringify([h.childNodes[1].data, h.childNodes[1].length, \
+                                 h.childNodes[3].data, h.firstChild.nodeName])",
+            )
+            .unwrap();
+        assert_eq!(probe, r#"["AA",2,"CC","SPAN"]"#);
+    }
+
+    #[test]
+    fn child_nodes_hands_out_typed_text_and_comment_wrappers() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var h = document.getElementById('host'); \
+                 var t = document.createTextNode('T'); \
+                 var c = document.createComment('C'); \
+                 h.appendChild(t); h.appendChild(c); \
+                 var n = h.childNodes, ch = h.children; \
+                 JSON.stringify([n.length, n[0].nodeType, n[1].nodeType, n[2].nodeType, \
+                   n[1] instanceof Text, n[1] instanceof CharacterData, n[1] instanceof Node, \
+                   n[2] instanceof Comment, n[2] instanceof CharacterData, n[2] instanceof Node, \
+                   n[1].data, n[2].data, n[1].nodeName, n[2].nodeName, \
+                   ch[1] instanceof Comment, ch[1].nodeType, t.length, n[1].length])",
+            )
+            .unwrap();
+        assert_eq!(
+            probe,
+            r##"[3,1,3,8,true,true,true,true,true,true,"T","C","#text","#comment",true,8,1,1]"##
+        );
+    }
+
+    #[test]
+    fn insert_before_handles_order_fragments_null_ref_and_bad_ref() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var h = document.getElementById('host'); \
+                 var a = document.createElement('a'), b = document.createElement('b'); \
+                 h.appendChild(a); h.appendChild(b); \
+                 var x = document.createElement('x'); h.insertBefore(x, a); \
+                 var y = document.createElement('y'); h.insertBefore(y, null); \
+                 var f = document.createDocumentFragment(); \
+                 var p = document.createElement('p'), q = document.createElement('q'); \
+                 f.appendChild(p); f.appendChild(q); \
+                 h.insertBefore(f, b); \
+                 var order = [], kids = h.children; \
+                 for (var i = 0; i < kids.length; i++) order.push(kids[i].tagName.toLowerCase()); \
+                 var stray = document.createElement('stray'); var bad = false; \
+                 try { h.insertBefore(stray, stray); } catch (e) { bad = e instanceof TypeError; } \
+                 JSON.stringify([order.join(','), bad, f.childNodes.length])",
+            )
+            .unwrap();
+        assert_eq!(probe, r#"["span,x,a,p,q,b,y",true,0]"#);
+    }
+
+    #[test]
+    fn sibling_getters_walk_a_mixed_tree() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var h = document.getElementById('host'); \
+                 var kid = document.getElementById('kid'); \
+                 var t = document.createTextNode('T'), c = document.createComment('C'); \
+                 h.appendChild(t); h.appendChild(c); \
+                 JSON.stringify([h.firstChild.nodeType, h.lastChild.nodeType, \
+                   kid.previousSibling === null, kid.nextSibling.nodeType, \
+                   t.previousSibling.nodeType, t.nextSibling.nodeType, \
+                   c.nextSibling === null, c.previousSibling.nodeType, \
+                   t.parentNode.nodeType, t instanceof CharacterData, \
+                   c instanceof CharacterData])",
+            )
+            .unwrap();
+        assert_eq!(probe, "[1,8,true,3,1,8,true,3,1,true,true]");
+    }
+
+    #[test]
     fn node_constants_match_the_dom_spec() {
         let (dom, _, _) = sample_dom();
         let mut runtime = ExtScriptRuntime::new_page(dom);
@@ -1472,7 +2038,7 @@ mod tests {
     }
 
     #[test]
-    fn range_import_and_clone_are_honestly_unsupported() {
+    fn range_is_unsupported_and_import_node_clones() {
         let (dom, _, _) = sample_dom();
         let mut runtime = ExtScriptRuntime::new_page(dom);
         let probe = runtime
@@ -1483,16 +2049,157 @@ mod tests {
                    catch (e) { out.push(e.name + ':' + /not supported/.test(e.message)); } \
                  } \
                  probe(function () { document.createRange(); }); \
-                 probe(function () { document.importNode(document.createElement('b'), true); }); \
-                 probe(function () { document.createElement('b').cloneNode(true); }); \
                  probe(function () { Range; }); \
+                 var original = document.createElement('b'); \
+                 original.setAttribute('id', 'copied'); \
+                 var copy = document.importNode(original, true); \
+                 out.push(copy !== original && copy.getAttribute('id') === 'copied' \
+                   ? 'clone' : 'bad'); \
                  JSON.stringify(out)",
+            )
+            .unwrap();
+        assert_eq!(probe, r#"["TypeError:true","TypeError:true","clone"]"#);
+    }
+
+    #[test]
+    fn clone_node_shallow_is_detached_and_copies_attributes() {
+        let (dom, host, kid) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(Rc::clone(&dom));
+        let probe = runtime
+            .eval(
+                "var h = document.getElementById('host'); \
+                 var c = h.cloneNode(); \
+                 JSON.stringify([c !== h, c.tagName, c.getAttribute('id'), \
+                   c.getAttribute('class'), c.children.length, c.childNodes.length, \
+                   c.parentNode, c instanceof HTMLElement, c instanceof Node])",
+            )
+            .unwrap();
+        assert_eq!(probe, r#"[true,"DIV","host","x y",0,0,null,true,true]"#);
+        // The live tree is untouched and the source keeps its child.
+        assert_eq!(dom.borrow().children(host), [kid]);
+    }
+
+    #[test]
+    fn clone_node_deep_is_recursive_detached_and_roundtrips_text_and_comments() {
+        let (dom, host, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(Rc::clone(&dom));
+        runtime
+            .eval(
+                "var h = document.getElementById('host'); \
+                 h.appendChild(document.createTextNode('T')); \
+                 h.appendChild(document.createComment('C')); \
+                 window.__copy = h.cloneNode(true);",
+            )
+            .unwrap();
+        // Deep copy has the same kinds in order, but lives outside the document.
+        assert_eq!(
+            runtime
+                .eval(
+                    "var c = window.__copy, n = c.childNodes, out = []; \
+                     for (var i = 0; i < n.length; i++) out.push([n[i].nodeType, n[i].data]); \
+                     JSON.stringify([c.getAttribute('id'), out, c.parentNode, \
+                       c.children[0].tagName, c.children[0].getAttribute('id')])"
+                )
+                .unwrap(),
+            r##"["host",[[1,null],[3,"T"],[8,"C"]],null,"SPAN","kid"]"##
+        );
+        // Mutating the clone does not touch the original.
+        runtime
+            .eval(
+                "window.__copy.setAttribute('id', 'copy'); \
+                 window.__copy.children[0].setAttribute('id', 'copy-kid');",
+            )
+            .unwrap();
+        assert_eq!(
+            runtime
+                .eval(
+                    "JSON.stringify([document.getElementById('host').getAttribute('id'), \
+                       document.getElementById('kid').getAttribute('id'), \
+                       window.__copy.getAttribute('id')])"
+                )
+                .unwrap(),
+            r#"["host","kid","copy"]"#
+        );
+        assert_eq!(dom.borrow().children(host).len(), 3);
+    }
+
+    #[test]
+    fn clone_node_deep_on_a_fragment_keeps_its_children_detached() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(Rc::clone(&dom));
+        let probe = runtime
+            .eval(
+                "var f = document.createDocumentFragment(); \
+                 f.appendChild(document.createElement('b')); \
+                 f.appendChild(document.createTextNode('txt')); \
+                 var c = f.cloneNode(true); \
+                 JSON.stringify([c instanceof DocumentFragment, c !== f, \
+                   c.childNodes.length, c.children[0].tagName, c.childNodes[1].data, \
+                   c.parentNode, f.childNodes.length, \
+                   document.createDocumentFragment().cloneNode() instanceof DocumentFragment])",
+            )
+            .unwrap();
+        assert_eq!(probe, r##"[true,true,2,"B","txt",null,2,true]"##);
+    }
+
+    #[test]
+    fn window_location_reports_every_field_from_the_threaded_url() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page_with_url(
+            dom,
+            "https://archive.org:8443/details/foo?a=1&b=2#frag",
+        );
+        let probe = runtime
+            .eval(
+                "var l = window.location; \
+                 JSON.stringify([l.href, l.protocol, l.host, l.hostname, l.port, l.origin, \
+                   l.pathname, l.search, l.search.slice(1), l.hash, \
+                   Object.isFrozen(l)])",
             )
             .unwrap();
         assert_eq!(
             probe,
-            r#"["TypeError:true","TypeError:true","TypeError:true","TypeError:true"]"#
+            r##"["https://archive.org:8443/details/foo?a=1&b=2#frag","https:","archive.org:8443","archive.org","8443","https://archive.org:8443","/details/foo","?a=1&b=2","a=1&b=2","#frag",false]"##
         );
+    }
+
+    #[test]
+    fn window_location_on_a_bare_url_has_empty_search_and_hash() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page_with_url(dom, "https://archive.org");
+        let probe = runtime
+            .eval(
+                "var l = location; \
+                 JSON.stringify([l.href, l.protocol, l.host, l.hostname, l.port, l.origin, \
+                   l.pathname, l.search, l.search.slice(1), l.hash])",
+            )
+            .unwrap();
+        assert_eq!(
+            probe,
+            r#"["https://archive.org","https:","archive.org","archive.org","","https://archive.org","/","","",""]"#
+        );
+    }
+
+    #[test]
+    fn window_and_custom_elements_have_their_class_surfaces() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var out = []; \
+                 ['CustomElementRegistry', 'Window'].forEach(function (n) { \
+                   var C = window[n]; \
+                   try { new C(); out.push('no-throw'); } \
+                   catch (e) { out.push(e instanceof TypeError); } \
+                 }); \
+                 JSON.stringify(out.concat([\
+                   window.customElements instanceof CustomElementRegistry, \
+                   window instanceof Window, \
+                   typeof CustomElementRegistry.prototype.define !== 'undefined', \
+                   typeof Window.prototype !== 'undefined']))",
+            )
+            .unwrap();
+        assert_eq!(probe, "[true,true,true,true,false,true]");
     }
 
     /// Document-order fixture: scripts, img, anchor, div with assorted attrs.
@@ -2134,5 +2841,1067 @@ mod tests {
             .eval("document.getElementById('host').dispatchEvent(new Event('nobody'));")
             .unwrap();
         assert_eq!(probe, "true");
+    }
+
+    #[test]
+    fn svg_element_family_chains_and_illegal_direct_constructors() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var illegal = []; \
+                 ['SVGElement', 'SVGSVGElement'].forEach(function (n) { \
+                   var C = window[n]; \
+                   try { new C(); illegal.push('no-throw'); } \
+                   catch (e) { illegal.push(e instanceof TypeError); } \
+                 }); \
+                 class MySvg extends SVGSVGElement {} \
+                 var ms = new MySvg(); \
+                 JSON.stringify([\
+                   typeof window.SVGElement, typeof window.SVGSVGElement, \
+                   illegal[0], illegal[1], \
+                   ms instanceof MySvg, ms instanceof SVGSVGElement, \
+                   ms instanceof SVGElement, ms instanceof Element, ms instanceof Node, \
+                   SVGElement.prototype instanceof Element, \
+                   SVGSVGElement.prototype instanceof SVGElement])",
+            )
+            .unwrap();
+        assert_eq!(
+            probe,
+            r#"["function","function",true,true,true,true,true,true,true,true,true]"#
+        );
+    }
+
+    #[test]
+    fn parsed_svg_wrapper_aligns_to_svg_prototype_with_null_svg_accessors() {
+        let mut dom = Dom::new();
+        let svg = dom.create(NodeKind::Element {
+            tag: "svg".into(),
+            attrs: vec![
+                ("id".into(), "chart".into()),
+                ("width".into(), "100%".into()),
+                ("height".into(), "200".into()),
+            ],
+        });
+        dom.append(dom.root(), svg);
+        let mut runtime = ExtScriptRuntime::new_page(Rc::new(RefCell::new(dom)));
+        let probe = runtime
+            .eval(
+                "var s = document.getElementById('chart'); \
+                 var c = document.querySelector('svg'); \
+                 var all = document.querySelectorAll('svg')[0]; \
+                 var created = document.createElement('svg'); \
+                 var kid = document.createElement('span'); \
+                 s.appendChild(kid); \
+                 JSON.stringify([\
+                   s instanceof SVGSVGElement, s instanceof SVGElement, \
+                   s instanceof Element, s instanceof HTMLElement, \
+                   c instanceof SVGSVGElement, all instanceof SVGSVGElement, \
+                   created instanceof SVGSVGElement, \
+                   s.nodeType, s.tagName, s.ownerSVGElement, s.viewportElement, \
+                   typeof kid.ownerSVGElement, kid instanceof SVGSVGElement, \
+                   kid instanceof HTMLElement])",
+            )
+            .unwrap();
+        assert_eq!(
+            probe,
+            r#"[true,true,true,false,true,true,true,1,"SVG",null,null,"undefined",false,true]"#
+        );
+    }
+
+    #[test]
+    fn svg_width_height_reflect_real_attributes_honestly() {
+        let mut dom = Dom::new();
+        let svg = dom.create(NodeKind::Element {
+            tag: "svg".into(),
+            attrs: vec![
+                ("id".into(), "chart".into()),
+                ("width".into(), "100%".into()),
+                ("height".into(), "200".into()),
+            ],
+        });
+        dom.append(dom.root(), svg);
+        let mut runtime = ExtScriptRuntime::new_page(Rc::new(RefCell::new(dom)));
+        let probe = runtime
+            .eval(
+                "var s = document.getElementById('chart'); \
+                 var before = [s.width, s.height]; \
+                 s.setAttribute('width', '50'); \
+                 var after = [s.width, s.height]; \
+                 var absent = [document.createElement('svg').width, \
+                               document.createElement('svg').height]; \
+                 JSON.stringify([before, after, absent])",
+            )
+            .unwrap();
+        assert_eq!(probe, r#"[["100%","200"],["50","200"],[null,null]]"#);
+    }
+
+    // ---- Zone B: shadow DOM / templates / detached document surfaces -----
+
+    #[test]
+    fn inner_html_roundtrip_on_simple_markup() {
+        let (dom, host, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(Rc::clone(&dom));
+        let probe = runtime
+            .eval(
+                "var h = document.getElementById('host'); \
+                 h.innerHTML = '<b class=\"x\">hi</b><i>there</i>'; \
+                 JSON.stringify([h.innerHTML, h.children.length, h.children[0].tagName, \
+                   h.children[0].getAttribute('class'), h.children[0].textContent, \
+                   h.children[1].tagName])",
+            )
+            .unwrap();
+        assert_eq!(
+            probe,
+            r#"["<b class=\"x\">hi</b><i>there</i>",2,"B","x","hi","I"]"#
+        );
+        assert_eq!(dom.borrow().children(host).len(), 2);
+    }
+
+    #[test]
+    fn template_content_is_a_document_fragment_side_tree() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(Rc::clone(&dom));
+        let probe = runtime
+            .eval(
+                "var t = document.createElement('template'); \
+                 t.innerHTML = '<b>hi</b>'; \
+                 JSON.stringify([t instanceof HTMLTemplateElement, \
+                   t.content instanceof DocumentFragment, t.content.childNodes.length, \
+                   t.content.querySelector('b').textContent, t.children.length, \
+                   t.innerHTML, t.content.firstChild instanceof Element])",
+            )
+            .unwrap();
+        assert_eq!(probe, r#"[true,true,1,"hi",0,"<b>hi</b>",true]"#);
+    }
+
+    #[test]
+    fn template_capability_probe_skips_the_bundle_polyfill() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        // Same shape webcomponents-sd-ce-pf.js uses to decide `c`/`M`: with
+        // native template content + deep clone, both stay false.
+        let probe = runtime
+            .eval(
+                "var t = document.createElement('template'); \
+                 var inner = document.createElement('template'); \
+                 inner.content.appendChild(document.createElement('div')); \
+                 t.content.appendChild(inner); \
+                 var clone = t.cloneNode(true); \
+                 JSON.stringify([typeof HTMLTemplateElement, clone.content.childNodes.length, \
+                   clone.content.firstChild.content.childNodes.length, \
+                   document.createDocumentFragment().cloneNode() instanceof DocumentFragment])",
+            )
+            .unwrap();
+        assert_eq!(probe, r#"["function",1,1,true]"#);
+    }
+
+    #[test]
+    fn dom_parser_parses_into_a_detached_document_wrapper() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(Rc::clone(&dom));
+        let probe = runtime
+            .eval(
+                "var doc = new DOMParser().parseFromString( \
+                   '<html><body><p class=\"x\">hello</p></body></html>', 'text/html'); \
+                 JSON.stringify([doc instanceof Document, doc.querySelector('p').textContent, \
+                   doc.querySelectorAll('p').length, doc.body !== null, \
+                   doc.documentElement !== null, doc.querySelector('span') === null, \
+                   document.querySelector('p') === null])",
+            )
+            .unwrap();
+        assert_eq!(probe, r#"[true,"hello",1,true,true,true,true]"#);
+    }
+
+    #[test]
+    fn dom_parser_rejects_non_html_mime_types() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var caught = 'none'; \
+                 try { new DOMParser().parseFromString('<p>x</p>', 'application/xml'); } \
+                 catch (e) { caught = e.name; } caught",
+            )
+            .unwrap();
+        assert_eq!(probe, "TypeError");
+    }
+
+    #[test]
+    fn create_html_document_returns_a_usable_detached_document() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var d = document.implementation.createHTMLDocument('t'); \
+                 d.body.innerHTML = '<b>x</b>'; \
+                 JSON.stringify([d.title, d.body.querySelector('b').textContent, \
+                   d instanceof Document, d.createElement('i').tagName])",
+            )
+            .unwrap();
+        assert_eq!(probe, r#"["t","x",true,"I"]"#);
+    }
+
+    #[test]
+    fn get_root_node_reaches_the_document_and_the_shadow_root() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var h = document.getElementById('host'); \
+                 var kid = document.getElementById('kid'); \
+                 var r = h.attachShadow({mode:'open'}); \
+                 r.innerHTML = '<b>deep</b>'; \
+                 var deep = r.querySelector('b'); \
+                 JSON.stringify([h.getRootNode() === document, kid.getRootNode() === document, \
+                   document.getRootNode() === document, r.getRootNode() === r, \
+                   deep.getRootNode() === r, deep.parentNode === r])",
+            )
+            .unwrap();
+        assert_eq!(probe, "[true,true,true,true,true,true]");
+    }
+
+    #[test]
+    fn attach_shadow_open_and_closed_shadow_root_nullness() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var h = document.getElementById('host'); \
+                 var r = h.attachShadow({mode:'open'}); \
+                 r.innerHTML = '<b>hi</b>'; \
+                 var c = document.createElement('div'); \
+                 var cr = c.attachShadow({mode:'closed'}); \
+                 JSON.stringify([h.shadowRoot === r, r.host === h, r.mode, \
+                   r instanceof ShadowRoot, h.children.length, h.childNodes.length, \
+                   r.querySelector('b').textContent, r.childNodes.length, \
+                   document.querySelectorAll('b').length, \
+                   c.shadowRoot === null, cr.mode, cr.host === c])",
+            )
+            .unwrap();
+        assert_eq!(
+            probe,
+            r#"[true,true,"open",true,1,1,"hi",1,0,true,"closed",true]"#
+        );
+    }
+
+    #[test]
+    fn custom_element_upgrade_walks_into_shadow_roots() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var h = document.getElementById('host'); \
+                 var r = h.attachShadow({mode:'open'}); \
+                 r.innerHTML = '<x-deep id=\"deep\"></x-deep>'; \
+                 function XDeep() { HTMLElement.call(this); } \
+                 XDeep.prototype = Object.create(HTMLElement.prototype); \
+                 XDeep.prototype.constructor = XDeep; \
+                 XDeep.prototype.connectedCallback = function () { console.log('upgraded'); }; \
+                 customElements.define('x-deep', XDeep); \
+                 JSON.stringify([r.querySelector('x-deep').getAttribute('id'), \
+                   r.querySelector('x-deep') instanceof XDeep])",
+            )
+            .unwrap();
+        assert_eq!(probe, r#"["deep",true]"#);
+        assert_eq!(runtime.take_logs(), ["upgraded"]);
+    }
+
+    #[test]
+    fn css_style_sheet_constructor_and_replace_sync_store_text() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var s = new CSSStyleSheet({media: 'screen'}); \
+                 s.replaceSync('p{color:red}'); \
+                 JSON.stringify([s.cssText, s.cssRules.length, s instanceof CSSStyleSheet, \
+                   typeof window.CSSStyleSheet, s.__hodoOptions.media])",
+            )
+            .unwrap();
+        assert_eq!(probe, r#"["p{color:red}",0,true,"function","screen"]"#);
+    }
+
+    #[test]
+    fn css_style_sheet_replace_returns_a_resolved_promise() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var s = new CSSStyleSheet(); \
+                 var p = s.replace('b{color:blue}'); \
+                 p.then(function (v) { \
+                   console.log((v === s) + ':' + (s.cssText === 'b{color:blue}')); \
+                 }); \
+                 typeof p.then",
+            )
+            .unwrap();
+        assert_eq!(probe, "function");
+        assert_eq!(runtime.take_logs(), ["true:true"]);
+    }
+
+    #[test]
+    fn css_style_sheet_rule_mutation_is_honestly_unsupported() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var s = new CSSStyleSheet(); var out = []; \
+                 try { s.insertRule('p{}', 0); } catch (e) { out.push(e.name); } \
+                 try { s.deleteRule(0); } catch (e) { out.push(e.name); } \
+                 JSON.stringify(out)",
+            )
+            .unwrap();
+        assert_eq!(probe, r#"["TypeError","TypeError"]"#);
+    }
+
+    #[test]
+    fn adopted_style_sheets_set_and_get_on_shadow_root_and_document() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var h = document.getElementById('host'); \
+                 var r = h.attachShadow({mode:'open'}); \
+                 var s = new CSSStyleSheet(); \
+                 r.adoptedStyleSheets = [s]; \
+                 document.adoptedStyleSheets = [s]; \
+                 JSON.stringify([r.adoptedStyleSheets.length, \
+                   r.adoptedStyleSheets[0] === s, \
+                   document.adoptedStyleSheets[0] === s, \
+                   'adoptedStyleSheets' in Document.prototype, \
+                   'replace' in CSSStyleSheet.prototype])",
+            )
+            .unwrap();
+        assert_eq!(probe, "[1,true,true,true,true]");
+    }
+
+    #[test]
+    fn lit_mimic_custom_element_stamps_shadow_content_with_adopted_sheet() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "class XLit extends HTMLElement { \
+                   connectedCallback() { \
+                     const s = this.attachShadow({mode:'open'}); \
+                     s.innerHTML = '<style>p{color:red}</style><p>t</p>'; \
+                     this.shadowRoot.adoptedStyleSheets = [new CSSStyleSheet()]; \
+                   } \
+                 } \
+                 customElements.define('x-lit', XLit); \
+                 var el = document.createElement('x-lit'); \
+                 document.getElementById('host').appendChild(el); \
+                 var sr = el.shadowRoot; \
+                 JSON.stringify([sr !== null, sr.querySelector('p').textContent, \
+                   sr.querySelector('style').textContent, \
+                   sr.adoptedStyleSheets.length, \
+                   sr.adoptedStyleSheets[0] instanceof CSSStyleSheet])",
+            )
+            .unwrap();
+        assert_eq!(probe, r#"[true,"t","p{color:red}",1,true]"#);
+        assert!(
+            runtime.take_logs().is_empty(),
+            "upgrade must not report an error"
+        );
+    }
+
+    #[test]
+    fn window_svg_prototype_patch_pattern_does_not_throw() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var shim = { sniff: true }; var out = []; \
+                 try { window.SVGElement.prototype = shim; \
+                       out.push(window.SVGElement.prototype === shim); } \
+                 catch (e) { out.push('THREW:' + e.name); } \
+                 try { window.SVGSVGElement.prototype = shim; \
+                       out.push(window.SVGSVGElement.prototype === shim); } \
+                 catch (e) { out.push('THREW:' + e.name); } \
+                 JSON.stringify(out)",
+            )
+            .unwrap();
+        assert_eq!(probe, "[true,true]");
+    }
+
+    // ---- ESM graph loader / dynamic import (wave 6) ----
+
+    #[test]
+    fn module_registry_evaluates_each_url_only_once() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var calls = 0; \
+                 function f(__mods) { calls++; return { v: calls }; } \
+                 var a = __hodoRunModule('https://x/a.js', [], f); \
+                 var b = __hodoRunModule('https://x/a.js', [], f); \
+                 JSON.stringify([calls, a.v, b.v, a === b]);",
+            )
+            .unwrap();
+        assert_eq!(probe, "[1,1,1,true]");
+    }
+
+    #[test]
+    fn module_factory_receives_dependency_exports_in_first_mention_order() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "__hodoRunModule('https://x/a.js', [], function () { return { name: 'a' }; }); \
+                 __hodoRunModule('https://x/b.js', [], function () { return { name: 'b' }; }); \
+                 var seen = []; \
+                 __hodoRunModule('https://x/c.js', ['https://x/b.js', 'https://x/a.js'], \
+                   function (mods) { seen = mods.map(function (m) { return m.name; }); return {}; }); \
+                 seen.join(',');",
+            )
+            .unwrap();
+        assert_eq!(probe, "b,a");
+    }
+
+    #[test]
+    fn module_missing_dependency_throws_with_both_urls() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let message = runtime
+            .eval(
+                "var msg = ''; \
+                 try { __hodoRunModule('https://x/importer.js', ['https://x/absent.js'], \
+                   function () { return {}; }); } \
+                 catch (e) { msg = e.message; } msg;",
+            )
+            .unwrap();
+        assert!(
+            message.contains("https://x/importer.js") && message.contains("https://x/absent.js"),
+            "honest error must name importer and missing dep: {message}"
+        );
+        let not_registered = runtime
+            .eval("typeof __hodoModules['https://x/importer.js']")
+            .unwrap();
+        assert_eq!(not_registered, "undefined");
+    }
+
+    #[test]
+    fn module_exports_are_snapshotted() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var raw = { a: 1, b: 2 }; \
+                 var ns = __hodoRunModule('https://x/snap.js', [], function () { return raw; }); \
+                 raw.a = 99; raw.c = 3; \
+                 JSON.stringify([Object.keys(ns).join(','), ns.a, ns.b, \
+                   ns.c === undefined, Object.getPrototypeOf(ns) === null, \
+                   ns === __hodoModules['https://x/snap.js']]);",
+            )
+            .unwrap();
+        assert_eq!(probe, r#"["a,b",1,2,true,true,true]"#);
+    }
+
+    #[test]
+    fn module_factory_keeps_strict_semantics() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        // No directive in the emitted factory itself (the shell strips chunk
+        // directives): the strict graph-eval path must supply it.
+        let probe = runtime
+            .eval_module_graph(
+                "__hodoRunModule('https://x/strict.js', [], (function (__mods) { \
+                   var threw = false; \
+                   try { __hodoUndeclared = 1; } catch (e) { threw = true; } \
+                   return { thisUndef: this === undefined, threw: threw }; \
+                 })); \
+                 JSON.stringify(__hodoModules['https://x/strict.js']);",
+            )
+            .unwrap();
+        assert_eq!(probe, r#"{"thisUndef":true,"threw":true}"#);
+    }
+
+    #[test]
+    fn dynamic_import_resolves_with_shell_supplied_exports() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&seen);
+        runtime.set_message_reply_hook(Some(Rc::new(move |message, _| {
+            sink.borrow_mut().push(message.clone());
+        })));
+        runtime
+            .eval(
+                "__hodoModuleBaseUrl = 'https://x/pages/index.html'; \
+                 __dyn = __hodoDynImport('./child.js'); \
+                 __dyn.then(function (m) { console.log('resolved:' + m.v); }); \
+                 JSON.stringify(true);",
+            )
+            .unwrap();
+        // With a reply hook installed the shell owns the request channel; the
+        // internal queue must stay empty so it cannot grow without bound.
+        assert!(runtime.take_dynamic_module_requests().is_empty());
+        let message = seen.borrow()[0].clone();
+        assert_eq!(message["__hodoDynImport"], 1);
+        assert_eq!(message["spec"], "https://x/pages/child.js");
+        assert_eq!(message["base"], "https://x/pages/index.html");
+        runtime.resolve_dynamic_import(
+            message["id"].as_u64().expect("numeric promise id"),
+            &json!({ "v": 42 }),
+        );
+        assert_eq!(runtime.take_logs(), ["resolved:42"]);
+    }
+
+    #[test]
+    fn dynamic_import_rejects_with_shell_message() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        runtime
+            .eval(
+                "__hodoModuleBaseUrl = 'https://x/index.html'; \
+                 __hodoDynImport('./gone.js').catch(function (e) { \
+                   console.log('rejected:' + e.message); \
+                 }); JSON.stringify(true);",
+            )
+            .unwrap();
+        let requests = runtime.take_dynamic_module_requests();
+        assert_eq!(requests.len(), 1);
+        runtime.reject_dynamic_import(requests[0].promise_id, "load failed");
+        assert_eq!(runtime.take_logs(), ["rejected:load failed"]);
+    }
+
+    #[test]
+    fn late_or_unknown_dynamic_import_callback_is_a_no_op() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        runtime
+            .eval(
+                "__hodoDynImport('./child.js').then(function (m) { \
+                   console.log('only:' + m.v); \
+                 }); JSON.stringify(true);",
+            )
+            .unwrap();
+        let requests = runtime.take_dynamic_module_requests();
+        let id = requests[0].promise_id;
+        runtime.resolve_dynamic_import(id, &json!({ "v": 1 }));
+        // Both a duplicate settle of a known id and a never-issued id must be
+        // silent no-ops (no second log, no thrown error).
+        runtime
+            .eval(&format!(
+                "__hodoDynResolved({id}, {{ v: 2 }}); \
+                 __hodoDynRejected({id}, 'too late'); \
+                 __hodoDynResolved(99999999, {{}}); JSON.stringify(true);"
+            ))
+            .unwrap();
+        assert_eq!(runtime.take_logs(), ["only:1"]);
+    }
+
+    #[test]
+    fn host_page_event_honors_stop_propagation_flag() {
+        let (dom, _, _) = sample_dom();
+        let root = dom.borrow().root();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        runtime
+            .eval(
+                "document.addEventListener('click', function (e) { \
+                   console.log('one:' + e.type); e.stopPropagation(); \
+                 }); \
+                 document.addEventListener('click', function () { \
+                   console.log('two'); \
+                 });",
+            )
+            .unwrap();
+        runtime.dispatch_page_event(root, "click", json!({}));
+        runtime.tick();
+        assert_eq!(runtime.take_logs(), ["one:click"]);
+    }
+
+    #[test]
+    fn tree_walker_next_node_and_node_remove_work() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                r#"
+                var root = document.getElementById('host');
+                var walker = document.createTreeWalker(root, 129);
+                var seen = [];
+                var node;
+                while ((node = walker.nextNode()) !== null) {
+                  seen.push(node.nodeName);
+                }
+                var kid = document.getElementById('kid');
+                kid.remove();
+                JSON.stringify([seen, document.getElementById('kid') === null]);
+                "#,
+            )
+            .unwrap();
+        assert_eq!(probe, r#"[["SPAN"],true]"#);
+    }
+
+    // Lit's EventPart registers itself as an EventListener object with
+    // handleEvent (DOM-legal). The native registry needs a callable, so the
+    // prelude adapts once and must preserve removeEventListener identity.
+    #[test]
+    fn listener_object_with_handle_event_is_supported() {
+        let (dom, host, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        runtime
+            .eval(
+                r#"
+                window.__listener = {
+                  count: 0,
+                  handleEvent: function (e) {
+                    this.count++;
+                    console.log('handle:' + this.count + ':' + e.type);
+                  }
+                };
+                document.getElementById('host').addEventListener('click', window.__listener);
+                "#,
+            )
+            .unwrap();
+        runtime.dispatch_page_event(host, "click", json!({}));
+        runtime.tick();
+        runtime
+            .eval(
+                "document.getElementById('host').removeEventListener('click', window.__listener);",
+            )
+            .unwrap();
+        runtime.dispatch_page_event(host, "click", json!({}));
+        runtime.tick();
+        assert_eq!(runtime.take_logs(), ["handle:1:click"]);
+    }
+
+    // Lit's two TreeWalker consumers, modelled end to end in-process. The
+    // archive.org `<app-root>` shadow tree is whitespace + markers + nested
+    // parts: (1) the template part-finder must FIND the `<!--?lit$…$-->`
+    // comments past non-showing whitespace, and (2) ChildPart materialisation
+    // must re-walk the imported clone at the very same node indices so each
+    // binding's start marker is the right comment. A walk that stops at the
+    // first non-showing sibling finds zero markers; a walk that desends into
+    // REJECTED subtrees misaligns the clone walk and collapses the tree.
+    #[test]
+    fn lit_marker_find_and_child_part_materialization_work() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                r#"
+                var t = document.createElement('template');
+                t.innerHTML = '<main> <a href="/x">link</a> <header>h</header> ' +
+                  '<!--?lit$TEST$--> <b>x</b> <!--?lit$TEST$--> y <!--?lit$TEST$--> </main>';
+                var MARK = '?lit$TEST$';
+                var w = document.createTreeWalker(t.content, 129);
+                var parts = [], a = 0, n;
+                w.currentNode = t.content;
+                while ((n = w.nextNode()) !== null) {
+                  if (n.nodeType === 8 && n.data === MARK) parts.push(a);
+                  a++;
+                }
+                var clone = document.importNode(t.content, true);
+                w.currentNode = clone;
+                var i = w.nextNode(), idx = 0, starts = [];
+                for (var p = 0; p < parts.length; p++) {
+                  while (idx < parts[p]) { i = w.nextNode(); idx++; }
+                  var end = i.nextSibling;
+                  var txt = document.createTextNode('V' + p);
+                  i.parentNode.insertBefore(txt, end);
+                  starts.push(i.nodeType + ':' + i.data);
+                }
+                JSON.stringify([parts, starts, /V0.*V1.*V2/.test(clone.textContent)]);
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            probe,
+            r#"[[3,5,6],["8:?lit$TEST$","8:?lit$TEST$","8:?lit$TEST$"],true]"#
+        );
+    }
+
+    // The real archive.org <app-root> template (index-NFRVgqV2.js). The live
+    // stamped tree has 12 children: a/header/main/whitespace + three markers.
+    // Lit's Je constructor and Ye.u clone walk must agree on marker positions.
+    #[test]
+    fn lit_archive_template_marker_find_and_clone_walk() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                r#"
+                var t = document.createElement('template');
+                t.innerHTML = '<a id="skip" @click$lit$="lit$MK$" >' +
+                  '<!--?lit$MK$--></a>\n      \n      <header>\n        ' +
+                  '<!--?lit$MK$-->\n        <!--?lit$MK$-->\n      </header>\n    ';
+                var MARK = '?lit$MK$';
+                var w = document.createTreeWalker(t.content, 129);
+                var parts = [], a = 0, n;
+                while ((n = w.nextNode()) !== null) {
+                  if (n.nodeType === 8 && n.data === MARK) parts.push(a);
+                  a++;
+                }
+                var clone = document.importNode(t.content, true);
+                w.currentNode = clone;
+                var i = w.nextNode(), idx = 0, filled = [];
+                for (var p = 0; p < parts.length; p++) {
+                  while (idx < parts[p]) { i = w.nextNode(); idx++; }
+                  var txt = document.createTextNode('V' + p);
+                  i.parentNode.insertBefore(txt, i.nextSibling);
+                  filled.push(i.nodeType + ':' + i.data);
+                }
+                var kids = []; for (var k = 0; k < clone.childNodes.length; k++) kids.push(clone.childNodes[k].nodeName);
+                JSON.stringify([parts, filled, kids, clone.textContent.replace(/\s+/g, '')]);
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            probe,
+            r##"[[1,3,4],["8:?lit$MK$","8:?lit$MK$","8:?lit$MK$"],["A","#text","HEADER","#text"],"V0V1V2"]"##
+        );
+    }
+
+    // The regression guard: FILTER_SKIP drops only the node and still walks
+    // its children; FILTER_REJECT prunes the whole subtree. A walker that
+    // conflates the two either invents or loses nodes, which shifts Lit's
+    // part indices and collapses ChildPart materialisation.
+    #[test]
+    fn tree_walker_filter_reject_prunes_but_skip_descends() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                r#"
+                var t = document.createElement('template');
+                t.innerHTML = '<r><s><t></t></s><u></u></r>';
+                var root = t.content.firstChild;
+                function walk(filter) {
+                  var w = document.createTreeWalker(root, 129, filter);
+                  var names = [], n;
+                  while ((n = w.nextNode()) !== null) names.push(n.nodeName);
+                  return names.join(',');
+                }
+                JSON.stringify([
+                  walk({ acceptNode: function (n) {
+                    return n.nodeName === 'S' ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+                  }}),
+                  walk({ acceptNode: function (n) {
+                    return n.nodeName === 'S' ? NodeFilter.FILTER_SKIP : NodeFilter.FILTER_ACCEPT;
+                  }}),
+                  walk(null)
+                ]);
+                "#,
+            )
+            .unwrap();
+        assert_eq!(probe, r#"["U","T,U","S,T,U"]"#);
+    }
+
+    #[test]
+    fn page_text_encoder_emits_utf8_bytes() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval("Array.from(new TextEncoder().encode('Aé')).join(',')")
+            .unwrap();
+        assert_eq!(probe, "65,195,169");
+    }
+
+    #[test]
+    fn page_attribute_surface_sees_custom_names_from_inner_html() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                r#"
+                var host = document.getElementById('host');
+                host.innerHTML = '<span id="kid" data-x="1" class="x">t</span>';
+                var kid = host.firstElementChild;
+                var names = kid.getAttributeNames();
+                var clone = kid.cloneNode(false);
+                kid.toggleAttribute('hidden');
+                var toggled = kid.hasAttribute('hidden');
+                kid.toggleAttribute('hidden', false);
+                JSON.stringify([
+                  names.indexOf('data-x') >= 0, kid.hasAttribute('data-x'),
+                  kid.hasAttributes(), kid.getAttribute('data-x'),
+                  clone.hasAttribute('data-x'), toggled,
+                  typeof kid.removeAttribute
+                ]);
+                "#,
+            )
+            .unwrap();
+        assert_eq!(probe, r#"[true,true,true,"1",true,true,"function"]"#);
+    }
+
+    #[test]
+    fn page_get_elements_by_tag_name_returns_wrapped_matches() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "JSON.stringify([\
+                   document.getElementsByTagName('span').length,\
+                   document.getElementsByTagName('span')[0].getAttribute('id'),\
+                   document.getElementsByTagName('missing').length])",
+            )
+            .unwrap();
+        assert_eq!(probe, r#"[1,"kid",0]"#);
+    }
+
+    #[test]
+    fn page_history_state_roundtrip_and_replace_state_updates_location() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page_with_url(dom, "https://archive.org/");
+        let probe = runtime
+            .eval(
+                r#"
+                var initial = history.state;
+                history.pushState({ a: 1 }, '', '/one');
+                var pushed = [history.state.a, location.pathname, location.href];
+                history.replaceState({ b: 2 }, '', '/two?x=1#f');
+                var replaced = [
+                  history.state.b, location.pathname, location.search,
+                  location.hash, location.href
+                ];
+                history.scrollRestoration = 'manual';
+                var own = ['pushState', 'replaceState', 'forward', 'go', 'back'].map(
+                  function (k) { return Object.prototype.hasOwnProperty.call(history, k); });
+                history.back();
+                JSON.stringify([
+                  initial, pushed, replaced, history.length,
+                  history.scrollRestoration, own
+                ]);
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            probe,
+            r##"[null,[1,"/one","https://archive.org/one"],[2,"/two","?x=1","#f","https://archive.org/two?x=1#f"],1,"manual",[true,true,true,true,true]]"##
+        );
+        assert_eq!(
+            runtime.take_logs(),
+            ["hodo: history.back is a no-op in page scripts"]
+        );
+    }
+
+    #[test]
+    fn page_request_animation_frame_fires_on_the_house_timer() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        runtime
+            .eval(
+                r#"
+                var frames = [];
+                var id = requestAnimationFrame(function (t) { frames.push(typeof t); });
+                if (!(id > 0)) throw new Error('rAF id');
+                "#,
+            )
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        runtime.tick();
+        assert_eq!(runtime.eval("frames.join(',')").unwrap(), "number");
+    }
+
+    #[test]
+    fn page_cancel_animation_frame_suppresses_the_callback() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        runtime
+            .eval(
+                r#"
+                var frames = 0;
+                var id = requestAnimationFrame(function () { frames++; });
+                cancelAnimationFrame(id);
+                "#,
+            )
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        runtime.tick();
+        assert_eq!(runtime.eval("frames").unwrap(), "0");
+    }
+
+    #[test]
+    fn page_queue_microtask_runs_before_the_next_timer() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        runtime
+            .eval(
+                r#"
+                queueMicrotask(function () { console.log('micro'); });
+                setTimeout(function () { console.log('timer'); }, 0);
+                "#,
+            )
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        runtime.tick();
+        assert_eq!(runtime.take_logs(), ["micro", "timer"]);
+    }
+
+    #[test]
+    fn page_match_media_is_a_false_capability_shape() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                r#"
+                var m = matchMedia('(max-width: 889px)');
+                JSON.stringify([
+                  m.matches, m.media, typeof m.addEventListener,
+                  typeof m.removeEventListener, typeof m.addListener,
+                  m.dispatchEvent()
+                ]);
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            probe,
+            r#"[false,"(max-width: 889px)","function","function","function",true]"#
+        );
+    }
+
+    #[test]
+    fn page_observers_are_capability_only_with_no_callbacks() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                r#"
+                var fired = 0;
+                var mo = new MutationObserver(function () { fired++; });
+                var io = new IntersectionObserver(function () { fired++; });
+                var ro = new ResizeObserver(function () { fired++; });
+                mo.observe(document, { childList: true });
+                io.observe(document.documentElement);
+                ro.observe(document.documentElement);
+                JSON.stringify([
+                  mo instanceof MutationObserver, io instanceof IntersectionObserver,
+                  ro instanceof ResizeObserver, typeof mo.disconnect,
+                  typeof io.unobserve, typeof ro.takeRecords,
+                  ro.takeRecords().length, fired
+                ]);
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            probe,
+            r#"[true,true,true,"function","function","function",0,0]"#
+        );
+    }
+
+    #[test]
+    fn page_computed_style_performance_and_beacon_shape() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                r#"
+                var s = getComputedStyle(document.documentElement);
+                JSON.stringify([
+                  s.fontSize, typeof s.getPropertyValue, typeof performance.now,
+                  performance.getEntriesByType('navigation').length,
+                  typeof navigator.sendBeacon, navigator.sendBeacon('x')
+                ]);
+                "#,
+            )
+            .unwrap();
+        assert_eq!(probe, r#"["","function","function",0,"function",true]"#);
+    }
+
+    #[test]
+    fn raf_scheduler_stamps_shadow_dom_content_after_a_wait() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        runtime
+            .eval(
+                r#"
+                function XLit() { HTMLElement.call(this); }
+                XLit.prototype = Object.create(HTMLElement.prototype);
+                XLit.prototype.constructor = XLit;
+                XLit.prototype.connectedCallback = function () {
+                  var self = this;
+                  requestAnimationFrame(function () {
+                    var root = self.attachShadow({ mode: 'open' });
+                    root.innerHTML = '<b>stamped</b>';
+                  });
+                };
+                customElements.define('x-lit', XLit);
+                document.getElementById('host').appendChild(
+                  document.createElement('x-lit'));
+                "#,
+            )
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        runtime.tick();
+        let logs = runtime.take_logs();
+        assert!(logs.is_empty(), "unexpected page logs: {logs:?}");
+        assert_eq!(
+            runtime
+                .eval(
+                    "document.getElementById('host')
+                       .querySelector('x-lit').shadowRoot
+                       .querySelector('b').textContent"
+                )
+                .unwrap(),
+            "stamped"
+        );
+    }
+
+    #[test]
+    fn inner_html_serializes_custom_and_unknown_elements() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var h = document.getElementById('host'); \
+                 h.innerHTML = '<app-root id=\"a\"><x-lit>hi</x-lit></app-root>'; \
+                 JSON.stringify([h.innerHTML, h.childNodes.length, h.firstChild.nodeName, \
+                   h.firstElementChild.getAttribute('id')])",
+            )
+            .unwrap();
+        assert_eq!(
+            probe,
+            r#"["<app-root id=\"a\"><x-lit>hi</x-lit></app-root>",1,"APP-ROOT","a"]"#
+        );
+    }
+
+    #[test]
+    fn inner_html_roundtrips_lit_marker_comments() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var h = document.getElementById('host'); \
+                 h.innerHTML = '<!--<?lit$834982315>-->x<!--/*lit*/-->'; \
+                 JSON.stringify([h.childNodes.length, h.childNodes[0].nodeType, \
+                   h.childNodes[0].data, h.childNodes[2].data, h.innerHTML])",
+            )
+            .unwrap();
+        assert_eq!(
+            probe,
+            r#"[3,8,"<?lit$834982315>","/*lit*/","<!--<?lit$834982315>-->x<!--/*lit*/-->"]"#
+        );
+    }
+
+    #[test]
+    fn page_html_element_classes_are_subclassable_and_match_instances() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                r#"
+                var pairs = [
+                  ['button','HTMLButtonElement'], ['a','HTMLAnchorElement'],
+                  ['input','HTMLInputElement'], ['img','HTMLImageElement'],
+                  ['select','HTMLSelectElement'], ['textarea','HTMLTextAreaElement'],
+                  ['form','HTMLFormElement'], ['video','HTMLMediaElement']
+                ];
+                var ok = pairs.map(function (p) {
+                  var ctor = window[p[1]];
+                  var directThrows = false;
+                  try { new ctor(); } catch (e) { directThrows = /Illegal constructor/.test(String(e)); }
+                  return typeof ctor === 'function' && directThrows
+                    && document.createElement(p[0]) instanceof ctor;
+                });
+                class Btn extends HTMLButtonElement {}
+                JSON.stringify([ok, new Btn() instanceof HTMLButtonElement]);
+                "#,
+            )
+            .unwrap();
+        assert_eq!(probe, r#"[[true,true,true,true,true,true,true,true],true]"#);
     }
 }

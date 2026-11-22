@@ -24,6 +24,13 @@
 use hodo_types::limits::MAX_DOM_NODES;
 use std::collections::HashMap;
 
+/// Reserved tag for the node created by [`Dom::attach_shadow`].
+///
+/// Light-DOM views must filter this tag: JS `children`/`childNodes` and any
+/// DOM-API view hide `#shadow-root` nodes. Rendering/layout instead reads the
+/// flattened view through [`Dom::render_children`].
+pub const SHADOW_ROOT_TAG: &str = "#shadow-root";
+
 /// Opaque handle into the node arena: low 20 bits are the slot, high 12 bits
 /// the generation. A reused slot therefore hands out a *different* handle, so
 /// an old handle can be rejected instead of silently aliasing a new node.
@@ -170,6 +177,30 @@ pub struct Dom {
     interning: bool,
     /// Interned ids parallel to `nodes` (same slot indices).
     str_meta: Vec<StrMeta>,
+    /// Shadow root of a host node, parallel to `nodes` (same slot indices).
+    /// `Some(root)` marks this node as a shadow host.
+    shadow_roots: Vec<Option<NodeId>>,
+    // ---- Cache-local relation core (parallel to `nodes`, indexed by slot) ---
+    // Node.parent / Node.children stay the source of truth (public, frozen:
+    // `children()` returns `&[NodeId]`, `get()` returns `&Node`). These three
+    // packed arrays are a read-cache rebuilt at every mutation site; `walk`
+    // uses them so a traversal never dereferences a per-node children Vec.
+    // `parents` uses `root_id` as the "no parent" sentinel (the root is never
+    // a child, so that value never denotes a real parent edge).
+    //
+    // INVARIANT: this is only authoritative for live slots. `detach_subtree`
+    // rewrites the parent of the detached root but leaves its descendants'
+    // parent links (packed *and* source) stale, pointing into the trash. Every
+    // consumer must `validate()` the handle (generation + trashed check) before
+    // trusting `parents[slot]`; `create()` resets the entry to `root_id` when it
+    // recycles a trash slot. Never walk an unvalidated slot through this array.
+    parents: Vec<NodeId>,
+    first_child: Vec<Option<NodeId>>,
+    next_sibling: Vec<Option<NodeId>>,
+    /// Debug-only mutation count driving the sampled chain check below.
+    /// Compiled out in release so wide-tree builds pay no sampling cost there.
+    #[cfg(debug_assertions)]
+    mutations: u64,
 }
 
 impl Dom {
@@ -189,6 +220,12 @@ impl Dom {
             interner: StringInterner::default(),
             interning: false,
             str_meta: vec![StrMeta::default()],
+            shadow_roots: vec![None],
+            parents: vec![NodeId(0)],
+            first_child: vec![None],
+            next_sibling: vec![None],
+            #[cfg(debug_assertions)]
+            mutations: 0,
         }
     }
 
@@ -255,6 +292,10 @@ impl Dom {
             self.generations[slot as usize] = generation;
             self.trashed[slot as usize] = false;
             self.str_meta[slot as usize] = meta;
+            self.shadow_roots[slot as usize] = None;
+            self.parents[slot as usize] = self.root_id;
+            self.first_child[slot as usize] = None;
+            self.next_sibling[slot as usize] = None;
             (slot, generation)
         } else {
             let slot = self.nodes.len() as u32;
@@ -262,11 +303,83 @@ impl Dom {
             self.generations.push(0);
             self.trashed.push(false);
             self.str_meta.push(meta);
+            self.shadow_roots.push(None);
+            self.parents.push(self.root_id);
+            self.first_child.push(None);
+            self.next_sibling.push(None);
             (slot, 0)
         };
         let id = NodeId::encode(slot, generation);
         self.debug_assert_handle(id);
         id
+    }
+
+    /// Append `child` to the tail of `parent`'s child list, keeping the packed
+    /// relation arrays in lock-step with the source-of-truth `children` Vec.
+    /// The old tail is read from the Vec (append order), so no `last_child`
+    /// array is needed and appends stay O(1).
+    fn link_child(&mut self, parent: NodeId, child: NodeId) {
+        let p = parent.slot() as usize;
+        let c = child.slot() as usize;
+        match self.nodes[p].children.last().copied() {
+            None => self.first_child[p] = Some(child),
+            Some(last) => self.next_sibling[last.slot() as usize] = Some(child),
+        }
+        self.next_sibling[c] = None;
+        self.parents[c] = parent;
+        self.nodes[p].children.push(child);
+        self.nodes[c].parent = Some(parent);
+        #[cfg(debug_assertions)]
+        self.check_chain_sampled(parent);
+    }
+
+    /// Remove `child` from `parent`'s child list (both the Vec and the packed
+    /// chain). The chain walk is O(#children), the same order as `Vec::retain`.
+    fn remove_child(&mut self, parent: NodeId, child: NodeId) {
+        let p = parent.slot() as usize;
+        let c = child.slot() as usize;
+        let mut cur = self.first_child[p];
+        let mut prev: Option<NodeId> = None;
+        while let Some(x) = cur {
+            if x == child {
+                let next = self.next_sibling[x.slot() as usize];
+                match prev {
+                    None => self.first_child[p] = next,
+                    Some(pr) => self.next_sibling[pr.slot() as usize] = next,
+                }
+                self.next_sibling[c] = None;
+                break;
+            }
+            prev = Some(x);
+            cur = self.next_sibling[x.slot() as usize];
+        }
+        self.nodes[p].children.retain(|x| *x != child);
+        #[cfg(debug_assertions)]
+        self.check_chain_sampled(parent);
+    }
+
+    /// Debug-only: number of nodes in `parent`'s packed sibling chain.
+    #[cfg(debug_assertions)]
+    fn chain_len(&self, parent: NodeId) -> usize {
+        let mut n = 0;
+        let mut cur = self.first_child[parent.slot() as usize];
+        while let Some(x) = cur {
+            n += 1;
+            cur = self.next_sibling[x.slot() as usize];
+        }
+        n
+    }
+
+    /// Sampling rule: every mutation for the first 1024, then only when
+    /// `mutations` is a power of two. Total chain-walk work stays O(n) even for
+    /// a 100k-sibling build, while small trees still check on every mutation.
+    #[cfg(debug_assertions)]
+    fn check_chain_sampled(&mut self, parent: NodeId) {
+        self.mutations = self.mutations.wrapping_add(1);
+        if self.mutations < 1024 || self.mutations.is_power_of_two() {
+            let expected = self.nodes[parent.slot() as usize].children.len();
+            debug_assert_eq!(self.chain_len(parent), expected);
+        }
     }
 
     /// Remove `root` and its whole subtree from the visible tree.
@@ -282,10 +395,10 @@ impl Dom {
         }
         let root_slot = root.slot() as usize;
         if let Some(parent) = self.nodes[root_slot].parent {
-            let p = parent.slot() as usize;
-            self.nodes[p].children.retain(|c| *c != root);
+            self.remove_child(parent, root);
         }
         self.nodes[root_slot].parent = None;
+        self.parents[root_slot] = self.root_id;
 
         let trash = self.ensure_trash();
         let mut stack = vec![root];
@@ -310,9 +423,31 @@ impl Dom {
             self.generations[slot as usize] = NodeId::bump(self.generations[slot as usize]);
             self.free.push(slot);
         }
+        // The trash is unreachable from `walk`, so only the source-of-truth
+        // fields are updated here. Its packed chain is deliberately left alone:
+        // trashed slots are recycled, and stale chain links into a reused slot
+        // would be harmless but would trip the debug chain-length assertion.
         let t = trash.slot() as usize;
         self.nodes[root_slot].parent = Some(trash);
+        self.parents[root_slot] = trash;
         self.nodes[t].children.push(root);
+    }
+
+    /// Remove `id` from its parent without re-attaching it anywhere.
+    ///
+    /// The node stays live (its slot is neither trashed nor recycled), so this
+    /// is the "drop" path for callers whose capacity budget forbids growing a
+    /// trash tree: the subtree simply becomes unreachable from the root.
+    pub fn detach_orphan(&mut self, id: NodeId) {
+        if !self.validate(id) {
+            return;
+        }
+        let slot = id.slot() as usize;
+        if let Some(parent) = self.nodes[slot].parent {
+            self.remove_child(parent, id);
+        }
+        self.nodes[slot].parent = None;
+        self.parents[slot] = self.root_id;
     }
 
     /// True only for a handle that is in range, live and of the current generation.
@@ -330,21 +465,28 @@ impl Dom {
             return;
         }
         // If `parent` is `child` or lies below it, linking them makes a cycle.
-        let mut cursor = Some(parent);
-        while let Some(id) = cursor {
-            if id == child {
+        // Walk the packed parent array: compact, no per-node children Vec touched.
+        // INVARIANT: trashed descendants keep stale packed parents, so a packed
+        // parent is trustworthy only after `validate()` (done above for both
+        // endpoints). A live node never has a trashed ancestor, so this climb
+        // stays on live slots and cannot follow a stale link into the trash;
+        // `create()` resets each recycled slot's parent on reuse. Do not extend
+        // this walk to unvalidated handles.
+        let mut cursor = parent;
+        loop {
+            if cursor == child {
                 return;
             }
-            cursor = self.nodes[id.slot() as usize].parent;
+            if cursor == self.root_id {
+                break;
+            }
+            cursor = self.parents[cursor.slot() as usize];
         }
         let c = child.slot() as usize;
         if let Some(old) = self.nodes[c].parent {
-            self.nodes[old.slot() as usize]
-                .children
-                .retain(|x| *x != child);
+            self.remove_child(old, child);
         }
-        self.nodes[c].parent = Some(parent);
-        self.nodes[parent.slot() as usize].children.push(child);
+        self.link_child(parent, child);
     }
 
     /// Indexing assumes `id` came from this arena (or passed [`Dom::validate`]):
@@ -359,6 +501,55 @@ impl Dom {
 
     pub fn parent(&self, id: NodeId) -> Option<NodeId> {
         self.nodes[id.slot() as usize].parent
+    }
+
+    /// Give `host` a shadow root, returning the new root node.
+    ///
+    /// The root is parented *under* `host`, so [`Dom::walk`] reaches shadow
+    /// content for free. A host can only be attached once: further calls return
+    /// `None`. Invalid hosts and arena-cap exhaustion also return `None`.
+    pub fn attach_shadow(&mut self, host: NodeId) -> Option<NodeId> {
+        if !self.validate(host) || self.shadow_root(&host).is_some() {
+            return None;
+        }
+        let root = self.create(NodeKind::Element {
+            tag: SHADOW_ROOT_TAG.to_string(),
+            attrs: Vec::new(),
+        });
+        // `create` hands back the document root when the arena cap is exhausted.
+        if root == self.root_id {
+            return None;
+        }
+        self.shadow_roots[host.slot() as usize] = Some(root);
+        self.append(host, root);
+        Some(root)
+    }
+
+    /// The shadow root attached to `id`, if any.
+    pub fn shadow_root(&self, id: &NodeId) -> Option<NodeId> {
+        self.shadow_roots.get(id.slot() as usize).copied().flatten()
+    }
+
+    /// The host of a shadow root, if `root` is one.
+    pub fn host(&self, root: &NodeId) -> Option<NodeId> {
+        if !self.validate(*root) || self.tag(*root) != Some(SHADOW_ROOT_TAG) {
+            return None;
+        }
+        self.parent(*root)
+    }
+
+    /// Children in render order: the shadow subtree's children when `id` is a
+    /// shadow host, otherwise its plain children.
+    ///
+    /// The host's light children — including the `#shadow-root` node itself —
+    /// are skipped for hosts; a shadow root's own children render normally.
+    /// Light-DOM views (JS `children`/`childNodes`, DOM APIs) instead hide
+    /// `#shadow-root`; layout uses this method to see shadow content.
+    pub fn render_children(&self, id: NodeId) -> &[NodeId] {
+        match self.shadow_root(&id) {
+            Some(root) => &self.nodes[root.slot() as usize].children,
+            None => &self.nodes[id.slot() as usize].children,
+        }
     }
 
     pub fn tag(&self, id: NodeId) -> Option<&str> {
@@ -467,7 +658,37 @@ impl Dom {
     }
 
     /// Visit every node reachable from the root in pre-order. Trash is unreachable.
+    ///
+    /// Pre-order DFS over the packed sibling links with a small explicit stack.
+    /// Only one continuation per depth is held, so the stack never grows with
+    /// sibling count — a 10k-child flat tree keeps it at a single entry.
     pub fn walk(&self, mut f: impl FnMut(NodeId, &Node)) {
+        self.debug_assert_handle(self.root_id);
+        f(self.root_id, self.get(self.root_id));
+        let mut stack = Vec::with_capacity(64);
+        if let Some(first) = self.first_child[self.root_id.slot() as usize] {
+            stack.push(first);
+        }
+        while let Some(id) = stack.pop() {
+            self.debug_assert_handle(id);
+            let node = self.get(id);
+            f(id, node);
+            let slot = id.slot() as usize;
+            // LIFO: push the sibling first so the child (and its subtree) is
+            // visited before it, preserving the frozen append-order walk.
+            if let Some(sib) = self.next_sibling[slot] {
+                stack.push(sib);
+            }
+            if let Some(child) = self.first_child[slot] {
+                stack.push(child);
+            }
+        }
+    }
+
+    /// Original recursive traversal, kept only so the micro-bench can A/B the
+    /// two walk strategies in one process (no cross-run machine drift).
+    #[cfg(test)]
+    fn walk_baseline(&self, mut f: impl FnMut(NodeId, &Node)) {
         fn visit(dom: &Dom, id: NodeId, f: &mut impl FnMut(NodeId, &Node)) {
             dom.debug_assert_handle(id);
             let node = dom.get(id);
@@ -496,6 +717,10 @@ impl Dom {
         // The trash root is an internal node, never a valid external handle.
         self.trashed.push(true);
         self.str_meta.push(StrMeta::default());
+        self.shadow_roots.push(None);
+        self.parents.push(self.root_id);
+        self.first_child.push(None);
+        self.next_sibling.push(None);
         let id = NodeId::encode(slot, 0);
         self.detached = Some(id);
         id
@@ -513,6 +738,19 @@ impl Dom {
         debug_assert!(
             slot < self.str_meta.len(),
             "interner side table out of sync"
+        );
+        debug_assert!(
+            slot < self.shadow_roots.len(),
+            "shadow side table out of sync"
+        );
+        debug_assert!(slot < self.parents.len(), "parent array out of sync");
+        debug_assert!(
+            slot < self.first_child.len(),
+            "first_child array out of sync"
+        );
+        debug_assert!(
+            slot < self.next_sibling.len(),
+            "next_sibling array out of sync"
         );
         debug_assert!(!self.trashed[slot], "trash node reached from the live tree");
         debug_assert_eq!(
@@ -1025,6 +1263,478 @@ mod tests {
             _ => panic!("expected element"),
         }
         assert_eq!(dom.interner_len(), 0);
+    }
+
+    // ---- Shadow DOM --------------------------------------------------------
+
+    #[test]
+    fn attach_shadow_creates_parented_root_and_is_idempotent() {
+        run_both(|mut dom| {
+            let host = elem(&mut dom, "my-widget");
+            dom.append(dom.root(), host);
+            assert_eq!(dom.shadow_root(&host), None);
+
+            let root = dom.attach_shadow(host).expect("first attach succeeds");
+            assert!(dom.validate(root));
+            assert_eq!(dom.tag(root), Some(SHADOW_ROOT_TAG));
+            assert_eq!(dom.parent(root), Some(host), "root parented under its host");
+            assert!(
+                dom.children(host).contains(&root),
+                "host light children include the shadow-root node"
+            );
+            assert_eq!(dom.shadow_root(&host), Some(root));
+            assert_eq!(dom.host(&root), Some(host));
+            assert_eq!(dom.host(&host), None, "a host is not itself a shadow root");
+
+            assert_eq!(dom.attach_shadow(host), None, "second attach returns None");
+            assert_eq!(dom.shadow_root(&host), Some(root), "root is unchanged");
+        });
+    }
+
+    #[test]
+    fn shadow_host_root_roundtrip_and_invalid_inputs() {
+        run_both(|mut dom| {
+            let host = elem(&mut dom, "host");
+            dom.append(dom.root(), host);
+            let root = dom.attach_shadow(host).unwrap();
+            assert_eq!(dom.shadow_root(&host), Some(root));
+            assert_eq!(dom.host(&root), Some(host));
+            assert_eq!(
+                dom.shadow_root(&root),
+                None,
+                "a shadow root has no shadow root"
+            );
+            assert_eq!(dom.host(&host), None);
+            assert_eq!(dom.shadow_root(&dom.root()), None);
+            assert_eq!(dom.attach_shadow(NodeId(u32::MAX)), None, "invalid host");
+            assert_eq!(dom.host(&NodeId(u32::MAX)), None, "invalid root handle");
+        });
+    }
+
+    #[test]
+    fn render_children_prefers_shadow_content_and_walk_reaches_it() {
+        run_both(|mut dom| {
+            let host = elem(&mut dom, "my-widget");
+            let light = dom.create(NodeKind::Text("light".into()));
+            dom.append(dom.root(), host);
+            dom.append(host, light);
+
+            let root = dom.attach_shadow(host).unwrap();
+            let shadow_child = elem(&mut dom, "shadow-child");
+            let shadow_text = dom.create(NodeKind::Text("shadow text".into()));
+            dom.append(root, shadow_child);
+            dom.append(root, shadow_text);
+
+            // Host renders the shadow subtree's children: light children and the
+            // #shadow-root node itself are skipped.
+            assert_eq!(dom.render_children(host), &[shadow_child, shadow_text]);
+            assert_eq!(
+                dom.children(host),
+                &[light, root],
+                "plain children unchanged"
+            );
+            // Non-hosts, including the root and its children, render plainly.
+            assert_eq!(dom.render_children(root), &[shadow_child, shadow_text]);
+            assert_eq!(
+                dom.render_children(shadow_child),
+                dom.children(shadow_child)
+            );
+            assert_eq!(dom.render_children(light), dom.children(light));
+
+            // The trick's payoff: walk() sees shadow content because the root is
+            // parented under host.
+            let mut tags = Vec::new();
+            let mut texts = Vec::new();
+            dom.walk(|id, _| {
+                if let Some(t) = dom.tag(id) {
+                    tags.push(t.to_string());
+                }
+                if let Some(t) = dom.text(id) {
+                    texts.push(t.to_string());
+                }
+            });
+            assert!(tags.contains(&SHADOW_ROOT_TAG.to_string()));
+            assert!(tags.contains(&"shadow-child".to_string()));
+            assert!(texts.contains(&"shadow text".to_string()));
+            assert!(texts.contains(&"light".to_string()));
+        });
+    }
+
+    #[test]
+    fn shadow_slot_reuse_after_trash_keeps_side_table_consistent() {
+        run_both(|mut dom| {
+            let host = elem(&mut dom, "host");
+            dom.append(dom.root(), host);
+            let root = dom.attach_shadow(host).unwrap();
+            assert_eq!(dom.shadow_root(&host), Some(root));
+
+            dom.detach_subtree(root);
+            assert!(!dom.validate(root));
+
+            let reused = elem(&mut dom, "reused");
+            assert_eq!(reused.slot(), root.slot(), "create reuses the trashed slot");
+            assert_eq!(
+                dom.shadow_root(&reused),
+                None,
+                "reused slot must not inherit a stale shadow root"
+            );
+            assert_eq!(dom.host(&reused), None);
+            assert_eq!(dom.tag(reused), Some("reused"));
+        });
+    }
+
+    #[test]
+    fn shadow_fixture_is_identical_in_both_storage_modes() {
+        fn snapshot(
+            dom: &Dom,
+            host: NodeId,
+            root: NodeId,
+            child: NodeId,
+            text: NodeId,
+        ) -> Vec<String> {
+            let mut out = vec![
+                dom.tag(host).unwrap_or("").to_string(),
+                dom.tag(root).unwrap_or("").to_string(),
+                dom.tag(child).unwrap_or("").to_string(),
+                dom.attr(child, "class").unwrap_or("").to_string(),
+                dom.text(text).unwrap_or("").to_string(),
+            ];
+            out.extend(
+                dom.render_children(host)
+                    .iter()
+                    .map(|&id| dom.tag(id).unwrap_or("").to_string()),
+            );
+            out
+        }
+        fn build(intern: bool) -> (Dom, NodeId, NodeId, NodeId, NodeId) {
+            let mut dom = if intern {
+                Dom::with_interning()
+            } else {
+                Dom::new()
+            };
+            let host = elem(&mut dom, "host");
+            dom.append(dom.root(), host);
+            let root = dom.attach_shadow(host).unwrap();
+            let child = elem(&mut dom, "item");
+            dom.set_attr(child, "class", "x".into());
+            let text = dom.create(NodeKind::Text("shadow".into()));
+            dom.append(root, child);
+            dom.append(child, text);
+            (dom, host, root, child, text)
+        }
+        let (plain, h1, r1, c1, t1) = build(false);
+        let (interned, h2, r2, c2, t2) = build(true);
+        assert_eq!(
+            snapshot(&plain, h1, r1, c1, t1),
+            snapshot(&interned, h2, r2, c2, t2)
+        );
+    }
+
+    // ---- Packed-relation cache invariants ----------------------------------
+
+    /// Walk the packed sibling chain directly; must always equal `children()`.
+    fn cached_chain(dom: &Dom, id: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut cur = dom.first_child[id.slot() as usize];
+        while let Some(c) = cur {
+            out.push(c);
+            cur = dom.next_sibling[c.slot() as usize];
+        }
+        out
+    }
+
+    fn assert_cache_matches_children(dom: &Dom) {
+        for slot in 0..dom.len() {
+            if dom.trashed[slot] {
+                continue; // trash is unreachable and intentionally not chained
+            }
+            let id = NodeId::encode(slot as u32, dom.generations[slot]);
+            assert_eq!(
+                cached_chain(dom, id),
+                dom.children(id),
+                "packed sibling chain diverged from children() at slot {slot}"
+            );
+        }
+    }
+
+    /// Release-real packed-cache check. The `debug_assert_eq!` in `link_child`
+    /// / `remove_child` is compiled out in release; this uses `assert_eq!` so it
+    /// still fails fast under `cargo test --release`. Trashed slots are skipped
+    /// (their packed links are stale by design, see the `parents` invariant).
+    fn assert_packed_consistent(dom: &Dom) {
+        for slot in 0..dom.len() {
+            if dom.trashed[slot] {
+                continue;
+            }
+            let id = NodeId::encode(slot as u32, dom.generations[slot]);
+            assert_eq!(
+                cached_chain(dom, id),
+                dom.children(id),
+                "packed sibling chain diverged from children() at slot {slot}"
+            );
+            let expected = dom.nodes[slot].parent.unwrap_or(dom.root_id);
+            assert_eq!(
+                dom.parents[slot], expected,
+                "packed parent diverged from source parent at slot {slot}"
+            );
+        }
+    }
+
+    #[test]
+    fn soa_cache_tracks_children_through_reparent_detach_and_reuse() {
+        run_both(|mut dom| {
+            let a = elem(&mut dom, "a");
+            let b = elem(&mut dom, "b");
+            let c = elem(&mut dom, "c");
+            let d = elem(&mut dom, "d");
+            dom.append(dom.root(), a);
+            dom.append(dom.root(), b);
+            dom.append(a, c);
+            assert_cache_matches_children(&dom);
+
+            dom.append(b, c); // reparent: unlink from a, append under b
+            assert_cache_matches_children(&dom);
+            dom.append(b, c); // no-op re-append must not duplicate
+            assert_cache_matches_children(&dom);
+            dom.append(b, d);
+            assert_cache_matches_children(&dom);
+
+            dom.detach_subtree(b); // unlink b (and its subtree) from the root
+            assert_cache_matches_children(&dom);
+
+            let reused = elem(&mut dom, "reused"); // reuses a trashed slot
+            dom.append(a, reused);
+            assert_cache_matches_children(&dom);
+            assert_eq!(dom.children(a), &[reused]);
+        });
+    }
+
+    // ---- Release-real packed-consistency regression coverage ---------------
+
+    #[test]
+    fn packed_consistency_interleaved_append_remove_release() {
+        run_both(|mut dom| {
+            let a = elem(&mut dom, "a");
+            let b = elem(&mut dom, "b");
+            let c = elem(&mut dom, "c");
+            dom.append(dom.root(), a);
+            dom.append(dom.root(), b);
+            dom.append(dom.root(), c);
+            assert_eq!(dom.children(dom.root()), &[a, b, c]);
+
+            dom.detach_subtree(b); // remove the middle child
+            assert_eq!(dom.children(dom.root()), &[a, c]);
+            assert_packed_consistent(&dom);
+            assert_cache_matches_children(&dom);
+
+            let d = elem(&mut dom, "d"); // reuses b's slot
+            dom.append(dom.root(), d);
+            assert_eq!(dom.children(dom.root()), &[a, c, d]);
+            assert_packed_consistent(&dom);
+            assert_cache_matches_children(&dom);
+        });
+    }
+
+    #[test]
+    fn packed_consistency_detach_reuse_attach_shadow_release() {
+        run_both(|mut dom| {
+            let host = elem(&mut dom, "host");
+            dom.append(dom.root(), host);
+            dom.detach_subtree(host);
+
+            let reused = elem(&mut dom, "reused");
+            assert_eq!(reused.slot(), host.slot(), "create reuses the trashed slot");
+            dom.append(dom.root(), reused);
+
+            let shadow = dom
+                .attach_shadow(reused)
+                .expect("shadow attaches on a reused slot");
+            assert!(dom.validate(shadow));
+            assert_eq!(dom.parent(shadow), Some(reused));
+            assert_eq!(dom.children(reused), &[shadow]);
+            assert_packed_consistent(&dom);
+            assert_cache_matches_children(&dom);
+
+            let mut visited = Vec::new();
+            dom.walk(|id, _| visited.push(id));
+            assert_eq!(visited, vec![dom.root(), reused, shadow]);
+            assert_packed_consistent(&dom);
+        });
+    }
+
+    #[test]
+    fn packed_consistency_deep_chain_three_splices_release() {
+        run_both(|mut dom| {
+            const DEPTH: usize = 100;
+            let chain: Vec<NodeId> = (0..DEPTH)
+                .map(|i| elem(&mut dom, &format!("n{i}")))
+                .collect();
+            let mut parent = dom.root();
+            for &id in &chain {
+                dom.append(parent, id);
+                parent = id;
+            }
+            assert_packed_consistent(&dom);
+
+            // Splice three middle levels out at different depths: re-parent the
+            // child under the grandparent, then re-home the removed level under
+            // the root so every node stays live and generation-checked.
+            for &depth in &[30usize, 60, 90] {
+                let grandparent = chain[depth - 2];
+                let removed = chain[depth - 1];
+                let child = chain[depth];
+                dom.append(grandparent, child);
+                dom.append(dom.root(), removed);
+                assert_packed_consistent(&dom);
+                assert_cache_matches_children(&dom);
+            }
+
+            let spliced = [chain[29], chain[59], chain[89]];
+            let expected: Vec<NodeId> = chain
+                .iter()
+                .copied()
+                .filter(|id| !spliced.contains(id))
+                .collect();
+            let mut actual = Vec::new();
+            let mut cursor = Some(chain[0]);
+            while let Some(id) = cursor {
+                actual.push(id);
+                cursor = dom.children(id).first().copied();
+            }
+            assert_eq!(actual, expected, "main chain must skip the spliced levels");
+            assert_eq!(
+                dom.children(chain[28]),
+                &[chain[30]],
+                "packed order must skip the removed depth-30 level"
+            );
+            assert_packed_consistent(&dom);
+            assert_cache_matches_children(&dom);
+        });
+    }
+
+    // ---- Micro bench: 10k-node walk + child iteration ----------------------
+
+    /// Deterministic parser-shaped tree: 10k elements, each node (bar the
+    /// first few levels) with up to `branch` sequentially-created children.
+    fn build_bench_tree(n: usize, branch: usize) -> (Dom, Vec<NodeId>) {
+        let mut dom = Dom::new();
+        let ids: Vec<NodeId> = (0..n).map(|_| elem(&mut dom, "n")).collect();
+        for i in 0..n {
+            let parent = if i == 0 {
+                dom.root()
+            } else {
+                ids[(i - 1) / branch]
+            };
+            dom.append(parent, ids[i]);
+        }
+        (dom, ids)
+    }
+
+    /// Build `n` siblings under one parent and time only the append phase.
+    /// Node creation is excluded so the measurement isolates mutation cost.
+    /// Best of 5 keeps the ~1ms release timings from being scheduler noise.
+    fn build_flat_tree(n: usize) -> u128 {
+        let mut best = u128::MAX;
+        for _ in 0..5 {
+            let mut dom = Dom::new();
+            let root = dom.root();
+            let ids: Vec<NodeId> = (0..n).map(|_| elem(&mut dom, "n")).collect();
+            let t = Instant::now();
+            for id in ids {
+                dom.append(root, id);
+            }
+            best = best.min(t.elapsed().as_nanos());
+            assert_eq!(dom.children(root).len(), n);
+            assert_eq!(dom.len(), n + 1);
+        }
+        best
+    }
+
+    /// Regression guard for the sampled debug chain check: a wide-tree build
+    /// must stay near-linear. The old per-op `chain_len` walk was O(n²), so the
+    /// 100k/50k append-time ratio was ~4x; with sampling it must be ~2x.
+    #[test]
+    fn perf_wide_tree_build_is_linear() {
+        let _ = build_flat_tree(1_000); // warm up allocator and code paths
+        let t50 = build_flat_tree(50_000);
+        let t100 = build_flat_tree(100_000);
+        let ratio = t100 as f64 / t50.max(1) as f64;
+        println!(
+            "wide build: 50k {t50} ns, 100k {t100} ns, ratio {ratio:.2}x (linear ~2x, O(n²) ~4x)"
+        );
+        // Generous slack for noise; the O(n²) baseline measured 4.01x in debug.
+        assert!(
+            ratio < 3.0,
+            "100k/50k build ratio {ratio:.2}x suggests superlinear chain checks"
+        );
+        // Absolute budget also catches the old 31s debug build directly.
+        assert!(
+            t100 < 5_000_000_000,
+            "100k build took {} ms",
+            t100 / 1_000_000
+        );
+    }
+
+    /// One op = one full `walk` + one full pass over every node's `children()`.
+    /// Both the original recursive walk and the current walk are timed in one
+    /// process (best of 7 release-mode runs each), so the ratio is honest.
+    #[test]
+    fn perf_dom_walk_and_children() {
+        const N: usize = 10_000;
+        const BRANCH: usize = 8;
+        const REPS: u32 = 200;
+        let (dom, ids) = build_bench_tree(N, BRANCH);
+        assert_eq!(dom.len(), N + 1);
+
+        fn bench(dom: &Dom, ids: &[NodeId], baseline: bool, sink: &mut usize) -> u128 {
+            let mut best = u128::MAX;
+            for _ in 0..7 {
+                let t = Instant::now();
+                let mut local = 0usize;
+                for _ in 0..REPS {
+                    if baseline {
+                        dom.walk_baseline(|id, _| local += id.slot() as usize);
+                    } else {
+                        dom.walk(|id, _| local += id.slot() as usize);
+                    }
+                    for &id in ids {
+                        local += dom.children(id).len();
+                    }
+                }
+                best = best.min(t.elapsed().as_nanos());
+                *sink += local;
+            }
+            best / REPS as u128
+        }
+
+        let mut sink = 0usize;
+        // Interleave warmup and two A/B rounds to cancel drift.
+        for _ in 0..10 {
+            dom.walk_baseline(|id, _| sink += id.slot() as usize);
+            dom.walk(|id, _| sink += id.slot() as usize);
+        }
+        let base_a = bench(&dom, &ids, true, &mut sink);
+        let new_a = bench(&dom, &ids, false, &mut sink);
+        let new_b = bench(&dom, &ids, false, &mut sink);
+        let base_b = bench(&dom, &ids, true, &mut sink);
+        let base = base_a.min(base_b);
+        let new = new_a.min(new_b);
+        println!(
+            "DOM bench: {} nodes (branch {}), {} ops: baseline {} ns/op, current {} ns/op, {:.1}% change",
+            N,
+            BRANCH,
+            REPS,
+            base,
+            new,
+            (new as f64 / base as f64 - 1.0) * 100.0
+        );
+        assert!(sink > 0, "bench must do real work");
+        // The two walks must visit exactly the same set of nodes.
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        dom.walk_baseline(|id, _| a.push(id));
+        dom.walk(|id, _| b.push(id));
+        assert_eq!(a, b, "walk strategies must agree on order and membership");
     }
 
     // ---- Micro A/B ---------------------------------------------------------

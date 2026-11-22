@@ -48,7 +48,7 @@ fn control_kind(dom: &Dom, id: NodeId) -> Option<ControlKind> {
 /// Concatenated text children, used for `<button>` and `<textarea>` values.
 fn text_content(dom: &Dom, id: NodeId) -> String {
     let mut out = String::new();
-    for &child in dom.children(id) {
+    for &child in dom.render_children(id) {
         if let Some(text) = dom.text(child) {
             out.push_str(text);
         }
@@ -59,7 +59,7 @@ fn text_content(dom: &Dom, id: NodeId) -> String {
 /// Wave 1: the first `selected` option's label, else the first option's label.
 fn select_label(dom: &Dom, id: NodeId) -> String {
     let mut first = None;
-    for &child in dom.children(id) {
+    for &child in dom.render_children(id) {
         if !dom
             .tag(child)
             .is_some_and(|tag| tag.eq_ignore_ascii_case("option"))

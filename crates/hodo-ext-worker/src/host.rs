@@ -18,6 +18,26 @@ use serde_json::{json, Value};
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 const WIRE_MARKER: u64 = 1;
 
+/// A single log line never approaches the 1 MiB IPC frame cap. Truncating here
+/// keeps a script (or a broker-supplied debug line) from asserting in `encode`.
+pub const MAX_LOG_LINE_BYTES: usize = 64 * 1024;
+const LOG_ELISION: &str = "... [truncated]";
+
+/// Truncate oversized log lines at a UTF-8 boundary, with an elision marker.
+pub fn truncate_log_line(line: &str) -> String {
+    if line.len() <= MAX_LOG_LINE_BYTES {
+        return line.to_string();
+    }
+    let mut keep = MAX_LOG_LINE_BYTES.saturating_sub(LOG_ELISION.len());
+    while keep > 0 && !line.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    let mut out = String::with_capacity(keep + LOG_ELISION.len());
+    out.push_str(&line[..keep]);
+    out.push_str(LOG_ELISION);
+    out
+}
+
 /// JS → Rust call registration emitted by the `__hodoPost` shim below.
 #[derive(Debug, Deserialize)]
 struct WireRegistration {
@@ -164,13 +184,14 @@ impl WorkerHost {
         self.runtime.fire_event(name, payload);
     }
 
-    /// Send a diagnostic line through the broker's log channel.
+    /// Send a diagnostic line through the broker's log channel. Oversized
+    /// lines are elided so the `__hodo_log` frame always fits its IPC cap.
     pub fn log(&self, line: String) {
         write_frame(
             &self.out,
             &Message::Event {
                 name: "__hodo_log".to_string(),
-                payload: json!({ "message": line }),
+                payload: json!({ "message": truncate_log_line(&line) }),
             },
         );
     }
@@ -276,6 +297,25 @@ mod tests {
         assert!(!state.insert(0, Vec::new()));
         assert!(!state.insert(1, Vec::new()));
         assert!(!state.insert(MAX_OUTSTANDING_CALLS as u64 + 1, Vec::new()));
+    }
+
+    #[test]
+    fn oversized_log_line_is_truncated_with_an_elision_marker() {
+        let short = truncate_log_line("hello");
+        assert_eq!(short, "hello");
+
+        let long = "x".repeat(MAX_LOG_LINE_BYTES * 2);
+        let truncated = truncate_log_line(&long);
+        assert_eq!(truncated.len(), MAX_LOG_LINE_BYTES);
+        assert!(truncated.ends_with(LOG_ELISION));
+        assert!(truncated.starts_with("xxxx"));
+
+        // Multi-byte text must not be cut in the middle of a character.
+        let unicode = "é".repeat(MAX_LOG_LINE_BYTES);
+        let truncated = truncate_log_line(&unicode);
+        assert!(truncated.len() <= MAX_LOG_LINE_BYTES);
+        assert!(truncated.is_char_boundary(truncated.len() - LOG_ELISION.len()));
+        assert!(truncated.ends_with(LOG_ELISION));
     }
 
     #[test]

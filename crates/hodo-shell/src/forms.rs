@@ -47,6 +47,9 @@ impl ControlState {
 /// Metadata that layout does not carry in `DisplayItem::Control`.
 #[derive(Debug, Clone, Default)]
 struct ControlMeta {
+    /// Owning arena node; layout emits shadow controls in a different order
+    /// than `Dom::walk`, so pairing by position drifts.
+    node: Option<NodeId>,
     name: String,
     checked: bool,
     submit: bool,
@@ -71,7 +74,7 @@ fn byte_at(value: &str, caret: usize) -> usize {
 impl ControlRegistry {
     fn from_list(list: &DisplayList, meta: &[ControlMeta], action: &str, method: &str) -> Self {
         let mut controls = Vec::new();
-        for item in &list.items {
+        for (item_index, item) in list.items.iter().enumerate() {
             let DisplayItem::Control {
                 rect,
                 kind,
@@ -84,7 +87,10 @@ impl ControlRegistry {
             else {
                 continue;
             };
-            let extra = meta.get(controls.len());
+            let owner = list.node_map.get(item_index).copied();
+            let extra = owner
+                .and_then(|node| meta.iter().find(|m| m.node == Some(node)))
+                .or_else(|| meta.get(controls.len()));
             controls.push(ControlState {
                 rect: *rect,
                 kind: *kind,
@@ -318,6 +324,7 @@ fn collect_meta(dom: &Dom) -> Vec<ControlMeta> {
         }
         let ty = dom.attr(id, "type").unwrap_or("");
         out.push(ControlMeta {
+            node: Some(id),
             name: dom
                 .attr(id, "name")
                 .filter(|name| !name.is_empty())
@@ -633,6 +640,41 @@ mod tests {
             "/submit",
             "get",
         )
+    }
+
+    #[test]
+    fn control_meta_pairs_by_node_across_light_and_shadow_order() {
+        let light = NodeId(11);
+        let shadow = NodeId(22);
+        // Layout emits the shadow control first; Dom::walk collects the light
+        // one first. Positional pairing would swap their names/checked state.
+        let list = DisplayList {
+            items: vec![
+                control(ControlKind::TextInput, "", "", rect(0.0)),
+                control(ControlKind::TextInput, "", "", rect(30.0)),
+            ],
+            node_map: vec![shadow, light],
+            fixed_items: Vec::new(),
+            fixed_node_map: Vec::new(),
+        };
+        let meta = vec![
+            ControlMeta {
+                node: Some(light),
+                name: "light".into(),
+                ..Default::default()
+            },
+            ControlMeta {
+                node: Some(shadow),
+                name: "shadow".into(),
+                checked: true,
+                ..Default::default()
+            },
+        ];
+        let reg = ControlRegistry::from_list(&list, &meta, "", "get");
+        assert_eq!(reg.controls[0].name, "shadow");
+        assert!(reg.controls[0].checked);
+        assert_eq!(reg.controls[1].name, "light");
+        assert!(!reg.controls[1].checked);
     }
 
     #[test]

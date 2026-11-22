@@ -1,0 +1,1 @@
+import{f as e}from"./index-NFRVgqV2.js";import{t}from"./format-number-rdMiVR61.js";function n(n,r){return(new Intl.PluralRules(e()).select(n)===`one`?r.one:r.other)(t(n))}export{n as t};

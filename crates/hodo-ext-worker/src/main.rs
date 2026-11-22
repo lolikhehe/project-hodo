@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use hodo_ext_api::{ApiDialect, RuntimeConfig};
 use hodo_ext_ipc::{encode, FrameReader, Message};
-use host::WorkerHost;
+use host::{truncate_log_line, WorkerHost};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
@@ -87,7 +87,13 @@ fn run() {
     };
 
     let out: Out = Rc::new(RefCell::new(io::stdout()));
-    let log = |line: String| write_event(&out, "__hodo_log", json!({ "message": line }));
+    let log = |line: String| {
+        write_event(
+            &out,
+            "__hodo_log",
+            json!({ "message": truncate_log_line(&line) }),
+        );
+    };
 
     if let Err(err) = sandbox::apply(log) {
         eprintln!("hodo-ext-worker: {err}");

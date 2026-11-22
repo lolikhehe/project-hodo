@@ -14,14 +14,15 @@
 //! is independent of thread scheduling.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use hodo_css::{
-    cascade_layer, complex, declaration_value, is_compound, is_important, matches_selector_ref,
-    parse_style_attribute, parse_stylesheet, resolve_custom_properties, specificity_ref,
-    substitute_vars, AncestorBloom, Compound, Declaration, MatchContext, PseudoClass, RuleIndex,
-    StyleRule, Stylesheet, LAYER_MARKER,
+    cascade_layer_name, complex, declaration_value, is_compound, is_important, matches_compiled,
+    matches_plain, matches_selector_ref, parse_style_attribute, parse_stylesheet, resolve_calc_now,
+    resolve_calc_with_basis, resolve_custom_properties, substitute_vars, AncestorBloom, Compound,
+    Declaration, MatchContext, PseudoClass, RuleIndex, StyleRule, Stylesheet, LAYER_MARKER,
+    LAYER_NAME_MARKER,
 };
 use hodo_dom::{Dom, NodeId, NodeKind};
 use hodo_types::{Color, Edges, Size};
@@ -268,9 +269,118 @@ pub struct ComputedStyle {
     pub max_size: Size,
 }
 
+/// How a computed-style change propagates to the rendering pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StyleChangeClass {
+    /// Only painted pixels change; geometry is untouched, so a repaint suffices.
+    PaintOnly,
+    /// Geometry, flow or text advance width changed; a relayout is required.
+    LayoutAffecting,
+}
+
+/// Classify the difference between two computed styles across every field of
+/// [`ComputedStyle`].
+///
+/// # Classification table (53 fields)
+///
+/// | Class | Fields |
+/// |---|---|
+/// | `PaintOnly` | `color`, `background`, `border_color`, `underline`, `line_through` |
+/// | `LayoutAffecting` | all 48 remaining fields: `display`, `font_size`, `font_weight`, `font_family`, `italic`, `margin`, `padding`, `border_width`, `border_widths`, `flex_direction`, `flex_wrap`, `justify_content`, `align_items`, `align_self`, `gap`, `flex_grow`, `flex_shrink`, `flex_basis`, `order`, `grid_template_columns`, `grid_template_rows`, `grid_column`, `grid_row`, `column_gap`, `row_gap`, `table_layout`, `border_collapse`, `border_spacing`, `line_height`, `vertical_align`, `text_align`, `text_indent`, `letter_spacing`, `word_spacing`, `white_space`, `overflow_wrap`, `position`, `float`, `clear`, `overflow`, `offsets`, `width`, `width_percent`, `margin_percent`, `padding_percent`, `height`, `min_size`, `max_size` |
+///
+/// Font-family / weight / italic are deliberately `LayoutAffecting`: font
+/// metrics decide glyph advance widths and baselines, so a change can reflow
+/// text even though the built-in layout font currently ignores the stack.
+/// No-change is reported as `PaintOnly` (a repaint is always safe, a relayout
+/// is not needed). NaN values compare unequal and are conservatively treated
+/// as a layout change.
+///
+/// # Integrator seam
+/// `crates/hodo-shell/src/app.rs::recompute_if_changed` currently funnels every
+/// DOM change through `relayout` (which calls `hodo_layout::layout`). Once the
+/// shell retains the previous `StyleMap`, the single call site becomes:
+/// `if style_change_class(&old_style, &new_style) == StyleChangeClass::LayoutAffecting
+/// { relayout(viewport) } else { repaint() }`. This crate does not touch app.rs.
+pub fn style_change_class(old: &ComputedStyle, new: &ComputedStyle) -> StyleChangeClass {
+    macro_rules! any_changed {
+        ($($field:ident),+ $(,)?) => {
+            false $(|| old.$field != new.$field)+
+        };
+    }
+    // `Edges<T>` has no PartialEq in hodo-types, so compare its four sides.
+    macro_rules! edges_changed {
+        ($field:ident) => {
+            old.$field.top != new.$field.top
+                || old.$field.right != new.$field.right
+                || old.$field.bottom != new.$field.bottom
+                || old.$field.left != new.$field.left
+        };
+    }
+    let edges = edges_changed!(margin)
+        || edges_changed!(padding)
+        || edges_changed!(border_widths)
+        || edges_changed!(offsets)
+        || edges_changed!(margin_percent)
+        || edges_changed!(padding_percent);
+    if edges
+        || any_changed!(
+            display,
+            font_size,
+            font_weight,
+            font_family,
+            italic,
+            border_width,
+            flex_direction,
+            flex_wrap,
+            justify_content,
+            align_items,
+            align_self,
+            gap,
+            flex_grow,
+            flex_shrink,
+            flex_basis,
+            order,
+            grid_template_columns,
+            grid_template_rows,
+            grid_column,
+            grid_row,
+            column_gap,
+            row_gap,
+            table_layout,
+            border_collapse,
+            border_spacing,
+            line_height,
+            vertical_align,
+            text_align,
+            text_indent,
+            letter_spacing,
+            word_spacing,
+            white_space,
+            overflow_wrap,
+            position,
+            float,
+            clear,
+            overflow,
+            width,
+            width_percent,
+            height,
+            min_size,
+            max_size,
+        )
+    {
+        StyleChangeClass::LayoutAffecting
+    } else {
+        StyleChangeClass::PaintOnly
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StyleMap {
     styles: Vec<Option<ComputedStyle>>,
+    /// Raw `calc()` text for `width` that contains `%`. Only layout knows the
+    /// containing-block basis, so the expression is carried here verbatim and
+    /// resolved by [`StyleMap::resolve_width_with_basis`].
+    deferred_width: Vec<Option<String>>,
 }
 
 impl StyleMap {
@@ -286,9 +396,33 @@ impl StyleMap {
         self.styles[index] = Some(s);
     }
 
+    /// The deferred percentage `calc()` text for `width`, if any.
+    pub fn deferred_width(&self, id: NodeId) -> Option<&str> {
+        self.deferred_width
+            .get(id.slot() as usize)
+            .and_then(Option::as_deref)
+    }
+
+    /// Resolve a deferred percentage `width` against a containing-block width.
+    /// This is the layout-time seam for `calc(100% - 32px)`: `%` becomes
+    /// `basis / 100`. Returns `None` when the width is not a deferred calc.
+    pub fn resolve_width_with_basis(&self, id: NodeId, basis: f32) -> Option<f32> {
+        self.deferred_width(id)
+            .and_then(|text| resolve_calc_with_basis(text, basis))
+    }
+
+    pub(crate) fn set_deferred_width(&mut self, id: NodeId, text: Option<String>) {
+        let index = id.slot() as usize;
+        if self.deferred_width.len() <= index {
+            self.deferred_width.resize(index + 1, None);
+        }
+        self.deferred_width[index] = text;
+    }
+
     pub fn with_len(len: usize) -> Self {
         Self {
             styles: vec![None; len],
+            deferred_width: vec![None; len],
         }
     }
 }
@@ -339,14 +473,56 @@ pub fn ua_stylesheet() -> &'static str {
 static UA_SHEET: std::sync::OnceLock<Stylesheet> = std::sync::OnceLock::new();
 
 pub fn compute_styles(dom: &Dom, sheets: &[Stylesheet]) -> StyleMap {
+    compute_styles_with_visited(dom, sheets, &HashSet::new())
+}
+
+/// Like [`compute_styles`], but seeds `:visited` matching with the given hrefs.
+/// The shell should pass its redirect-visited-set so visited links stop being
+/// styled as `:link`.
+pub fn compute_styles_with_visited(
+    dom: &Dom,
+    sheets: &[Stylesheet],
+    visited: &HashSet<String>,
+) -> StyleMap {
     let ua = UA_SHEET.get_or_init(|| parse_stylesheet(ua_stylesheet()));
-    compute_styles_parsed(dom, sheets, ua, true)
+    compute_styles_parsed(dom, sheets, ua, true, visited)
+}
+
+/// The resolved GLOBAL cascade-layer order across all author sheets: first
+/// occurrence of a dotted layer name wins, so `@layer a` in a later sheet merges
+/// into the `a` established by an earlier sheet instead of restarting at rank 0.
+/// Unlayered rules are not listed (they always outrank layered normal rules).
+pub fn resolved_layer_order(sheets: &[Stylesheet]) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    for sheet in sheets {
+        // A sheet's per-sheet ranks establish statement-form order; sort by
+        // them before folding names into the global list.
+        let mut by_rank: BTreeMap<u32, &str> = BTreeMap::new();
+        for rule in &sheet.rules {
+            if let Some(name) = cascade_layer_name(rule) {
+                // Per-sheet rank lives in the companion marker.
+                let rank = rule
+                    .declarations
+                    .iter()
+                    .find(|d| d.property == LAYER_MARKER)
+                    .and_then(|d| d.value.parse().ok())
+                    .unwrap_or(u32::MAX);
+                by_rank.entry(rank).or_insert(name);
+            }
+        }
+        for (_, name) in by_rank {
+            if !order.iter().any(|existing| existing == name) {
+                order.push(name.to_string());
+            }
+        }
+    }
+    order
 }
 
 #[cfg(test)]
 fn compute_styles_inner(dom: &Dom, sheets: &[Stylesheet], ua_css: &str) -> StyleMap {
     let ua = parse_stylesheet(ua_css);
-    compute_styles_parsed(dom, sheets, &ua, true)
+    compute_styles_parsed(dom, sheets, &ua, true, &HashSet::new())
 }
 
 /// Same resolution as `compute_styles`, but with style sharing turned off.
@@ -354,7 +530,7 @@ fn compute_styles_inner(dom: &Dom, sheets: &[Stylesheet], ua_css: &str) -> Style
 #[cfg(test)]
 fn compute_styles_uncached(dom: &Dom, sheets: &[Stylesheet]) -> StyleMap {
     let ua = UA_SHEET.get_or_init(|| parse_stylesheet(ua_stylesheet()));
-    compute_styles_parsed(dom, sheets, ua, false)
+    compute_styles_parsed(dom, sheets, ua, false, &HashSet::new())
 }
 
 fn compute_styles_parsed(
@@ -362,8 +538,9 @@ fn compute_styles_parsed(
     sheets: &[Stylesheet],
     ua: &Stylesheet,
     use_cache: bool,
+    visited: &HashSet<String>,
 ) -> StyleMap {
-    compute_styles_tracked(dom, sheets, ua, use_cache).0
+    compute_styles_tracked(dom, sheets, ua, use_cache, visited).0
 }
 
 /// One matched-rule-id list per arena slot: candidate indices into the ordered
@@ -392,23 +569,44 @@ fn match_thread_count(element_count: usize) -> usize {
 /// and `dom.children(parent)` — per-element-local reads of an immutable `Dom`,
 /// with no cross-element state. The ancestor Bloom is passed in precomputed,
 /// so every chunk is independent.
+#[allow(clippy::too_many_arguments)]
 fn match_one(
     dom: &Dom,
     ordered: &[OrderedRule<'_>],
     index: &RuleIndex,
+    use_index: bool,
     bloom: AncestorBloom,
     id: NodeId,
     candidates: &mut Vec<usize>,
+    ctx: &mut MatchContext,
 ) -> Vec<usize> {
-    let mut ctx = MatchContext::new();
     ctx.ancestors = bloom;
-    index.candidates(dom, id, candidates);
+    if use_index {
+        index.candidates(dom, id, candidates);
+    } else {
+        // `HODO_NO_RULE_INDEX=1`: every rule is a candidate, matched through
+        // the same generic entry the A/B corpus uses as its brute-force oracle.
+        candidates.clear();
+        candidates.extend(0..ordered.len());
+    }
     let mut matched = Vec::new();
     for &candidate in candidates.iter() {
         let Some(&(_, _, rule, _)) = ordered.get(candidate) else {
             continue;
         };
-        if matches_selector_ref(&rule.selector, dom, id, &mut ctx) {
+        // Fast path: plain compounds are plain tag/#id/.class tests with no
+        // allocations and no ancestor-Bloom / sibling-cache consult. Non-plain
+        // rules reuse the chain decoded once at index-build time instead of
+        // re-decoding the CHAIN_PREFIX payload for every element.
+        let is_match = if !use_index {
+            matches_selector_ref(&rule.selector, dom, id, &mut *ctx)
+        } else {
+            match index.chain(candidate) {
+                Some(chain) => matches_compiled(chain, dom, id, &mut *ctx),
+                None => matches_plain(&rule.selector, dom, id),
+            }
+        };
+        if is_match {
             matched.push(candidate);
         }
     }
@@ -441,8 +639,10 @@ fn match_all(
     dom: &Dom,
     ordered: &[OrderedRule<'_>],
     index: &RuleIndex,
+    use_index: bool,
     needs_bloom: bool,
     threads: usize,
+    visited: &HashSet<String>,
 ) -> MatchedLists {
     let mut blooms = vec![AncestorBloom::default(); dom.len()];
     let mut elements: Vec<NodeId> = Vec::new();
@@ -470,9 +670,19 @@ fn match_all(
 
     if threads <= 1 {
         let mut candidates = Vec::new();
+        let mut ctx = MatchContext::with_visited(visited.iter().cloned());
         for &id in &elements {
             let slot = id.slot() as usize;
-            matched[slot] = match_one(dom, ordered, index, blooms[slot], id, &mut candidates);
+            matched[slot] = match_one(
+                dom,
+                ordered,
+                index,
+                use_index,
+                blooms[slot],
+                id,
+                &mut candidates,
+                &mut ctx,
+            );
         }
         return matched;
     }
@@ -489,10 +699,19 @@ fn match_all(
             scope.spawn(move || {
                 let base = thread * chunk_size;
                 let mut candidates = Vec::new();
+                let mut ctx = MatchContext::with_visited(visited.iter().cloned());
                 for &id in ids {
                     let slot = id.slot() as usize;
-                    slice[slot - base] =
-                        match_one(dom, ordered, index, blooms[slot], id, &mut candidates);
+                    slice[slot - base] = match_one(
+                        dom,
+                        ordered,
+                        index,
+                        use_index,
+                        blooms[slot],
+                        id,
+                        &mut candidates,
+                        &mut ctx,
+                    );
                 }
             });
         }
@@ -505,8 +724,9 @@ fn compute_styles_tracked(
     sheets: &[Stylesheet],
     ua: &Stylesheet,
     use_cache: bool,
+    visited: &HashSet<String>,
 ) -> (StyleMap, SharingStats) {
-    compute_styles_tracked_with(dom, sheets, ua, use_cache, 0)
+    compute_styles_tracked_with(dom, sheets, ua, use_cache, 0, visited)
 }
 
 /// `threads == 0` selects the policy automatically; tests force a value to
@@ -517,6 +737,23 @@ fn compute_styles_tracked_with(
     ua: &Stylesheet,
     use_cache: bool,
     threads: usize,
+    visited: &HashSet<String>,
+) -> (StyleMap, SharingStats) {
+    // Bench honesty switch: `HODO_NO_RULE_INDEX=1` makes the public entry walk
+    // every rule, matching through the same brute-force path the A/B corpus
+    // uses as its reference. Read once per pass, never per element.
+    let use_index = !std::env::var_os("HODO_NO_RULE_INDEX").is_some_and(|v| v == "1");
+    compute_styles_tracked_with_index(dom, sheets, ua, use_cache, threads, visited, use_index)
+}
+
+fn compute_styles_tracked_with_index(
+    dom: &Dom,
+    sheets: &[Stylesheet],
+    ua: &Stylesheet,
+    use_cache: bool,
+    threads: usize,
+    visited: &HashSet<String>,
+    use_index: bool,
 ) -> (StyleMap, SharingStats) {
     // (origin, source order, rule, layer); origin 0 = UA, 1 = author.
     let mut ordered: Vec<OrderedRule<'_>> = Vec::new();
@@ -525,9 +762,16 @@ fn compute_styles_tracked_with(
         ordered.push((0, order, rule, u32::MAX));
         order += 1;
     }
+    // Resolve one GLOBAL layer order across all sheets before ranking rules.
+    // The per-sheet rank only restores statement-form order inside a sheet;
+    // the dotted name decides the global rank, so a repeated name merges.
+    let global = resolved_layer_order(sheets);
     for sheet in sheets {
         for rule in &sheet.rules {
-            ordered.push((1, order, rule, cascade_layer(rule).unwrap_or(u32::MAX)));
+            let layer = cascade_layer_name(rule)
+                .and_then(|name| global.iter().position(|n| n == name))
+                .map_or(u32::MAX, |index| index as u32);
+            ordered.push((1, order, rule, layer));
             order += 1;
         }
     }
@@ -542,7 +786,8 @@ fn compute_styles_tracked_with(
             let mut normal = Vec::new();
             let mut important = Vec::new();
             for declaration in &rule.declarations {
-                if declaration.property == LAYER_MARKER {
+                if declaration.property == LAYER_MARKER || declaration.property == LAYER_NAME_MARKER
+                {
                     continue;
                 }
                 if is_important(declaration) {
@@ -555,9 +800,26 @@ fn compute_styles_tracked_with(
         })
         .collect();
 
+    // Specificity comes from the chain decode already done while building the
+    // index; the cascade only reads this slice, so no element re-decodes a
+    // selector (the bench's brute-force path is the sole exception).
+    let specificity: Vec<(u32, u32, u32)> = ordered
+        .iter()
+        .enumerate()
+        .map(|(i, (_, _, rule, _))| index.specificity(i, &rule.selector))
+        .collect();
+
     // Phase A — matching only: reads immutable DOM + sheets, writes one result
     // list per element slot. This is the part that runs in parallel.
-    let mut matched = match_all(dom, &ordered, &index, needs_bloom, threads);
+    let mut matched = match_all(
+        dom,
+        &ordered,
+        &index,
+        use_index,
+        needs_bloom,
+        threads,
+        visited,
+    );
 
     // Phase B — cascade + style sharing stay sequential: they consume the
     // precomputed matched lists and share one mutable LRU / parent context.
@@ -565,6 +827,7 @@ fn compute_styles_tracked_with(
     let mut rules = CascadeRules {
         ordered: &ordered,
         prepared: &prepared,
+        specificity: &specificity,
     };
     // Conservative sheet-level bail-out: if any rule keys off sibling
     // position, two elements with the same class set can match different
@@ -595,7 +858,7 @@ fn compute_styles_tracked_with(
                 map.set(id, parent);
             }
             NodeKind::Element { .. } => {
-                let (style, vars) = cascade(
+                let (style, vars, deferred) = cascade(
                     dom,
                     id,
                     &mut rules,
@@ -606,6 +869,7 @@ fn compute_styles_tracked_with(
                     &mut stats,
                 );
                 custom[id.slot() as usize] = vars;
+                map.set_deferred_width(id, deferred);
                 map.set(id, style);
             }
             NodeKind::Document => {}
@@ -709,6 +973,8 @@ fn initial_style() -> ComputedStyle {
 struct CascadeRules<'a> {
     ordered: &'a [OrderedRule<'a>],
     prepared: &'a [(Vec<&'a Declaration>, Vec<&'a Declaration>)],
+    /// One specificity per rule, decoded once when the index was built.
+    specificity: &'a [(u32, u32, u32)],
 }
 
 /// Maximum number of post-inheritance styles kept in one style pass.
@@ -778,10 +1044,12 @@ fn hash_inherited(style: &ComputedStyle, custom: &BTreeMap<String, String>) -> u
     h.finish()
 }
 
+type SharingEntry = (u64, ComputedStyle, BTreeMap<String, String>, Option<String>);
+
 /// Pure-std LRU: O(1) hits, O(capacity) eviction. `clock` gives each entry a
 /// monotonically increasing stamp; the smallest stamp is least recently used.
 struct SharingCache {
-    entries: HashMap<SharingKey, (u64, ComputedStyle, BTreeMap<String, String>)>,
+    entries: HashMap<SharingKey, SharingEntry>,
     clock: u64,
 }
 
@@ -793,12 +1061,15 @@ impl SharingCache {
         }
     }
 
-    fn get(&mut self, key: &SharingKey) -> Option<(ComputedStyle, BTreeMap<String, String>)> {
+    fn get(
+        &mut self,
+        key: &SharingKey,
+    ) -> Option<(ComputedStyle, BTreeMap<String, String>, Option<String>)> {
         self.clock += 1;
         let stamp = self.clock;
         let entry = self.entries.get_mut(key)?;
         entry.0 = stamp;
-        Some((entry.1.clone(), entry.2.clone()))
+        Some((entry.1.clone(), entry.2.clone(), entry.3.clone()))
     }
 
     fn insert(
@@ -806,6 +1077,7 @@ impl SharingCache {
         key: SharingKey,
         style: &ComputedStyle,
         custom: &BTreeMap<String, String>,
+        deferred_width: &Option<String>,
     ) {
         self.clock += 1;
         let stamp = self.clock;
@@ -817,14 +1089,16 @@ impl SharingCache {
             let oldest = self
                 .entries
                 .iter()
-                .min_by_key(|(_, (s, _, _))| *s)
+                .min_by_key(|(_, (s, _, _, _))| *s)
                 .map(|(key, _)| *key);
             if let Some(oldest) = oldest {
                 self.entries.remove(&oldest);
             }
         }
-        self.entries
-            .insert(key, (stamp, style.clone(), custom.clone()));
+        self.entries.insert(
+            key,
+            (stamp, style.clone(), custom.clone(), deferred_width.clone()),
+        );
     }
 }
 
@@ -835,6 +1109,9 @@ fn compound_has_positional(compound: &Compound) -> bool {
         | PseudoClass::OnlyChild
         | PseudoClass::NthChild(_, _) => true,
         PseudoClass::Not(inner) => compound_has_positional(inner),
+        PseudoClass::Is(args) | PseudoClass::Where(args) => {
+            args.iter().any(compound_has_positional)
+        }
         _ => false,
     })
 }
@@ -863,7 +1140,7 @@ fn cascade(
     parent_custom: &BTreeMap<String, String>,
     mut cache: Option<&mut SharingCache>,
     stats: &mut SharingStats,
-) -> (ComputedStyle, BTreeMap<String, String>) {
+) -> (ComputedStyle, BTreeMap<String, String>, Option<String>) {
     let mut normal: Vec<Match<'_>> = Vec::new();
     let mut important: Vec<Match<'_>> = Vec::new();
     // Inline declarations are per-element and are never shared.
@@ -871,8 +1148,8 @@ fn cascade(
     // Phase A already matched every candidate; only rule-order-independent
     // bookkeeping remains here (no re-matching, no context/sibling scans).
     for &candidate in matched_ids.iter() {
-        let (origin, order, rule, layer) = rules.ordered[candidate];
-        let specificity = specificity_ref(&rule.selector);
+        let (origin, order, _rule, layer) = rules.ordered[candidate];
+        let specificity = rules.specificity[candidate];
         if !rules.prepared[candidate].0.is_empty() {
             normal.push((
                 rank(origin, false),
@@ -982,7 +1259,14 @@ fn cascade(
                 continue;
             }
             let property = trimmed.to_ascii_lowercase();
-            let Some(value) = substitute_vars(declaration_value(decl), &resolved_custom) else {
+            let Some(substituted) = substitute_vars(declaration_value(decl), &resolved_custom)
+            else {
+                continue;
+            };
+            // Parse-time calc resolution runs before `var()` substitution, so
+            // var-containing calcs were kept raw. Resolve them now that the
+            // variables are concrete; `%` calcs stay raw for layout.
+            let Some(value) = resolve_calc_now(&substituted) else {
                 continue;
             };
             if property == "border" {
@@ -1004,6 +1288,14 @@ fn cascade(
             }
         }
     }
+
+    // A `%`-containing `calc()` has no parse-time basis; keep its raw text so
+    // layout can resolve it against the containing block (mirroring how plain
+    // `width: N%` flows through `width_percent`).
+    let deferred_width = winning
+        .get("width")
+        .filter(|value| value.contains("calc(") && value.contains('%'))
+        .cloned();
 
     let mut style = initial_style();
     // Inherited properties start from the parent's computed values.
@@ -1191,10 +1483,15 @@ fn cascade(
                 // A percentage has no parse-time basis: keep the raw number for
                 // layout to resolve against the containing block's content box.
                 let (abs, pct) = parse_length_or_percent(value, style.font_size);
-                style.width = abs;
-                style.width_percent = pct;
+                // Negative width/height are invalid in CSS; clamp here so a
+                // `calc(0px - 10px)` cannot produce a negative box width.
+                style.width = abs.map(|w| w.max(0.0));
+                style.width_percent = pct.map(|p| p.max(0.0));
             }
-            "height" => set!(style.height, parse_optional_length(value, style.font_size)),
+            "height" => set!(
+                style.height,
+                parse_optional_length(value, style.font_size).map(|h| h.map(|h| h.max(0.0)))
+            ),
             "min-width" => set!(style.min_size.w, parse_length(value, style.font_size)),
             "min-height" => set!(style.min_size.h, parse_length(value, style.font_size)),
             "max-width" => set!(style.max_size.w, parse_length(value, style.font_size)),
@@ -1235,10 +1532,10 @@ fn cascade(
         cache
             .as_mut()
             .unwrap()
-            .insert(key, &style, &resolved_custom);
+            .insert(key, &style, &resolved_custom, &deferred_width);
         stats.inserted += 1;
     }
-    (style, resolved_custom)
+    (style, resolved_custom, deferred_width)
 }
 
 fn parse_f32(value: &str) -> Option<f32> {
@@ -2287,6 +2584,103 @@ mod tests {
     }
 
     #[test]
+    fn same_name_layer_merges_across_sheets() {
+        let first = sheet("@layer a { div { color: red } }");
+        let second = sheet("@layer b { div { color: green } } @layer a { div { color: blue } }");
+        assert_eq!(
+            resolved_layer_order(&[first.clone(), second.clone()]),
+            ["a", "b"]
+        );
+        let (dom, id) = one_element("div");
+        let map = compute_styles(&dom, &[first, second]);
+        // Global `b` (rank 1) outranks `a` (rank 0) even though sheet 2's
+        // per-sheet rank for `a` is 1; a repeated name must not restart.
+        assert_eq!(map.get(id).unwrap().color, Color::rgb(0, 128, 0));
+    }
+
+    #[test]
+    fn nested_layer_keeps_its_own_path_vs_a_flat_layer() {
+        let (_, _, s) = css_style(
+            "@layer inner { div { color: blue } } \
+             @layer outer { @layer inner { div { color: red } } }",
+        );
+        // `outer.inner` is a distinct, later layer than flat `inner`.
+        assert_eq!(s.color, Color::rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn comma_layer_list_duplicates_the_rule_into_each_layer() {
+        let (_, _, s) =
+            css_style("@layer b { div { color: blue } } @layer a, b { div { color: red } }");
+        // The copy in `b` shares b's rank with the blue rule but comes later.
+        assert_eq!(s.color, Color::rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn var_inside_calc_resolves_at_cascade_time() {
+        let (_, _, s) = css_style("div { --w: 50px; width: calc(var(--w) + 5px) }");
+        assert_eq!(s.width, Some(55.0));
+
+        let (_, _, s) = css_style("div { --b: 10px; --a: calc(var(--b) * 2); width: var(--a) }");
+        assert_eq!(s.width, Some(20.0));
+    }
+
+    #[test]
+    fn percent_calc_is_deferred_to_layout_basis() {
+        let (dom, id) = one_element("div");
+        let map = compute_styles(&dom, &[sheet("div { width: calc(100% - 32px) }")]);
+        assert!(map.get(id).unwrap().width.is_none());
+        assert_eq!(map.resolve_width_with_basis(id, 1000.0), Some(968.0));
+        assert_eq!(map.resolve_width_with_basis(id, 500.0), Some(468.0));
+    }
+
+    #[test]
+    fn unitless_calc_line_height_is_a_number() {
+        let (_, _, s) = css_style("div { line-height: calc(2) }");
+        assert_eq!(s.line_height, LineHeight::Number(2.0));
+    }
+
+    #[test]
+    fn negative_calc_width_and_height_clamp_to_zero() {
+        let (_, _, s) = css_style("div { width: calc(0px - 10px); height: calc(0px - 5px) }");
+        assert_eq!(s.width, Some(0.0));
+        assert_eq!(s.height, Some(0.0));
+    }
+
+    #[test]
+    fn visited_and_link_style_split() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let id = element(&mut dom, root, "a", &[("href", "https://example.com")]);
+        let sheets = [sheet("a:link { color: blue } a:visited { color: red }")];
+
+        let unvisited = compute_styles_with_visited(&dom, &sheets, &HashSet::new());
+        assert_eq!(unvisited.get(id).unwrap().color, Color::rgb(0, 0, 255));
+
+        let visited = HashSet::from(["https://example.com".to_string()]);
+        let styled = compute_styles_with_visited(&dom, &sheets, &visited);
+        assert_eq!(styled.get(id).unwrap().color, Color::rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn positional_pseudos_are_detected_inside_is_and_where() {
+        let first = Compound {
+            pseudos: vec![PseudoClass::FirstChild],
+            ..Compound::default()
+        };
+        let in_is = Compound {
+            pseudos: vec![PseudoClass::Is(vec![Compound::default(), first.clone()])],
+            ..Compound::default()
+        };
+        let in_where = Compound {
+            pseudos: vec![PseudoClass::Where(vec![first])],
+            ..Compound::default()
+        };
+        assert!(compound_has_positional(&in_is));
+        assert!(compound_has_positional(&in_where));
+    }
+
+    #[test]
     fn custom_property_inherits_and_substitutes() {
         let mut dom = Dom::new();
         let root = dom.root();
@@ -2812,6 +3206,48 @@ mod tests {
         });
     }
 
+    /// `HODO_NO_RULE_INDEX=1` routes the public entry through brute force;
+    /// exercising the mode seam directly keeps the test independent of env
+    /// mutation in a parallel test run. The result must stay byte-for-byte the
+    /// same as the indexed path (the corpus's EXACT equality, end to end).
+    #[test]
+    fn no_rule_index_flag_produces_identical_styles() {
+        let (dom, sheets) = style_corpus(64, 20, true);
+        let indexed =
+            compute_styles_tracked_with_index(&dom, &sheets, ua(), true, 1, &HashSet::new(), true)
+                .0;
+        let brute =
+            compute_styles_tracked_with_index(&dom, &sheets, ua(), true, 1, &HashSet::new(), false)
+                .0;
+        assert_same_styles(&indexed, &brute, &dom);
+    }
+
+    /// 33 distinct attribute names overflow the 32 dedicated buckets; the
+    /// fallback rule must still win a specificity tie by source order.
+    #[test]
+    fn rule_index_33rd_attribute_keeps_source_order_winner() {
+        let mut css = String::new();
+        for i in 0..=32 {
+            css.push_str(&format!("[data-k{i:02}] {{ color: #ff0000 }}\n"));
+        }
+        css.push_str(".target { color: #0000ff }\n");
+        let sheets = [sheet(&css)];
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let id = element(
+            &mut dom,
+            root,
+            "div",
+            &[("class", "target"), ("data-k32", "x")],
+        );
+        let map = compute_styles(&dom, &sheets);
+        assert_eq!(
+            map.get(id).unwrap().color,
+            Color::rgb(0, 0, 255),
+            "equal specificity: the later .target rule must beat the 33rd attr rule"
+        );
+    }
+
     fn same_class_siblings(n: usize, extra_css: &str) -> (Dom, Vec<NodeId>, Vec<Stylesheet>) {
         let mut dom = Dom::new();
         let root = dom.root();
@@ -2828,7 +3264,7 @@ mod tests {
     #[test]
     fn sharing_matches_uncached_for_500_same_class_siblings() {
         let (dom, ids, sheets) = same_class_siblings(500, "");
-        let (shared, stats) = compute_styles_tracked(&dom, &sheets, ua(), true);
+        let (shared, stats) = compute_styles_tracked(&dom, &sheets, ua(), true, &HashSet::new());
         let plain = compute_styles_uncached(&dom, &sheets);
         assert_same_styles(&shared, &plain, &dom);
         assert!(stats.hits >= 498, "expected near-total sharing: {stats:?}");
@@ -2850,7 +3286,7 @@ mod tests {
         );
         let sheets = [sheet(".foo { color: red }")];
 
-        let (shared, stats) = compute_styles_tracked(&dom, &sheets, ua(), true);
+        let (shared, stats) = compute_styles_tracked(&dom, &sheets, ua(), true, &HashSet::new());
         let plain_map = compute_styles_uncached(&dom, &sheets);
         assert_same_styles(&shared, &plain_map, &dom);
         assert_eq!(shared.get(plain).unwrap().color, Color::rgb(255, 0, 0));
@@ -2867,7 +3303,7 @@ mod tests {
             10,
             ".foo:nth-child(odd) { color: red }\n.foo:nth-child(even) { color: blue }",
         );
-        let (shared, stats) = compute_styles_tracked(&dom, &sheets, ua(), true);
+        let (shared, stats) = compute_styles_tracked(&dom, &sheets, ua(), true, &HashSet::new());
         let plain = compute_styles_uncached(&dom, &sheets);
         assert_same_styles(&shared, &plain, &dom);
         assert_eq!(
@@ -2886,8 +3322,8 @@ mod tests {
             same_class_siblings(16, ".foo { color: red !important }\n.foo { color: green }");
         // UA important outranks author important; sharing must not change that.
         let ua = parse_stylesheet("div { color: blue !important }");
-        let (shared, stats) = compute_styles_tracked(&dom, &sheets, &ua, true);
-        let plain = compute_styles_parsed(&dom, &sheets, &ua, false);
+        let (shared, stats) = compute_styles_tracked(&dom, &sheets, &ua, true, &HashSet::new());
+        let plain = compute_styles_parsed(&dom, &sheets, &ua, false, &HashSet::new());
         assert_same_styles(&shared, &plain, &dom);
         assert!(stats.hits > 0, "expected sharing here: {stats:?}");
         for id in ids {
@@ -2910,7 +3346,7 @@ mod tests {
         let sheets = [sheet(
             "body { color: purple; font-weight: bold }\n.lvl { padding: 1px; margin: 2px }",
         )];
-        let (shared, stats) = compute_styles_tracked(&dom, &sheets, ua(), true);
+        let (shared, stats) = compute_styles_tracked(&dom, &sheets, ua(), true, &HashSet::new());
         let plain = compute_styles_uncached(&dom, &sheets);
         assert_same_styles(&shared, &plain, &dom);
         assert!(stats.hits >= 198, "expected deep-chain sharing: {stats:?}");
@@ -2936,7 +3372,7 @@ mod tests {
             "#a { color: red } #b { color: blue } .kid { padding: 1px }",
         )];
 
-        let (shared, stats) = compute_styles_tracked(&dom, &sheets, ua(), true);
+        let (shared, stats) = compute_styles_tracked(&dom, &sheets, ua(), true, &HashSet::new());
         let plain = compute_styles_uncached(&dom, &sheets);
         assert_same_styles(&shared, &plain, &dom);
         assert_eq!(shared.get(kid_a).unwrap().color, Color::rgb(255, 0, 0));
@@ -2960,12 +3396,13 @@ mod tests {
         let mut last_stats = SharingStats::default();
         for _ in 0..iterations {
             let start = Instant::now();
-            let (shared, stats) = compute_styles_tracked(&dom, &sheets, ua(), true);
+            let (shared, stats) =
+                compute_styles_tracked(&dom, &sheets, ua(), true, &HashSet::new());
             on += start.elapsed();
             last_stats = stats;
             assert_eq!(shared.styles.len(), dom.len());
             let start = Instant::now();
-            let plain = compute_styles_tracked(&dom, &sheets, ua(), false).0;
+            let plain = compute_styles_tracked(&dom, &sheets, ua(), false, &HashSet::new()).0;
             off += start.elapsed();
             assert_eq!(plain.styles.len(), dom.len());
         }
@@ -3029,9 +3466,10 @@ mod tests {
     /// Uncached+sequential is the reference; cached+sequential and the
     /// production path (cached + auto threads) must be byte-identical to it.
     fn assert_three_way(dom: &Dom, sheets: &[Stylesheet]) {
-        let seq_uncached = compute_styles_tracked_with(dom, sheets, ua(), false, 1).0;
-        let seq_cached = compute_styles_tracked_with(dom, sheets, ua(), true, 1).0;
-        let parallel = compute_styles_tracked_with(dom, sheets, ua(), true, 0).0;
+        let seq_uncached =
+            compute_styles_tracked_with(dom, sheets, ua(), false, 1, &HashSet::new()).0;
+        let seq_cached = compute_styles_tracked_with(dom, sheets, ua(), true, 1, &HashSet::new()).0;
+        let parallel = compute_styles_tracked_with(dom, sheets, ua(), true, 0, &HashSet::new()).0;
         assert_same_styles(&seq_uncached, &seq_cached, dom);
         assert_same_styles(&seq_uncached, &parallel, dom);
     }
@@ -3040,7 +3478,7 @@ mod tests {
     fn parallel_matches_sequential_on_2000_element_fixture() {
         let (dom, sheets) = style_corpus(2000, 200, false);
         assert_three_way(&dom, &sheets);
-        let (_, stats) = compute_styles_tracked_with(&dom, &sheets, ua(), true, 0);
+        let (_, stats) = compute_styles_tracked_with(&dom, &sheets, ua(), true, 0, &HashSet::new());
         assert!(stats.hits > 0, "sharing should be active here: {stats:?}");
         assert!(LAST_MATCH_THREADS.with(|count| count.get()) >= 2);
     }
@@ -3069,8 +3507,8 @@ mod tests {
         )];
         // Only 202 elements, so the auto policy stays sequential; force 8
         // threads to prove the chunked matcher reproduces the chain exactly.
-        let seq = compute_styles_tracked_with(&dom, &sheets, ua(), false, 1).0;
-        let par = compute_styles_tracked_with(&dom, &sheets, ua(), false, 8).0;
+        let seq = compute_styles_tracked_with(&dom, &sheets, ua(), false, 1, &HashSet::new()).0;
+        let par = compute_styles_tracked_with(&dom, &sheets, ua(), false, 8, &HashSet::new()).0;
         assert_same_styles(&seq, &par, &dom);
         assert_eq!(seq.get(parent).unwrap().color, Color::rgb(255, 0, 0));
     }
@@ -3084,8 +3522,8 @@ mod tests {
             600,
             ".foo:nth-child(odd) { color: red }\n.foo:nth-child(even) { color: blue }",
         );
-        let seq = compute_styles_tracked_with(&dom, &sheets, ua(), false, 1).0;
-        let par = compute_styles_tracked_with(&dom, &sheets, ua(), false, 0).0;
+        let seq = compute_styles_tracked_with(&dom, &sheets, ua(), false, 1, &HashSet::new()).0;
+        let par = compute_styles_tracked_with(&dom, &sheets, ua(), false, 0, &HashSet::new()).0;
         assert_same_styles(&seq, &par, &dom);
         assert!(LAST_MATCH_THREADS.with(|count| count.get()) >= 2);
         assert_eq!(par.get(ids[0]).unwrap().color, Color::rgb(255, 0, 0));
@@ -3122,10 +3560,10 @@ mod tests {
         let mut par = std::time::Duration::ZERO;
         for _ in 0..iterations {
             let start = Instant::now();
-            let a = compute_styles_tracked_with(&dom, &sheets, ua(), true, 1).0;
+            let a = compute_styles_tracked_with(&dom, &sheets, ua(), true, 1, &HashSet::new()).0;
             seq += start.elapsed();
             let start = Instant::now();
-            let b = compute_styles_tracked_with(&dom, &sheets, ua(), true, 0).0;
+            let b = compute_styles_tracked_with(&dom, &sheets, ua(), true, 0, &HashSet::new()).0;
             par += start.elapsed();
             assert_eq!(a.styles.len(), b.styles.len());
         }
@@ -3135,6 +3573,257 @@ mod tests {
             "A/B matching (2000 elements, 200 rules): sequential {seq_ms:.2} ms, \
              parallel {par_ms:.2} ms ({:.2}x)",
             if par_ms > 0.0 { seq_ms / par_ms } else { 0.0 }
+        );
+    }
+
+    // --- Style change classifier -------------------------------------------
+
+    fn classify_change(mutate: impl FnOnce(&mut ComputedStyle)) -> StyleChangeClass {
+        let old = initial_style();
+        let mut new = old.clone();
+        mutate(&mut new);
+        style_change_class(&old, &new)
+    }
+
+    #[test]
+    fn style_change_class_paint_only_fields() {
+        use StyleChangeClass::PaintOnly;
+        assert_eq!(
+            classify_change(|s| s.color = Color::rgb(1, 2, 3)),
+            PaintOnly
+        );
+        assert_eq!(
+            classify_change(|s| s.background = Color::rgb(1, 2, 3)),
+            PaintOnly
+        );
+        assert_eq!(
+            classify_change(|s| s.border_color = Color::rgb(1, 2, 3)),
+            PaintOnly
+        );
+        assert_eq!(classify_change(|s| s.underline = true), PaintOnly);
+        assert_eq!(classify_change(|s| s.line_through = true), PaintOnly);
+        // No change is safe to report as paint-only.
+        assert_eq!(
+            style_change_class(&initial_style(), &initial_style()),
+            PaintOnly
+        );
+    }
+
+    #[test]
+    fn style_change_class_layout_affecting_fields() {
+        use StyleChangeClass::LayoutAffecting as L;
+        assert_eq!(classify_change(|s| s.display = Display::None), L);
+        assert_eq!(classify_change(|s| s.font_size = 17.0), L);
+        assert_eq!(classify_change(|s| s.font_weight = 700), L);
+        assert_eq!(classify_change(|s| s.font_family = "serif".into()), L);
+        assert_eq!(classify_change(|s| s.italic = true), L);
+        assert_eq!(classify_change(|s| s.margin.top = 1.0), L);
+        assert_eq!(classify_change(|s| s.padding.left = 1.0), L);
+        assert_eq!(classify_change(|s| s.border_width = 2.0), L);
+        assert_eq!(classify_change(|s| s.border_widths.right = 2.0), L);
+        assert_eq!(
+            classify_change(|s| s.flex_direction = FlexDirection::Column),
+            L
+        );
+        assert_eq!(classify_change(|s| s.flex_wrap = FlexWrap::Wrap), L);
+        assert_eq!(
+            classify_change(|s| s.justify_content = JustifyContent::Center),
+            L
+        );
+        assert_eq!(classify_change(|s| s.align_items = AlignItems::Center), L);
+        assert_eq!(classify_change(|s| s.align_self = AlignSelf::Stretch), L);
+        assert_eq!(classify_change(|s| s.gap = 3.0), L);
+        assert_eq!(classify_change(|s| s.flex_grow = 1.0), L);
+        assert_eq!(classify_change(|s| s.flex_shrink = 2.0), L);
+        assert_eq!(
+            classify_change(|s| s.flex_basis = FlexBasis::Length(4.0)),
+            L
+        );
+        assert_eq!(classify_change(|s| s.order = 1), L);
+        assert_eq!(
+            classify_change(|s| s.grid_template_columns = vec![GridTrack::Fixed(1.0)]),
+            L
+        );
+        assert_eq!(
+            classify_change(|s| s.grid_template_rows = vec![GridTrack::Fixed(1.0)]),
+            L
+        );
+        assert_eq!(
+            classify_change(|s| s.grid_column = (GridLine::Line(1), GridLine::Auto)),
+            L
+        );
+        assert_eq!(
+            classify_change(|s| s.grid_row = (GridLine::Line(1), GridLine::Auto)),
+            L
+        );
+        assert_eq!(classify_change(|s| s.column_gap = 5.0), L);
+        assert_eq!(classify_change(|s| s.row_gap = 6.0), L);
+        assert_eq!(classify_change(|s| s.table_layout = TableLayout::Fixed), L);
+        assert_eq!(
+            classify_change(|s| s.border_collapse = BorderCollapse::Collapse),
+            L
+        );
+        assert_eq!(classify_change(|s| s.border_spacing = (3.0, 3.0)), L);
+        assert_eq!(
+            classify_change(|s| s.line_height = LineHeight::Number(2.0)),
+            L
+        );
+        assert_eq!(
+            classify_change(|s| s.vertical_align = VerticalAlign::Top),
+            L
+        );
+        assert_eq!(classify_change(|s| s.text_align = TextAlign::Center), L);
+        assert_eq!(classify_change(|s| s.text_indent = 7.0), L);
+        assert_eq!(classify_change(|s| s.letter_spacing = 1.0), L);
+        assert_eq!(classify_change(|s| s.word_spacing = 1.0), L);
+        assert_eq!(classify_change(|s| s.white_space = WhiteSpace::Pre), L);
+        assert_eq!(
+            classify_change(|s| s.overflow_wrap = OverflowWrap::BreakWord),
+            L
+        );
+        assert_eq!(classify_change(|s| s.position = Position::Absolute), L);
+        assert_eq!(classify_change(|s| s.float = Float::Left), L);
+        assert_eq!(classify_change(|s| s.clear = Clear::Both), L);
+        assert_eq!(classify_change(|s| s.overflow = Overflow::Hidden), L);
+        assert_eq!(classify_change(|s| s.offsets.bottom = Some(1.0)), L);
+        assert_eq!(classify_change(|s| s.width = Some(10.0)), L);
+        assert_eq!(classify_change(|s| s.width_percent = Some(50.0)), L);
+        assert_eq!(classify_change(|s| s.margin_percent.left = Some(10.0)), L);
+        assert_eq!(classify_change(|s| s.padding_percent.top = Some(10.0)), L);
+        assert_eq!(classify_change(|s| s.height = Some(10.0)), L);
+        assert_eq!(classify_change(|s| s.min_size = Size { w: 1.0, h: 1.0 }), L);
+        assert_eq!(classify_change(|s| s.max_size = Size { w: 1.0, h: 1.0 }), L);
+    }
+
+    // --- Sharing extension measurement -------------------------------------
+
+    /// Miniature of `hodo-perf`'s LARGE generator: 200 blocks with the same
+    /// class / id / attribute rule shapes, short text (text cannot affect
+    /// styles). Fixed LCG seed, no `rand` dependency.
+    fn large_like_corpus() -> (Dom, Vec<Stylesheet>) {
+        const BLOCKS: usize = 200;
+        const CLASSES: usize = 50;
+        const SPANS: usize = 25;
+        let mut rng = 0x004c_4152_4745_0002u64;
+        let mut next = || {
+            rng = rng
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            rng
+        };
+        let mut hex = || format!("#{:06x}", next() & 0x00ff_ffff);
+        let mut css = String::from(".root{display:block;padding:4px}\n");
+        for i in 0..80 {
+            let selector = if i % 2 == 0 {
+                format!(".s{}", i % CLASSES)
+            } else {
+                format!(".sp{}", i % SPANS)
+            };
+            css.push_str(&format!(
+                "{selector}{{color:{};background-color:{};padding:1px}}\n",
+                hex(),
+                hex()
+            ));
+        }
+        for i in 0..60 {
+            css.push_str(&format!(
+                "#blk{i}{{border-width:1px;border-color:{};margin:2px}}\n",
+                hex()
+            ));
+        }
+        for i in 0..59 {
+            let selector = match i % 3 {
+                0 => "[data-kind=\"mixed\"]".to_string(),
+                1 => "[width=\"120\"]".to_string(),
+                _ => format!("[data-idx=\"{}\"]", i % 20),
+            };
+            css.push_str(&format!(
+                "{selector}{{font-size:{}px;line-height:1.4}}\n",
+                13 + i % 4
+            ));
+        }
+
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let main = element(&mut dom, root, "main", &[("class", "root")]);
+        for block in 0..BLOCKS {
+            let bclass = format!("b{}", block % 20);
+            let block_id = format!("blk{block}");
+            let block_idx = format!("{block}");
+            let outer = element(
+                &mut dom,
+                main,
+                "div",
+                &[
+                    ("class", &bclass),
+                    ("id", &block_id),
+                    ("data-kind", "mixed"),
+                    ("data-idx", &block_idx),
+                ],
+            );
+            let d1 = element(&mut dom, outer, "div", &[("class", "d1")]);
+            let d2 = element(&mut dom, d1, "div", &[("class", "d2")]);
+            let d3 = element(&mut dom, d2, "div", &[("class", "d3")]);
+            let d4 = element(&mut dom, d3, "div", &[("class", "d4")]);
+            for paragraph in 0..3 {
+                let class = format!("s{}", (block * 3 + paragraph) % CLASSES);
+                let p = element(&mut dom, d4, "p", &[("class", &class)]);
+                for span in 0..if paragraph == 2 { 3 } else { 2 } {
+                    let sclass = format!("sp{}", (block + span) % SPANS);
+                    let _ = element(&mut dom, p, "span", &[("class", &sclass)]);
+                }
+            }
+            let list = element(&mut dom, d4, "ul", &[("class", "list")]);
+            let _ = element(&mut dom, list, "li", &[("class", "li0")]);
+            let _ = element(&mut dom, list, "li", &[("class", "li1")]);
+            let _ = element(&mut dom, d4, "img", &[("src", "pic.png"), ("width", "120")]);
+        }
+        (dom, vec![sheet(&css)])
+    }
+
+    /// Gate for rung 4: how much sharing would a subtree-content hash unlock
+    /// beyond the current (matched-set + tag + inherited) key? Below 5% the
+    /// extension is not worth building and is deliberately skipped.
+    ///
+    /// Measured on this LARGE-shaped corpus: 171 of 3801 elements (4.50%) have
+    /// an identical computed style under a different key, while the existing
+    /// cache already hits 3390/3801 (89.2%). 4.50% < 5%, so the subtree-content
+    /// hash is NOT built. shortcut: skip subtree hashing; revisit only if the
+    /// corpus changes to repeat whole subtrees without unique ids/data-idx.
+    #[test]
+    fn sharing_untapped_potential_large_corpus() {
+        let (dom, sheets) = large_like_corpus();
+        let (map, stats) = compute_styles_tracked(&dom, &sheets, ua(), true, &HashSet::new());
+        let mut total = 0usize;
+        let mut distinct_styles: HashSet<u64> = HashSet::new();
+        let mut distinct_style_and_key: HashSet<(u64, String)> = HashSet::new();
+        dom.walk(|id, node| {
+            if !matches!(node.kind, NodeKind::Element { .. }) {
+                return;
+            }
+            total += 1;
+            let style_hash = hash_u64(&format!("{:?}", map.get(id)));
+            // A conservative stand-in for the current SharingKey: unique ids
+            // and data-idx attributes are exactly what splits LARGE's repeated
+            // blocks into distinct matched sets today.
+            let key = format!(
+                "{:?}|{:?}|{:?}|{:?}",
+                dom.tag(id),
+                dom.attr(id, "id"),
+                dom.attr(id, "class"),
+                dom.attr(id, "data-idx")
+            );
+            distinct_styles.insert(style_hash);
+            distinct_style_and_key.insert((style_hash, key));
+        });
+        let untapped = distinct_style_and_key.len() - distinct_styles.len();
+        let potential = untapped as f64 / total as f64 * 100.0;
+        eprintln!(
+            "Sharing LARGE corpus: {total} elements, cache hits {}, misses {}, inserted {}, excluded {}; \
+             distinct computed styles {}, distinct (style,key) {}, untapped {untapped} ({potential:.2}%)",
+            stats.hits, stats.misses, stats.inserted, stats.excluded,
+            distinct_styles.len(),
+            distinct_style_and_key.len()
         );
     }
 }

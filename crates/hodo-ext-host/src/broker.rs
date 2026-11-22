@@ -27,6 +27,26 @@ const RSS_TREND_SAMPLES: usize = 3;
 const MIN_RSS_BUDGET: u64 = 64 * 1024 * 1024;
 const SHUTDOWN_GRACE_MS: u64 = 250;
 
+/// A message whose serialized frame body would exceed the IPC cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TooBig {
+    pub len: usize,
+}
+
+/// Serialize `msg` only when its frame body fits the IPC cap. `encode()` adds a
+/// one-byte version prefix, so the bound is `json.len() + 1`. Every host→worker
+/// write path calls this before `WorkerProc::send` so an oversized payload
+/// degrades to a diagnostic instead of panicking the host in `encode`'s assert.
+pub(crate) fn try_encode_bounded(msg: &Message) -> Result<Vec<u8>, TooBig> {
+    let body = serde_json::to_vec(msg).expect("serializing a Message cannot fail");
+    let len = body.len() + 1; // VERSION byte prepended by `encode`
+    if len > hodo_ext_ipc::MAX_MSG_BYTES {
+        Err(TooBig { len })
+    } else {
+        Ok(body)
+    }
+}
+
 /// The broker asks the host for these operations instead of knowing about
 /// `Host` itself, so frame routing is testable without spawning anything.
 pub trait BrokerHost {
@@ -394,6 +414,18 @@ impl Broker {
             name: "__hodo_ready".to_string(),
             payload: ready,
         };
+        // `encode` asserts on an oversized body; the shared bounded guard keeps
+        // every host→worker write (including ready) below the IPC cap.
+        if let Err(too_big) = try_encode_bounded(&ready_msg) {
+            let reason = format!(
+                "ready payload is {} bytes, exceeding the {} byte IPC cap",
+                too_big.len,
+                hodo_ext_ipc::MAX_MSG_BYTES
+            );
+            self.kill_and_clear(ext_index);
+            host.diagnostic(ext_index, reason.clone());
+            return Err(reason);
+        }
         let sent = self.slots[ext_index]
             .proc
             .as_mut()
@@ -509,7 +541,16 @@ impl Broker {
                     name: "__hodo_ping".to_string(),
                     payload: json!({ "at": now }),
                 };
-                if let Some(proc) = self.slots[index].proc.as_mut() {
+                if let Err(too_big) = try_encode_bounded(&ping) {
+                    host.diagnostic(
+                        index,
+                        format!(
+                            "ping frame is {} bytes, exceeding the {} byte IPC cap; skipped",
+                            too_big.len,
+                            hodo_ext_ipc::MAX_MSG_BYTES
+                        ),
+                    );
+                } else if let Some(proc) = self.slots[index].proc.as_mut() {
                     let _ = proc.send(&ping);
                 }
             }
@@ -582,6 +623,11 @@ impl Broker {
             name: name.to_string(),
             payload,
         };
+        // Never reach `encode`'s assert; a `false` return makes the host retain
+        // the event (an oversized one is normally filtered at the emit boundary).
+        if try_encode_bounded(&msg).is_err() {
+            return false;
+        }
         proc.send(&msg).is_ok()
     }
 
@@ -614,12 +660,13 @@ impl Broker {
         }
     }
 
-    /// Diagnostic RSS baseline recorded during normal polling. Must not call
-    /// `observe`: a user reading memory usage must never trip the watchdog or
-    /// overwrite its baseline (the `&mut self` is only for API symmetry).
+    /// Current worker RSS for diagnostics. Reads the sysinfo cache (refreshing
+    /// just this pid) but never calls `RssWatchdog::observe`: a user checking
+    /// memory usage must not seed/overwrite the baseline or trip the trend.
+    /// The `&mut self` is only for the sysinfo refresh.
     #[must_use]
     pub fn worker_rss_bytes(&mut self, ext_index: usize) -> Option<u64> {
-        self.slots.get(ext_index)?.rss.baseline()
+        self.read_rss_bytes(ext_index)
     }
 
     /// Returns `true` if the frame killed the channel.
@@ -662,7 +709,16 @@ impl Broker {
                         error: Some(err),
                     },
                 };
-                if let Some(proc) = slot.proc.as_mut() {
+                if let Err(too_big) = try_encode_bounded(&reply) {
+                    host.diagnostic(
+                        ext_index,
+                        format!(
+                            "api reply for call {id} is {} bytes, exceeding the {} byte IPC cap; dropped",
+                            too_big.len,
+                            hodo_ext_ipc::MAX_MSG_BYTES
+                        ),
+                    );
+                } else if let Some(proc) = slot.proc.as_mut() {
                     if proc.send(&reply).is_err() {
                         return true;
                     }
@@ -989,17 +1045,107 @@ mod tests {
         let baseline = broker.slots[0].rss.baseline();
         let over = broker.slots[0].rss.over;
         assert_eq!(over, 2);
+        // No live process in this unit test, so the current-RSS probe has no
+        // sample to report; it must still leave the watchdog state untouched.
         for _ in 0..10 {
-            assert_eq!(
-                broker.worker_rss_bytes(0),
-                baseline,
-                "read-only probe returns the stored baseline"
-            );
+            assert_eq!(broker.worker_rss_bytes(0), None);
         }
         assert_eq!(broker.slots[0].rss.baseline(), baseline);
         assert_eq!(
             broker.slots[0].rss.over, over,
             "a probe must not trip the trend"
+        );
+    }
+
+    #[test]
+    fn bounded_encode_rejects_oversized_frames_from_every_write_path() {
+        let big = "x".repeat(hodo_ext_ipc::MAX_MSG_BYTES);
+        // Event frames cover emit_event, disable fan-out and ready.
+        for name in ["__hodo_ping", "__hodoExtensionDisabled", "__hodo_ready"] {
+            let err = try_encode_bounded(&Message::Event {
+                name: name.into(),
+                payload: json!({ "body": big }),
+            })
+            .expect_err("{name} frame must be bounded");
+            assert!(err.len > hodo_ext_ipc::MAX_MSG_BYTES, "{name}: {err:?}");
+        }
+        // The api-reply path uses ApiResponse.
+        let err = try_encode_bounded(&Message::ApiResponse {
+            id: 1,
+            result: Some(json!({ "body": big })),
+            error: None,
+        })
+        .expect_err("api reply must be bounded");
+        assert!(err.len > hodo_ext_ipc::MAX_MSG_BYTES, "{err:?}");
+
+        // Ordinary frames on each path still encode.
+        assert!(try_encode_bounded(&Message::Event {
+            name: "__hodo_ping".into(),
+            payload: json!({ "at": 0u64 })
+        })
+        .is_ok());
+        assert!(try_encode_bounded(&Message::ApiResponse {
+            id: 1,
+            result: Some(json!(null)),
+            error: None
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn bounded_encode_boundary_matches_cap_exactly() {
+        // The cap covers the VERSION-prefixed body, so a frame fits exactly when
+        // `json.len() + 1 == MAX_MSG_BYTES`. `try_encode_bounded` rejects only on
+        // `len > cap` and `encode` asserts only on `body.len() > cap`; this test
+        // locks both sides of that `>`/`<=` pairing against an off-by-one on
+        // either path. Build the boundary payload deterministically: measure the
+        // empty envelope and pad its string field to hit the cap minus one byte.
+        const CAP: usize = hodo_ext_ipc::MAX_MSG_BYTES;
+        let empty = Message::Event {
+            name: String::new(),
+            payload: json!(null),
+        };
+        let envelope = serde_json::to_vec(&empty)
+            .expect("serializing a Message cannot fail")
+            .len();
+        let pad = CAP - 1 - envelope; // -1 for the VERSION byte the guard adds
+
+        // Exactly at the cap: the bounded guard accepts and `encode` does not
+        // panic on its assert.
+        let exact = Message::Event {
+            name: "x".repeat(pad),
+            payload: json!(null),
+        };
+        assert_eq!(
+            serde_json::to_vec(&exact)
+                .expect("serializing a Message cannot fail")
+                .len()
+                + 1,
+            CAP
+        );
+        assert!(
+            try_encode_bounded(&exact).is_ok(),
+            "a cap-sized frame must pass the bounded guard"
+        );
+        let _ = encode(&exact); // must not panic: encode's assert allows == cap
+
+        // One byte over: the bounded guard rejects and `encode`'s assert fires.
+        let over = Message::Event {
+            name: "x".repeat(pad + 1),
+            payload: json!(null),
+        };
+        assert_eq!(
+            serde_json::to_vec(&over)
+                .expect("serializing a Message cannot fail")
+                .len()
+                + 1,
+            CAP + 1
+        );
+        let err = try_encode_bounded(&over).expect_err("a cap+1 frame must be rejected");
+        assert_eq!(err.len, CAP + 1);
+        assert!(
+            std::panic::catch_unwind(|| encode(&over)).is_err(),
+            "encode must assert on a cap+1 frame"
         );
     }
 }

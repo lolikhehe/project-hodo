@@ -147,6 +147,9 @@ pub(crate) fn print_best_stages(best: &Times) {
 
 fn main() {
     if std::env::args().skip(1).any(|arg| arg == "--big-doc") {
+        if std::env::var_os("HODO_NO_RULE_INDEX").is_some_and(|v| v == "1") {
+            println!("HODO_NO_RULE_INDEX=1: brute-force style matching (rule index bypassed)");
+        }
         // The DEEP corpus recurses ~200 levels deep through parse/style/layout.
         // A debug build's frames overflow the 1 MiB Windows main-thread stack,
         // so run the whole corpus on a thread with a 16 MiB stack instead.

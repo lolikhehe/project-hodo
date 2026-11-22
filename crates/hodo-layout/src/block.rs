@@ -5,13 +5,32 @@ use std::rc::Rc;
 use super::*;
 
 /// Lay out `dom` into a flat display list for a viewport of `size`.
+///
+/// A fresh [`MeasureCache`] is created per call; repeated text runs inside one
+/// page still share it through `Ctx`. Use [`layout_with_cache`](crate::layout_with_cache)
+/// to keep the cache across calls (and call `set_generation`/`observe_dom`
+/// after a DOM or stylesheet mutation).
 pub fn layout(dom: &Dom, styles: &StyleMap, viewport: Size) -> DisplayList {
+    let mut cache = crate::MeasureCache::new();
+    layout_with_cache(dom, styles, viewport, &mut cache)
+}
+
+/// `layout` with a caller-owned measurement cache. Rerunning the same page
+/// with a warm cache replays previously-shaped text runs instead of scanning
+/// their words again.
+pub fn layout_with_cache(
+    dom: &Dom,
+    styles: &StyleMap,
+    viewport: Size,
+    cache: &mut crate::MeasureCache,
+) -> DisplayList {
     let mut list = DisplayList::default();
     {
         let mut ctx = Ctx {
             dom,
             styles,
             list: &mut list,
+            cache,
         };
         let fallback = fallback_style();
         let mut flow = Flow::new(0.0, viewport.w, 0.0);
@@ -44,7 +63,7 @@ pub(crate) fn layout_children(
 ) {
     let live: Vec<NodeId> = ctx
         .dom
-        .children(parent)
+        .render_children(parent)
         .iter()
         .copied()
         .filter(|&child| {
@@ -53,6 +72,19 @@ pub(crate) fn layout_children(
                 .is_some_and(|s| s.display == Display::None)
         })
         .collect();
+
+    // Risk gate: only the document root, >=8 disjoint block siblings and >=2
+    // cores. Everything else keeps the sequential walk unchanged.
+    if crate::parallel::try_parallel_root_children(
+        ctx,
+        flow,
+        fallback,
+        parent,
+        &link,
+        flow.right - flow.left,
+    ) {
+        return;
+    }
 
     let has_block = live.iter().any(|&c| is_block_level(ctx, c));
     let has_inline = live.iter().any(|&c| !is_block_level(ctx, c));
@@ -264,7 +296,15 @@ fn layout_inline_element(
     }
 }
 
-/// Union of two margin boxes, used when two floats share a side.
+/// Single sub-pixel tolerance for float-edge geometry in this module.
+/// Percentage widths round to ~0.001px at these coordinates; two floats meant
+/// to share an edge (EFF rows 1/2) can otherwise overlap by 0.0004px and get
+/// wrongly dropped. Every edge comparison uses this one value.
+const FLOAT_EPS: f32 = 0.01;
+
+/// Union of two margin boxes, used when two floats share a side. Geometry here
+/// is exact min/max; the only tolerance in float placement is `FLOAT_EPS` in
+/// the cross-side overlap decision below, which operates on this union.
 fn union_rect(a: Rect, b: Rect) -> Rect {
     let x = a.x.min(b.x);
     let y = a.y.min(b.y);
@@ -280,27 +320,26 @@ fn union_rect(a: Rect, b: Rect) -> Rect {
 
 /// Advance a float's top past an earlier float on the opposite side whenever
 /// their margin boxes actually intersect in x and y. Opposite-side floats share
-/// one vertical band in CSS: a right float that stacks left of an earlier
-/// right float can land inside an earlier left float's band (EFF's third
-/// featured row). The check is geometric — real rect extents, not a sum of
-/// widths — so floats that merely touch edges still share the line.
-/// Bounded to 4 hops (matching M8b's `place_word` guard): the single rect kept
-/// per side settles in one hop, the cap is a defensive bound for future
-/// per-slot float stacks.
+/// one vertical band in CSS: a right float that stacks left of an earlier right
+/// float can land inside an earlier left float's band (EFF's third featured
+/// row). The check is geometric — real rect extents, not a sum of widths — so
+/// floats that merely touch edges still share the line.
+///
+/// ONE HOP SUFFICES. `other` is `flow.float_l`/`flow.float_r`: the *union* of
+/// all earlier margin boxes on that side (`record_float` keeps one rect per
+/// side, merging via `union_rect`). That union's bottom is the max of every
+/// opposite-side float's bottom, so moving `y` once to `r.y + r.h` clears them
+/// all at once. A second hop could only re-examine the same rect, which now
+/// satisfies `y + FLOAT_EPS >= r.y + r.h` and breaks — this is why the former
+/// 4-hop loop never ran a second iteration. A genuine two-hop case would need
+/// a per-slot float stack (several non-overlapping rects at different y),
+/// which this one-rect-per-side model does not have; see `record_float`.
 fn clear_opposite_float(y: f32, x0: f32, x1: f32, other: Option<Rect>) -> f32 {
-    // Percentage widths round to ~0.001px at these coordinates; two floats
-    // meant to share an edge (EFF rows 1/2) can otherwise overlap by 0.0004px
-    // and get wrongly dropped. Ignore sub-pixel overlaps.
-    const EDGE_EPS: f32 = 0.01;
-    let mut y = y;
-    for _ in 0..4 {
-        let Some(r) = other else { break };
-        if x0 >= r.x + r.w - EDGE_EPS || x1 <= r.x + EDGE_EPS || y + EDGE_EPS >= r.y + r.h {
-            break;
-        }
-        y = r.y + r.h;
+    let Some(r) = other else { return y };
+    if x0 >= r.x + r.w - FLOAT_EPS || x1 <= r.x + FLOAT_EPS || y + FLOAT_EPS >= r.y + r.h {
+        return y;
     }
-    y
+    r.y + r.h
 }
 
 /// Record a floated child's margin box on the containing flow. Its consumed
@@ -388,7 +427,7 @@ fn layout_child_inner(
             // Events target elements, not text nodes: the owner is the text
             // node's parent element (the document root for bare top-level text).
             let owner = ctx.dom.parent(child).unwrap_or_else(|| ctx.dom.root());
-            feed_text(flow, ctx.list, t, st, link, &boxes, owner);
+            feed_text(flow, ctx.list, t, st, link, &boxes, owner, ctx.cache);
         }
         NodeKind::Element { .. } => {
             let st = s.as_ref().unwrap_or(fallback);
@@ -423,10 +462,7 @@ fn layout_child_inner(
             };
             // shortcut: floats without an explicit width take the full content
             // width (no shrink-to-fit pass yet); upgrade with intrinsic sizing.
-            let specified_w = st
-                .width_percent
-                .map(|pct| resolve_span(0.0, Some(pct), cb_width))
-                .or(st.width);
+            let specified_w = crate::resolve_width(ctx.styles, child, st, cb_width);
             let float_w = if is_float {
                 specified_w
                     .unwrap_or((cb_width - fm.left - fm.right).max(0.0))
@@ -648,7 +684,8 @@ fn layout_child_inner(
                     // flow cursor is set from the atomic's consumed height below.
                     // shortcut: box width mirrors inline_block_atom; flex/grid/table
                     // atomics use the same declared-or-available width here.
-                    let mut box_w = st.width.unwrap_or((avail_w - fm.left - fm.right).max(0.0));
+                    let mut box_w = crate::resolve_width(ctx.styles, child, st, avail_w)
+                        .unwrap_or((avail_w - fm.left - fm.right).max(0.0));
                     box_w = box_w
                         .max(st.min_size.w.max(0.0))
                         .min(st.max_size.w.max(0.0))
@@ -758,10 +795,7 @@ fn layout_block_inner(
     let box_y = avail.y + m.top;
     // shortcut: explicit width/min/max clamp the border box (no box-sizing
     // support); max-size wins when the two constraints cross over.
-    let specified_w = style
-        .width_percent
-        .map(|pct| resolve_span(0.0, Some(pct), basis))
-        .or(style.width);
+    let specified_w = crate::resolve_width(ctx.styles, id, style, basis);
     let mut box_w = specified_w
         .unwrap_or(avail.width - m.left - m.right)
         .max(0.0);
@@ -1816,9 +1850,49 @@ mod tests {
     }
 
     #[test]
+    fn cross_side_overlapping_floats_are_pushed_apart() {
+        // Minimal forced-overlap repro: in a 200px pane two 60% floats span
+        // [0,120] (left) and [80,200] (right), sharing 40px in x. Without the
+        // cross-side clear both would paint at y=0 and overlap.
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let pane = elem(&mut dom, root, "div", &[("style", "width:200px")]);
+        for side in ["left", "right"] {
+            elem(
+                &mut dom,
+                pane,
+                "div",
+                &[(
+                    "style",
+                    &format!("float:{side}; width:60%; height:20px; background:#ff0000"),
+                )],
+            );
+        }
+        let list = layout(&dom, &compute_styles(&dom, &[]), viewport(200.0));
+        let rects = colored_rects(&list, Color::rgb(255, 0, 0));
+        assert_eq!(rects.len(), 2);
+        let (left, right) = if rects[0].x < rects[1].x {
+            (rects[0], rects[1])
+        } else {
+            (rects[1], rects[0])
+        };
+        assert!(
+            left.x + left.w > right.x + FLOAT_EPS,
+            "the two floats must genuinely overlap in x: {left:?} {right:?}"
+        );
+        assert!(
+            right.y >= left.y + left.h - FLOAT_EPS,
+            "the later float must be pushed below the earlier one: {left:?} {right:?}"
+        );
+    }
+
+    #[test]
     fn many_alternating_floats_terminate_with_valid_geometry() {
-        // Pathological stack: every float overlaps the opposite side's union
-        // band, so each one hops. The 4-hop guard must keep this bounded.
+        // Pathological stack: 60% floats genuinely overlap across sides —
+        // left spans [0,600], right spans [400,1000] in the 1000px pane, a
+        // 200px shared band — so every float must hop past the opposite side's
+        // union. The old 45% widths left the bands disjoint, so the cross-side
+        // clear never fired and the test passed without exercising it.
         let mut dom = Dom::new();
         let root = dom.root();
         let pane = elem(&mut dom, root, "div", &[("style", "width:1000px")]);
@@ -1830,7 +1904,7 @@ mod tests {
                 "div",
                 &[(
                     "style",
-                    &format!("float:{side}; width:45%; height:10px; background:#ff0000"),
+                    &format!("float:{side}; width:60%; height:10px; background:#ff0000"),
                 )],
             );
         }
@@ -1845,8 +1919,8 @@ mod tests {
         }
         for (i, a) in rects.iter().enumerate() {
             for (j, b) in rects.iter().enumerate().skip(i + 1) {
-                let overlap_x = a.x + 0.01 < b.x + b.w && b.x + 0.01 < a.x + a.w;
-                let overlap_y = a.y + 0.01 < b.y + b.h && b.y + 0.01 < a.y + a.h;
+                let overlap_x = a.x + FLOAT_EPS < b.x + b.w && b.x + FLOAT_EPS < a.x + a.w;
+                let overlap_y = a.y + FLOAT_EPS < b.y + b.h && b.y + FLOAT_EPS < a.y + a.h;
                 assert!(
                     !(overlap_x && overlap_y),
                     "floats {i} and {j} overlap: {a:?} {b:?}"
@@ -2051,5 +2125,219 @@ mod tests {
             "img",
             &[("src", src), ("width", &ws), ("height", &hs)],
         )
+    }
+
+    // ---- Shadow-DOM layout (wave 1: hosts replace light children) ----------
+
+    #[test]
+    fn shadow_host_lays_out_shadow_content_and_skips_light_children() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let host = elem(&mut dom, root, "div", &[("style", "width:200px")]);
+        let shadow = dom.attach_shadow(host).expect("first attach succeeds");
+
+        // Stamped light children: the host must ignore them entirely.
+        let light = elem(&mut dom, host, "span", &[("style", "background:#ff0000")]);
+        text_node(&mut dom, light, "LIGHT");
+
+        // Stamped shadow content: this is what must paint.
+        let s = elem(&mut dom, shadow, "p", &[]);
+        text_node(&mut dom, s, "SHADOW");
+
+        let list = layout(&dom, &compute_styles(&dom, &[]), viewport(200.0));
+        let t = texts(&list);
+        assert_eq!(t.len(), 1, "only shadow text paints: {t:?}");
+        assert_eq!(t[0].0, "SHADOW");
+        assert!(
+            colored_rects(&list, Color::rgb(0xff, 0, 0)).is_empty(),
+            "the light child's background must not paint"
+        );
+    }
+
+    #[test]
+    fn host_without_shadow_root_still_lays_out_light_children() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let host = elem(&mut dom, root, "div", &[("style", "width:200px")]);
+        assert_eq!(dom.shadow_root(&host), None);
+        let light = elem(&mut dom, host, "span", &[("style", "background:#ff0000")]);
+        text_node(&mut dom, light, "LIGHT");
+
+        let list = layout(&dom, &compute_styles(&dom, &[]), viewport(200.0));
+        let t = texts(&list);
+        assert_eq!(t.len(), 1, "light text paints as before: {t:?}");
+        assert_eq!(t[0].0, "LIGHT");
+        assert_eq!(
+            colored_rects(&list, Color::rgb(0xff, 0, 0)).len(),
+            1,
+            "light background paints as before"
+        );
+    }
+
+    #[test]
+    fn shadow_subtree_text_block_and_float_complete_layout() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let host = elem(
+            &mut dom,
+            root,
+            "div",
+            &[("style", "width:200px; background:#dddddd")],
+        );
+        let shadow = dom.attach_shadow(host).unwrap();
+
+        text_node(&mut dom, shadow, "lead");
+        elem(
+            &mut dom,
+            shadow,
+            "div",
+            &[(
+                "style",
+                "float:left; width:40px; height:30px; background:#ffcc99",
+            )],
+        );
+        let block = elem(&mut dom, shadow, "div", &[("style", "background:#99ccff")]);
+        text_node(&mut dom, block, "body");
+
+        let list = layout(&dom, &compute_styles(&dom, &[]), viewport(200.0));
+        let t = texts(&list);
+        assert_eq!(
+            t.len(),
+            2,
+            "shadow text and shadow block text both paint: {t:?}"
+        );
+        let orange = colored_rects(&list, Color::rgb(0xff, 0xcc, 0x99));
+        let blue = colored_rects(&list, Color::rgb(0x99, 0xcc, 0xff));
+        assert_eq!(orange.len(), 1, "floated shadow box painted: {orange:?}");
+        assert_eq!(blue.len(), 1, "in-flow shadow block painted: {blue:?}");
+        assert!(
+            t[1].1.x >= orange[0].x + orange[0].w,
+            "the following block's text must wrap past the shadow float: {t:?} {orange:?}"
+        );
+        let host_bg = colored_rects(&list, Color::rgb(0xdd, 0xdd, 0xdd));
+        assert_eq!(host_bg.len(), 1, "host box painted: {host_bg:?}");
+        assert!(
+            host_bg[0].h >= 30.0,
+            "the shadow host's auto height must contain its float: {host_bg:?}"
+        );
+    }
+
+    #[test]
+    fn shadow_items_node_map_owners_are_shadow_nodes() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let host = elem(&mut dom, root, "div", &[("style", "width:200px")]);
+        let shadow = dom.attach_shadow(host).unwrap();
+        let sbox = elem(&mut dom, shadow, "div", &[("style", "background:#00ff00")]);
+        text_node(&mut dom, sbox, "owned");
+
+        let light = elem(&mut dom, host, "div", &[("style", "background:#ff0000")]);
+        text_node(&mut dom, light, "LIGHT");
+
+        let list = layout(&dom, &compute_styles(&dom, &[]), viewport(200.0));
+        // `layout`'s debug_asserts check items/node_map and fixed parity.
+        assert_eq!(list.items.len(), list.node_map.len());
+        assert_eq!(list.fixed_items.len(), list.fixed_node_map.len());
+        assert!(
+            list.node_map.contains(&sbox),
+            "shadow box owns its rect and text: {:?}",
+            list.node_map
+        );
+        assert!(
+            !list.node_map.contains(&light),
+            "light box must own nothing: {:?}",
+            list.node_map
+        );
+    }
+
+    #[test]
+    fn shadow_controls_and_flex_grid_table_containers_emit_items() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let host = elem(&mut dom, root, "div", &[("style", "width:300px")]);
+        let shadow = dom.attach_shadow(host).unwrap();
+
+        // A control directly under the shadow root.
+        elem(
+            &mut dom,
+            shadow,
+            "input",
+            &[("type", "text"), ("value", "direct")],
+        );
+
+        // A flex container inside the shadow tree with control children.
+        let flex = elem(
+            &mut dom,
+            shadow,
+            "div",
+            &[("style", "display:flex; width:300px")],
+        );
+        let ok = elem(&mut dom, flex, "button", &[]);
+        text_node(&mut dom, ok, "OK");
+        let cancel = elem(&mut dom, flex, "button", &[]);
+        text_node(&mut dom, cancel, "Cancel");
+
+        // A grid container inside the shadow tree with control children.
+        let grid = elem(
+            &mut dom,
+            shadow,
+            "div",
+            &[(
+                "style",
+                "display:grid; grid-template-columns:100px 100px; width:300px",
+            )],
+        );
+        elem(&mut dom, grid, "input", &[("type", "checkbox")]);
+        let select = elem(&mut dom, grid, "select", &[]);
+        let option = elem(&mut dom, select, "option", &[]);
+        text_node(&mut dom, option, "One");
+
+        // A table container inside the shadow tree with a control child.
+        let table = elem(&mut dom, shadow, "table", &[("style", "width:300px")]);
+        let tr = elem(&mut dom, table, "tr", &[]);
+        let td = elem(&mut dom, tr, "td", &[]);
+        elem(&mut dom, td, "textarea", &[]);
+
+        let list = layout(&dom, &compute_styles(&dom, &[]), viewport(300.0));
+        let controls: Vec<(&ControlKind, &String)> = list
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                DisplayItem::Control { kind, text, .. } => Some((kind, text)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            controls.len(),
+            6,
+            "every shadow control emits an item: {controls:?}"
+        );
+        let labels: Vec<&str> = controls.iter().map(|(_, t)| t.as_str()).collect();
+        assert!(labels.contains(&"direct"), "text input value: {labels:?}");
+        assert!(labels.contains(&"OK"), "flex button label: {labels:?}");
+        assert!(labels.contains(&"Cancel"), "flex button label: {labels:?}");
+        assert!(
+            labels.contains(&"One"),
+            "grid select option label: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn deep_shadow_tree_lays_out_within_depth_cap() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let host = elem(&mut dom, root, "div", &[("style", "width:200px")]);
+        let shadow = dom.attach_shadow(host).unwrap();
+
+        let mut cur = shadow;
+        for _ in 0..100 {
+            cur = elem(&mut dom, cur, "div", &[]);
+        }
+        text_node(&mut dom, cur, "deep");
+
+        let list = layout(&dom, &compute_styles(&dom, &[]), viewport(200.0));
+        let t = texts(&list);
+        assert_eq!(t.len(), 1, "the deepest shadow text must paint: {t:?}");
+        assert_eq!(t[0].0, "deep");
     }
 }

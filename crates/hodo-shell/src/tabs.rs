@@ -14,7 +14,8 @@
 //! reloads its URL through the normal pipeline if the file is missing/corrupt.
 //! The on-disk format and the orphan sweep live in [`crate::sessions`].
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 
 use hodo_dom::NodeId;
 use hodo_layout::DisplayList;
@@ -91,6 +92,9 @@ impl Tab {
 // parallel unit tests isolated; the GUI drives everything on one thread.
 thread_local! {
     static PRIVATE_LOAD: Cell<bool> = const { Cell::new(false) };
+    /// Redirect-final URLs from the active tab's history, used to seed
+    /// `:visited` matching in `hodo_style::compute_styles_with_visited`.
+    static VISITED_HREFS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 }
 
 /// Read by `app::load_resource` when building `FetchOptions`.
@@ -100,6 +104,25 @@ pub(crate) fn private_load() -> bool {
 
 fn set_private_load(private: bool) {
     PRIVATE_LOAD.with(|flag| flag.set(private));
+}
+
+/// Snapshot of the active tab's visited URLs for the page pipeline. Headless
+/// loads have no tab and therefore seed an empty set.
+pub(crate) fn visited_hrefs() -> HashSet<String> {
+    VISITED_HREFS.with(|set| set.borrow().clone())
+}
+
+#[cfg(test)]
+pub(crate) fn set_visited_hrefs_for_test(hrefs: &[&str]) {
+    VISITED_HREFS.with(|set| {
+        *set.borrow_mut() = hrefs.iter().map(|href| (*href).to_string()).collect();
+    });
+}
+
+/// Set both load-context thread-locals from a tab before driving the pipeline.
+fn set_load_context(tab: &Tab) {
+    set_private_load(tab.private);
+    VISITED_HREFS.with(|set| *set.borrow_mut() = tab.history.iter().cloned().collect());
 }
 
 /// True when hodo was launched with `--private`.
@@ -117,7 +140,7 @@ fn hydrate(tab: &mut Tab) {
         .cloned()
         .filter(|url| !url.is_empty())
         .unwrap_or_else(|| ABOUT_HODO_URL.to_string());
-    set_private_load(tab.private);
+    set_load_context(tab);
     let (title, display_list, page_js) = load_page_live(&url, DEFAULT_VIEWPORT);
     tab.url = url;
     tab.title = title;
@@ -138,7 +161,7 @@ fn reattach_page_js(app: &mut App) {
     if url.is_empty() {
         return;
     }
-    set_private_load(app.tabs[index].private);
+    set_load_context(&app.tabs[index]);
     let (_, list, page_js) = load_page_live(&url, app.viewport);
     app.tabs[index].has_page_js = page_js.is_some();
     if page_js.is_some() {
@@ -401,7 +424,7 @@ impl App {
     /// can fire into the document being replaced.
     fn load_history_entry(&mut self, viewport: Size) -> String {
         self.page_js = None;
-        set_private_load(self.tabs[self.active].private);
+        set_load_context(&self.tabs[self.active]);
         let url = self.tabs[self.active].history[self.tabs[self.active].history_cursor].clone();
         let (title, display_list, page_js) = load_page_live(&url, viewport);
         self.page_js = page_js;
@@ -448,7 +471,7 @@ impl App {
             return String::new();
         }
         self.page_js = None;
-        set_private_load(self.tabs[self.active].private);
+        set_load_context(&self.tabs[self.active]);
         let (title, display_list, page_js) = load_page_live(&url, viewport);
         self.page_js = page_js;
         let tab = &mut self.tabs[self.active];
@@ -559,7 +582,7 @@ impl App {
     /// Forced re-pipe after a resize (the DOM did not change, so `tick` alone
     /// would skip it).
     pub(crate) fn page_js_relayout(&mut self, viewport: Size) -> bool {
-        let list = self.page_js.as_ref().map(|ctx| ctx.relayout(viewport));
+        let list = self.page_js.as_mut().map(|ctx| ctx.relayout(viewport));
         let Some(list) = list else {
             return false;
         };

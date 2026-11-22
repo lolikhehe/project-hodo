@@ -103,6 +103,110 @@ function __hodoMemoPut(key, value) {
 var __hodoPure = __HODO_PURE__;
 "#;
 
+// ESM graph glue. The shell owns the graph: it emits, per module and in
+// topological order, `__hodoModuleBaseUrl=<U>;` followed by
+// `__hodoRunModule(<U>, [<depU>...], function(__mods){ ...; return {...}; })`.
+// Deps are absolute URLs in first-mention order, so by the time a factory runs
+// every dep's exports are already in the registry. hodo-js only owns the
+// registry, the factory call, and the dynamic-import promise glue.
+const MODULE_JS: &str = r#"
+// URL -> export namespace. Null prototype so a URL like `__proto__` can never
+// alias Object.prototype; ids are strings, not property-name surprises.
+var __hodoModules = Object.create(null);
+// Set by the emitted script immediately before each __hodoRunModule call.
+var __hodoModuleBaseUrl = '';
+function __hodoRunModule(url, deps, factory) {
+  var existing = __hodoModules[url];
+  if (existing !== undefined) return existing;
+  var mods = [];
+  for (var i = 0; i < deps.length; i++) {
+    var dep = __hodoModules[deps[i]];
+    if (dep === undefined) {
+      throw new Error('module ' + url + ': missing dependency ' + deps[i]);
+    }
+    mods.push(dep);
+  }
+  // The shell emits `__hodoModuleBaseUrl=<U>;` before each call; set it here
+  // too so a factory's own synchronous import() resolves against its URL even
+  // if the host has not emitted that line yet.
+  __hodoModuleBaseUrl = url;
+  // The factory runs as a plain call under the strict graph-eval path, so
+  // `this === undefined` and undeclared assignments are ReferenceErrors.
+  var raw = factory(mods);
+  // Snapshot own enumerable exports. Live bindings are intentionally NOT
+  // modelled in wave 1: later mutation of `raw` cannot reach a registered
+  // consumer, matching the frozen "snapshot the returned object" contract.
+  var snapshot = Object.create(null);
+  if (raw !== null && raw !== undefined) {
+    var keys = Object.keys(raw);
+    for (var k = 0; k < keys.length; k++) snapshot[keys[k]] = raw[keys[k]];
+  }
+  __hodoModules[url] = snapshot;
+  return snapshot;
+}
+// Dynamic import. The shell rewrites `import(spec)` to `__hodoDynImport(spec)`
+// (boa has no native import syntax). Pending id -> { resolve, reject }.
+var __hodoDynPending = Object.create(null);
+var __hodoDynNextId = 1;
+// Wave-1 string resolution: absolute URLs pass through; relative specs are
+// joined to the current module's directory and `.`/`..` segments collapsed.
+// No percent-encoding, punycode or default-port canonicalisation.
+function __hodoResolveModuleSpec(spec, base) {
+  var text = String(spec);
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(text)) return text;
+  var rest = String(base || '');
+  var prefix = '';
+  var origin = /^([A-Za-z][A-Za-z0-9+.-]*:\/\/[^/]*)(\/.*)?$/.exec(rest);
+  if (origin) { prefix = origin[1]; rest = origin[2] || '/'; }
+  else { prefix = ''; }
+  rest = rest.replace(/[?#].*$/, '');
+  var dir = rest.slice(0, rest.lastIndexOf('/') + 1);
+  var joined = text.charAt(0) === '/' ? text : dir + text;
+  var parts = [];
+  var segs = joined.split('/');
+  for (var i = 0; i < segs.length; i++) {
+    var seg = segs[i];
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') { parts.pop(); continue; }
+    parts.push(seg);
+  }
+  return prefix + '/' + parts.join('/');
+}
+function __hodoDynImport(spec) {
+  var id = __hodoDynNextId++;
+  // The shell normally assigns `__hodoModuleBaseUrl` right before each module
+  // factory. Fall back to the page URL so a bare import() still resolves with
+  // an authority if the host has not emitted that line yet.
+  var base = __hodoModuleBaseUrl ||
+    ((typeof window !== 'undefined' && window.location) ? window.location.href : '');
+  var resolved = __hodoResolveModuleSpec(spec, base);
+  return new Promise(function (resolve, reject) {
+    __hodoDynPending[id] = { resolve: resolve, reject: reject };
+    // A throwing native must not strand a permanently pending promise.
+    try {
+      __hodo_load_dynamic_module(resolved, base, id);
+    } catch (err) {
+      var entry = __hodoDynPending[id];
+      if (entry) { delete __hodoDynPending[id]; reject(err); }
+    }
+  });
+}
+// Shell-invoked settle callbacks. A late callback for an unknown or already
+// settled id is a documented no-op: first settle wins, ids are never reused.
+function __hodoDynResolved(id, exportsObj) {
+  var entry = __hodoDynPending[id];
+  if (!entry) return;
+  delete __hodoDynPending[id];
+  try { entry.resolve(exportsObj); } catch (e) { __hodoReportError(e); }
+}
+function __hodoDynRejected(id, msg) {
+  var entry = __hodoDynPending[id];
+  if (!entry) return;
+  delete __hodoDynPending[id];
+  try { entry.reject(new Error(String(msg))); } catch (e) { __hodoReportError(e); }
+}
+"#;
+
 fn with_memo_config(js: &str) -> String {
     let pure = crate::PURE_METHODS
         .iter()
@@ -110,6 +214,7 @@ fn with_memo_config(js: &str) -> String {
         .collect::<Vec<_>>()
         .join(",");
     js.replace("__HODO_MEMO__", MEMO_JS)
+        .replace("__HODO_MODULES__", MODULE_JS)
         .replace("__HODO_PURE__", &format!("{{{pure}}}"))
         .replace("__HODO_MEMO_CAP__", &crate::MEMO_CAP.to_string())
 }
@@ -133,6 +238,7 @@ function __hodoFreezeDeep(o, seen) {
 }
 function __hodoArgs(a) { return Array.prototype.slice.call(a); }
 __HODO_MEMO__
+__HODO_MODULES__
 var __hodoState = { pending: {}, listeners: {}, lastError: null, nextId: 1 };
 function __hodoPost(name, args) {
   return __hodo_post_task(name, args);
@@ -491,7 +597,7 @@ pub fn build_prelude(config: &RuntimeConfig) -> String {
 /// extension prelude: no `chrome`, `browser`, `fetch`, `i18n` or `action` is
 /// ever installed here — only console, timers, promise plumbing, the DOM
 /// wrappers, the minimal `window` alias and the internal `__hodoFetch` helper.
-const PAGE_HELPERS: &str = r#"
+const PAGE_STATIC: &str = r#"
 var console = {
   log: function () { __hodo_log(__hodoJoin(arguments)); },
   info: function () { __hodo_log(__hodoJoin(arguments)); },
@@ -512,6 +618,7 @@ function __hodoReportError(e) {
   try { __hodo_log(String(e && (e.stack || e.message) || e)); } catch (_) {}
 }
 __HODO_MEMO__
+__HODO_MODULES__
 var __hodoState = { pending: {}, listeners: {}, lastError: null, nextId: 1 };
 function __hodoPost(name, args) { return __hodo_post_task(name, args); }
 function __hodoCall(name, args, callback, callbackOnly) {
@@ -585,6 +692,9 @@ function __hodoFetch(url, options) {
     throw new TypeError(e.message || String(e));
   });
 }
+// Page fetch rides the shell's GET-only cached loader hook; unsupported methods
+// are rejected by __hodoFetch rather than silently faked.
+function fetch(url, options) { return __hodoFetch(url, options); }
 function setTimeout(fn, delay) {
   if (typeof fn !== 'function') throw new TypeError('setTimeout expects a function');
   var ms = Number(delay);
@@ -603,21 +713,43 @@ function setInterval(fn, delay) {
 }
 function clearTimeout(id) { __hodo_clear_timer(id); }
 function clearInterval(id) { __hodo_clear_timer(id); }
-// Minimal honest attribute view, rebuilt on every access from the real attr
-// native. shortcut: only common HTML attribute names are enumerated; arbitrary
-// custom names stay invisible until Dom exposes a real attrs() iterator.
+// Attribute view rebuilt from the real get_attribute native. Dom has no public
+// attrs() iterator, so names are collected as setAttribute/innerHTML are used;
+// that includes Lit's `$lit$...` marker attributes, which template stamping
+// needs to see. Filtering by the native keeps the enumeration honest.
 var __hodoDomAttributeNames = [
   'id', 'class', 'name', 'src', 'href', 'alt', 'title', 'type', 'value',
   'placeholder', 'role', 'style', 'width', 'height', 'rel', 'target',
   'action', 'method', 'for', 'content', 'charset', 'lang', 'dir',
   'checked', 'selected', 'disabled', 'readonly', 'required', 'hidden'
 ];
-function __hodoDomAttributes(node) {
+var __hodoSeenAttributeNames = [];
+function __hodoNoteAttributeNames(text) {
+  var re = /([^\s"'>=/]+)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/g;
+  var match;
+  while ((match = re.exec(String(text))) !== null) {
+    if (__hodoSeenAttributeNames.indexOf(match[1]) === -1) {
+      __hodoSeenAttributeNames.push(match[1]);
+    }
+  }
+}
+function __hodoAttributeNamesOf(node) {
   var out = [];
-  for (var i = 0; i < __hodoDomAttributeNames.length; i++) {
-    var name = __hodoDomAttributeNames[i];
-    var value = __hodo_dom_get_attribute(node, name);
-    if (value !== null) out.push({ name: name, value: value });
+  var seen = {};
+  var all = __hodoDomAttributeNames.concat(__hodoSeenAttributeNames);
+  for (var i = 0; i < all.length; i++) {
+    var name = all[i];
+    if (seen[name]) continue;
+    seen[name] = true;
+    if (__hodo_dom_get_attribute(node, name) !== null) out.push(name);
+  }
+  return out;
+}
+function __hodoDomAttributes(node) {
+  var names = __hodoAttributeNamesOf(node);
+  var out = [];
+  for (var i = 0; i < names.length; i++) {
+    out.push({ name: names[i], value: __hodo_dom_get_attribute(node, names[i]) });
   }
   out.getNamedItem = function (name) {
     for (var j = 0; j < out.length; j++) {
@@ -631,6 +763,7 @@ function __hodoDomAttributes(node) {
 // so all of this is naturally per-runtime. Keys are the stable DOM handles
 // handed out by alloc_handle (one per live NodeId).
 var __hodoUpgraded = {};
+var __hodoWrappers = {};
 var __hodoCustomElements = {};
 var __hodoWhenDefined = {};
 var __hodoPendingNode = null;
@@ -646,6 +779,40 @@ function __hodoConnect(inst) {
 function __hodoDomProps(api, node) {
   api.__hodoNode = node;
   var isFragment = __hodo_dom_tag(node) === '#document-fragment';
+  api.append = function () {
+    for (var i = 0; i < arguments.length; i++) {
+      var value = arguments[i];
+      api.appendChild(value instanceof Node ? value
+        : document.createTextNode(String(value)));
+    }
+  };
+  api.prepend = function () {
+    var kids = __hodo_dom_child_nodes(node);
+    var ref = kids.length ? __hodoWrapAny(kids[0]) : null;
+    for (var i = 0; i < arguments.length; i++) {
+      var value = arguments[i];
+      api.insertBefore(value instanceof Node ? value
+        : document.createTextNode(String(value)), ref);
+    }
+  };
+  api.replaceChildren = function () {
+    var kids = __hodo_dom_child_nodes(node);
+    for (var i = 0; i < kids.length; i++) api.removeChild(__hodoWrapAny(kids[i]));
+    api.append.apply(api, arguments);
+  };
+  api.contains = function (other) {
+    if (!other || other.__hodoNode === undefined) return false;
+    var target = other.__hodoNode;
+    var found = false;
+    var handles = [node];
+    var cursor;
+    while ((cursor = handles.shift()) !== undefined) {
+      if (cursor === target) { found = true; break; }
+      var kids = __hodo_dom_child_nodes(cursor);
+      for (var j = 0; j < kids.length; j++) handles.push(kids[j]);
+    }
+    return found;
+  };
   api.appendChild = function (child) {
     // The native flattens a DocumentFragment. Children only become connected
     // when they land in the live tree, not while parked in a fragment.
@@ -658,10 +825,64 @@ function __hodoDomProps(api, node) {
     }
     return child;
   };
+  api.insertBefore = function (newNode, refNode) {
+    // A null/undefined ref appends; fragments flatten in the native.
+    var refHandle = (refNode === null || refNode === undefined) ? null : refNode.__hodoNode;
+    var moved = newNode instanceof DocumentFragment ? newNode.childNodes : null;
+    __hodo_dom_insert_before(node, newNode.__hodoNode, refHandle);
+    if (moved) {
+      for (var i = 0; i < moved.length; i++) __hodoConnect(moved[i]);
+    } else if (!isFragment) {
+      __hodoConnect(newNode);
+    }
+    return newNode;
+  };
   api.removeChild = function (child) { __hodo_dom_remove_child(node, child.__hodoNode); return child; };
+  api.remove = function () {
+    var parent = __hodo_dom_parent(node);
+    if (parent !== null) __hodo_dom_remove_child(parent, node);
+  };
   api.getAttribute = function (name) { return __hodo_dom_get_attribute(node, String(name)); };
-  api.setAttribute = function (name, value) { __hodo_dom_set_attribute(node, String(name), String(value)); };
-  api.addEventListener = function (kind, fn) { __hodo_dom_add_listener(node, String(kind), fn); };
+  api.setAttribute = function (name, value) {
+    __hodoNoteAttributeNames([String(name) + '="' + String(value) + '"'].join(''));
+    __hodo_dom_set_attribute(node, String(name), String(value));
+  };
+  api.hasAttribute = function (name) {
+    return __hodo_dom_get_attribute(node, String(name)) !== null;
+  };
+  api.hasAttributes = function () { return __hodoAttributeNamesOf(node).length > 0; };
+  api.getAttributeNames = function () { return __hodoAttributeNamesOf(node); };
+  // shortcut: Dom has no attribute-removal native, so removal clears the value.
+  api.removeAttribute = function (name) {
+    __hodo_dom_set_attribute(node, String(name), '');
+  };
+  api.toggleAttribute = function (name, force) {
+    var on = force === undefined
+      ? !api.hasAttribute(name) : !!force;
+    if (on) api.setAttribute(name, '');
+    else api.removeAttribute(name);
+    return on;
+  };
+  // Scoped to this node's subtree (the native starts at the handle, and hides
+  // #shadow-root subtrees unless the handle itself is a shadow root).
+  api.querySelector = function (selector) {
+    return __hodoWrapAny(__hodo_dom_query(node, String(selector)));
+  };
+  api.querySelectorAll = function (selector) {
+    var handles = __hodo_dom_query_all(node, String(selector));
+    var out = [];
+    for (var i = 0; i < handles.length; i++) {
+      var wrapped = __hodoWrapAny(handles[i]);
+      if (wrapped !== null) out.push(wrapped);
+    }
+    return out;
+  };
+  api.addEventListener = function (kind, fn) {
+    __hodo_dom_add_listener(node, String(kind), __hodoEventListener(fn));
+  };
+  api.removeEventListener = function (kind, fn) {
+    __hodo_dom_remove_listener(node, String(kind), __hodoEventListener(fn));
+  };
   api.dispatchEvent = function (evt) {
     evt.target = this;
     return __hodo_dom_dispatch_event(node, evt, !!evt.bubbles);
@@ -692,18 +913,42 @@ function __hodoDomProps(api, node) {
     set: function (v) { __hodo_dom_set_attribute(node, 'href', String(v)); },
     enumerable: true
   });
+  var type = __hodo_dom_node_type(node);
   var tag = __hodo_dom_tag(node);
-  var isDoc = tag === null || tag === undefined;
-  api.nodeType = isDoc ? 9 : 1;
-  api.nodeName = isDoc ? '#document' : String(tag).toUpperCase();
-  api.tagName = isDoc ? null : api.nodeName;
+  api.nodeType = type;
+  api.nodeName = type === 9 ? '#document'
+    : type === 3 ? '#text'
+    : type === 8 ? '#comment'
+    : type === 11 ? '#document-fragment'
+    : String(tag).toUpperCase();
+  api.tagName = type === 1 ? api.nodeName : null;
+  // Local name / namespace are honest for our HTML-only arena. ownerDocument
+  // is resolved lazily (the live `document` is built after this helper).
+  api.localName = type === 1 ? String(tag).toLowerCase() : null;
+  api.namespaceURI = 'http://www.w3.org/1999/xhtml';
+  Object.defineProperty(api, 'ownerDocument', {
+    get: function () { return __hodoOwnerDocument(node); }
+  });
+  // Minimal serialization: text verbatim (escaped), elements as
+  // <tag attr="v">…</tag>, void tags without a close. Fidelity limits: only
+  // the curated attribute names from __hodoDomAttributes survive, namespaces
+  // and entity fidelity are not modelled, and shadow content is hidden (the
+  // children native filters #shadow-root). Enough for polyfill reads.
+  Object.defineProperty(api, 'innerHTML', {
+    get: function () { return __hodoSerialize(__hodoInnerTarget(node)); },
+    set: function (value) {
+      __hodoNoteAttributeNames(value);
+      __hodo_dom_set_inner_html(__hodoInnerTarget(node), String(value));
+    },
+    enumerable: true
+  });
   // Per-access builds from the real natives: no caching, no invalidation risk.
   Object.defineProperty(api, 'children', {
     get: function () {
       var handles = __hodo_dom_children(node);
       var out = [];
       for (var i = 0; i < handles.length; i++) {
-        out.push(__hodoDomWrap(handles[i], null, null, HTMLElement.prototype));
+        out.push(__hodoWrapAny(handles[i]));
       }
       return out;
     }
@@ -713,37 +958,84 @@ function __hodoDomProps(api, node) {
       var handles = __hodo_dom_child_nodes(node);
       var out = [];
       for (var i = 0; i < handles.length; i++) {
-        // shortcut: text nodes get an element-shaped view until a node-kind
-        // wrapper exists; the child list and identity are still real.
-        out.push(__hodoDomWrap(handles[i], null, null, HTMLElement.prototype));
+        out.push(__hodoWrapAny(handles[i]));
       }
       return out;
     }
+  });
+  Object.defineProperty(api, 'firstChild', {
+    get: function () {
+      var handles = __hodo_dom_child_nodes(node);
+      return handles.length ? __hodoWrapAny(handles[0]) : null;
+    }
+  });
+  Object.defineProperty(api, 'lastChild', {
+    get: function () {
+      var handles = __hodo_dom_child_nodes(node);
+      return handles.length ? __hodoWrapAny(handles[handles.length - 1]) : null;
+    }
+  });
+  Object.defineProperty(api, 'firstElementChild', {
+    get: function () {
+      var handles = __hodo_dom_children(node);
+      return handles.length ? __hodoWrapAny(handles[0]) : null;
+    }
+  });
+  Object.defineProperty(api, 'lastElementChild', {
+    get: function () {
+      var handles = __hodo_dom_children(node);
+      return handles.length ? __hodoWrapAny(handles[handles.length - 1]) : null;
+    }
+  });
+  Object.defineProperty(api, 'previousSibling', {
+    get: function () { return __hodoSibling(node, -1); }
+  });
+  Object.defineProperty(api, 'nextSibling', {
+    get: function () { return __hodoSibling(node, 1); }
   });
   Object.defineProperty(api, 'attributes', {
     get: function () { return __hodoDomAttributes(node); }
   });
   Object.defineProperty(api, 'parentNode', {
-    get: function () {
-      var handle = __hodo_dom_parent(node);
-      if (handle === null) return null;
-      var parentProto = __hodo_dom_tag(handle) === null
-        ? Document.prototype : HTMLElement.prototype;
-      return __hodoDomWrap(handle, null, null, parentProto);
-    }
+    get: function () { return __hodoWrapAny(__hodo_dom_parent(node)); }
   });
   Object.defineProperty(api, 'parentElement', {
     get: function () {
       var handle = __hodo_dom_parent(node);
-      if (handle === null || __hodo_dom_tag(handle) === null) return null;
-      return __hodoDomWrap(handle, null, null, HTMLElement.prototype);
+      return (handle !== null && __hodo_dom_node_type(handle) === 1)
+        ? __hodoWrapAny(handle) : null;
     }
   });
+}
+// DOM EventListener accepts either a function or an object with handleEvent;
+// Lit's EventPart is the latter. The native listener registry requires a
+// callable stored in a global slot, so adapt objects once and reuse the wrapper
+// for removeEventListener identity.
+function __hodoEventListener(listener) {
+  if (typeof listener === 'function') return listener;
+  if (listener !== null && typeof listener === 'object'
+      && typeof listener.handleEvent === 'function') {
+    if (listener.__hodoListenerWrapper === undefined) {
+      var target = listener;
+      var wrapper = function (event) { return target.handleEvent(event); };
+      Object.defineProperty(listener, '__hodoListenerWrapper', {
+        value: wrapper, configurable: true
+      });
+    }
+    return listener.__hodoListenerWrapper;
+  }
+  return listener; // the native reports the type error
 }
 function __hodoDomWrap(node, extra, accessors, proto) {
   if (node === null || node === undefined) return null;
   var upgraded = __hodoUpgraded[node];
   if (upgraded !== undefined) return upgraded;
+  // Plain wrappers get a separate identity cache: __hodoUpgraded is reserved
+  // for custom-element instances, so caching there would block later upgrades.
+  var cached = __hodoWrappers[node];
+  if (cached !== undefined) return cached;
+  // Ordinary {} so libraries can stash private state (__styleInfo, etc.) on
+  // wrappers; only the DOM surface below is frozen with Object.freeze.
   var api = {};
   __hodoDomProps(api, node);
   if (extra) {
@@ -757,7 +1049,62 @@ function __hodoDomWrap(node, extra, accessors, proto) {
     }
   }
   if (proto) Object.setPrototypeOf(api, proto);
-  return Object.freeze(api);
+  __hodoWrappers[node] = api;
+  return api;
+}
+// Sibling lookups reuse the real child-list native; no duplicate sibling table.
+function __hodoSibling(node, delta) {
+  var parent = __hodo_dom_parent(node);
+  if (parent === null) return null;
+  var handles = __hodo_dom_child_nodes(parent);
+  for (var i = 0; i < handles.length; i++) {
+    if (handles[i] === node) {
+      var j = i + delta;
+      return (j >= 0 && j < handles.length) ? __hodoWrapAny(handles[j]) : null;
+    }
+  }
+  return null;
+}
+// CharacterData's data/nodeValue/length are views over the same text natives
+// that back textContent (installed by __hodoDomProps).
+function __hodoCharacterDataAccessors(node) {
+  var get = function () { return __hodo_dom_text(node); };
+  var set = function (v) { __hodo_dom_set_text(node, String(v)); };
+  return {
+    data: { get: get, set: set, enumerable: true },
+    nodeValue: { get: get, set: set, enumerable: true },
+    length: {
+      get: function () { return String(__hodo_dom_text(node)).length; },
+      enumerable: true
+    }
+  };
+}
+// Wrap by actual node kind so childNodes/children hand out typed wrappers.
+function __hodoWrapAny(node) {
+  if (node === null || node === undefined) return null;
+  var type = __hodo_dom_node_type(node);
+  var proto = HTMLElement.prototype;
+  var accessors = null;
+  if (type === 9) proto = Document.prototype;
+  else if (type === 11) {
+    proto = __hodo_dom_tag(node) === '#shadow-root'
+      ? ShadowRoot.prototype : DocumentFragment.prototype;
+  }
+  else if (type === 1) {
+    var tagName = String(__hodo_dom_tag(node)).toLowerCase();
+    if (tagName === 'template') proto = HTMLTemplateElement.prototype;
+    else if (tagName === 'svg') proto = SVGSVGElement.prototype;
+    else if (__hodoHtmlElementClasses[tagName]) {
+      proto = __hodoHtmlElementClasses[tagName].prototype;
+    }
+  } else if (type === 3) {
+    proto = Text.prototype;
+    accessors = __hodoCharacterDataAccessors(node);
+  } else if (type === 8) {
+    proto = Comment.prototype;
+    accessors = __hodoCharacterDataAccessors(node);
+  }
+  return __hodoDomWrap(node, null, accessors, proto);
 }
 // Construct the registered class for a node, attaching its handle during the
 // base HTMLElement constructor so the constructor body can already use the
@@ -914,12 +1261,102 @@ function HTMLElement() {
 function Document() {
   if (this.constructor === Document) throw new TypeError('Illegal constructor: Document');
 }
+// CharacterData is an abstract-ish base: direct `new` is spec-illegal, derived
+// classes work because `this.constructor` is the derived class.
+function CharacterData() {
+  if (this.constructor === CharacterData) throw new TypeError('Illegal constructor: CharacterData');
+}
+function Text() {
+  if (this.constructor === Text) throw new TypeError('Illegal constructor: Text');
+}
+function Comment() {
+  if (this.constructor === Comment) throw new TypeError('Illegal constructor: Comment');
+}
+// Legacy DOM node classes the polyfills iterate over to patch prototypes.
+// Their wrappers never surface in hodo's HTML arena, but capability checks
+// (`window[a].prototype`) must not throw while the bundle loads.
+function CDATASection() {}
+function ProcessingInstruction() {}
+CDATASection.prototype = Object.create(Text.prototype);
+CDATASection.prototype.constructor = CDATASection;
+ProcessingInstruction.prototype = Object.create(CharacterData.prototype);
+ProcessingInstruction.prototype.constructor = ProcessingInstruction;
+// SVG class surfaces exist for capability sniffing / prototype patching only.
+// hodo has no SVG raster, so no geometry methods are faked: the common
+// polyfill battery merely reads SVGElement.prototype to sniff `classList`.
+function SVGElement() {
+  if (this.constructor === SVGElement) throw new TypeError('Illegal constructor: SVGElement');
+}
+function SVGSVGElement() {
+  if (this.constructor === SVGSVGElement) throw new TypeError('Illegal constructor: SVGSVGElement');
+}
 Element.prototype = Object.create(Node.prototype);
 Element.prototype.constructor = Element;
 HTMLElement.prototype = Object.create(Element.prototype);
 HTMLElement.prototype.constructor = HTMLElement;
 Document.prototype = Object.create(Node.prototype);
 Document.prototype.constructor = Document;
+CharacterData.prototype = Object.create(Node.prototype);
+CharacterData.prototype.constructor = CharacterData;
+Text.prototype = Object.create(CharacterData.prototype);
+Text.prototype.constructor = Text;
+Comment.prototype = Object.create(CharacterData.prototype);
+Comment.prototype.constructor = Comment;
+SVGElement.prototype = Object.create(Element.prototype);
+SVGElement.prototype.constructor = SVGElement;
+SVGSVGElement.prototype = Object.create(SVGElement.prototype);
+SVGSVGElement.prototype.constructor = SVGSVGElement;
+// No SVG tree semantics here: the nearest-svg accessors are honest nulls, not
+// invented ancestors.
+Object.defineProperties(SVGElement.prototype, {
+  ownerSVGElement: { get: function () { return null; }, configurable: true },
+  viewportElement: { get: function () { return null; }, configurable: true }
+});
+// HTML*Element constructor surfaces the archive bundles patch and `instanceof`
+// against. Direct `new` is illegal (no backing node); real element wrappers get
+// the matching prototype through the tag map below. Only names the bundles read.
+function HTMLAnchorElement() { if (this.constructor === HTMLAnchorElement) throw new TypeError('Illegal constructor: HTMLAnchorElement'); }
+function HTMLAreaElement() { if (this.constructor === HTMLAreaElement) throw new TypeError('Illegal constructor: HTMLAreaElement'); }
+function HTMLButtonElement() { if (this.constructor === HTMLButtonElement) throw new TypeError('Illegal constructor: HTMLButtonElement'); }
+function HTMLCanvasElement() { if (this.constructor === HTMLCanvasElement) throw new TypeError('Illegal constructor: HTMLCanvasElement'); }
+function HTMLDialogElement() { if (this.constructor === HTMLDialogElement) throw new TypeError('Illegal constructor: HTMLDialogElement'); }
+function HTMLFieldSetElement() { if (this.constructor === HTMLFieldSetElement) throw new TypeError('Illegal constructor: HTMLFieldSetElement'); }
+function HTMLFormElement() { if (this.constructor === HTMLFormElement) throw new TypeError('Illegal constructor: HTMLFormElement'); }
+function HTMLIFrameElement() { if (this.constructor === HTMLIFrameElement) throw new TypeError('Illegal constructor: HTMLIFrameElement'); }
+function HTMLImageElement() { if (this.constructor === HTMLImageElement) throw new TypeError('Illegal constructor: HTMLImageElement'); }
+function HTMLInputElement() { if (this.constructor === HTMLInputElement) throw new TypeError('Illegal constructor: HTMLInputElement'); }
+function HTMLMediaElement() { if (this.constructor === HTMLMediaElement) throw new TypeError('Illegal constructor: HTMLMediaElement'); }
+function HTMLOptionElement() { if (this.constructor === HTMLOptionElement) throw new TypeError('Illegal constructor: HTMLOptionElement'); }
+function HTMLOptGroupElement() { if (this.constructor === HTMLOptGroupElement) throw new TypeError('Illegal constructor: HTMLOptGroupElement'); }
+function HTMLSelectElement() { if (this.constructor === HTMLSelectElement) throw new TypeError('Illegal constructor: HTMLSelectElement'); }
+function HTMLSlotElement() { if (this.constructor === HTMLSlotElement) throw new TypeError('Illegal constructor: HTMLSlotElement'); }
+function HTMLTextAreaElement() { if (this.constructor === HTMLTextAreaElement) throw new TypeError('Illegal constructor: HTMLTextAreaElement'); }
+function HTMLUnknownElement() { if (this.constructor === HTMLUnknownElement) throw new TypeError('Illegal constructor: HTMLUnknownElement'); }
+var __hodoHtmlElementClasses = {
+  a: HTMLAnchorElement, area: HTMLAreaElement, button: HTMLButtonElement,
+  canvas: HTMLCanvasElement, dialog: HTMLDialogElement, fieldset: HTMLFieldSetElement,
+  form: HTMLFormElement, iframe: HTMLIFrameElement, img: HTMLImageElement,
+  input: HTMLInputElement, option: HTMLOptionElement, optgroup: HTMLOptGroupElement,
+  select: HTMLSelectElement, slot: HTMLSlotElement, textarea: HTMLTextAreaElement,
+  audio: HTMLMediaElement, video: HTMLMediaElement
+};
+for (var __hodoHtmlCtorName in __hodoHtmlElementClasses) {
+  var __hodoHtmlCtor = __hodoHtmlElementClasses[__hodoHtmlCtorName];
+  __hodoHtmlCtor.prototype = Object.create(HTMLElement.prototype);
+  __hodoHtmlCtor.prototype.constructor = __hodoHtmlCtor;
+}
+// width/height reflect the real attributes; values like '100%' stay the exact
+// strings the DOM holds. No SVGAnimatedLength or numeric coercion is invented.
+function __hodoSvgAttr(name) {
+  return function () {
+    var node = this.__hodoNode;
+    return node === undefined ? null : __hodo_dom_get_attribute(node, name);
+  };
+}
+Object.defineProperties(SVGSVGElement.prototype, {
+  width: { get: __hodoSvgAttr('width'), configurable: true, enumerable: true },
+  height: { get: __hodoSvgAttr('height'), configurable: true, enumerable: true }
+});
 Node.ELEMENT_NODE = 1;
 Node.ATTRIBUTE_NODE = 2;
 Node.TEXT_NODE = 3;
@@ -949,39 +1386,543 @@ function DocumentFragment() {
 }
 DocumentFragment.prototype = Object.create(Node.prototype);
 DocumentFragment.prototype.constructor = DocumentFragment;
-// Absent this rung: throw instead of handing out a fake Range/clone/import.
+
+// ---- Shadow DOM / templates / detached documents -------------------------
+// Side tables are keyed by the stable opaque node handle, so repeated wraps
+// share identity even though wrapper objects are frozen.
+var __hodoShadowRoots = {};
+var __hodoTemplateContents = {};
+var __hodoDocs = {};
+var __hodoDocTitles = {};
+
+function __hodoRootHandle(node) {
+  var cur = node;
+  var parent;
+  while ((parent = __hodo_dom_parent(cur)) !== null) {
+    if (__hodo_dom_tag(parent) === '#shadow-root') return parent;
+    cur = parent;
+  }
+  return cur;
+}
+function __hodoOwnerDocument(node) {
+  var root = __hodoRootHandle(node);
+  return __hodoDocs[root] !== undefined ? __hodoDocs[root] : document;
+}
+function __hodoTemplateContentHandle(node) {
+  var handle = __hodoTemplateContents[node];
+  if (handle === undefined) {
+    handle = __hodo_dom_create_fragment();
+    __hodoTemplateContents[node] = handle;
+  }
+  return handle;
+}
+function __hodoInnerTarget(node) {
+  return __hodo_dom_tag(node) === 'template'
+    ? __hodoTemplateContentHandle(node) : node;
+}
+var __hodoVoidTags = {
+  area: 1, base: 1, br: 1, col: 1, embed: 1, hr: 1, img: 1,
+  input: 1, link: 1, meta: 1, param: 1, source: 1, track: 1, wbr: 1
+};
+function __hodoEscape(value) {
+  return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function __hodoSerialize(node) {
+  var out = '';
+  var kids = __hodo_dom_child_nodes(node);
+  for (var i = 0; i < kids.length; i++) {
+    var kid = kids[i];
+    var type = __hodo_dom_node_type(kid);
+    if (type === 3) out += __hodoEscape(__hodo_dom_text(kid));
+    else if (type === 8) out += '<!--' + __hodo_dom_text(kid) + '-->';
+    else {
+      var tag = String(__hodo_dom_tag(kid)).toLowerCase();
+      var attrs = __hodoDomAttributes(kid);
+      var open = '<' + tag;
+      for (var j = 0; j < attrs.length; j++) {
+        open += ' ' + attrs[j].name + '="' + __hodoEscape(attrs[j].value) + '"';
+      }
+      open += '>';
+      out += __hodoVoidTags[tag] ? open
+        : open + __hodoSerialize(kid) + '</' + tag + '>';
+    }
+  }
+  return out;
+}
+
+// Capability surface: defining HTMLTemplateElement (with a working content
+// fragment and deep clone) makes the webcomponents bundle's template polyfill
+// detect native support and skip its DOMParser/createHTMLDocument('template')
+// patch entirely. ShadowRoot is the class its `instanceof ShadowRoot` checks
+// use; the ShadyDOM branch is skipped because attachShadow/getRootNode exist.
+function ShadowRoot() {
+  if (this.constructor === ShadowRoot) throw new TypeError('Illegal constructor: ShadowRoot');
+}
+ShadowRoot.prototype = Object.create(DocumentFragment.prototype);
+ShadowRoot.prototype.constructor = ShadowRoot;
+// Constructable stylesheet surface. Lit capability-sniffs `replace` here plus
+// `adoptedStyleSheets` on Document.prototype to select the constructable path
+// instead of its <style>-injection fallback. shortcut: wave-1 stores CSS text
+// only — no parse, no rules and no engine cascade wiring; <style> elements
+// stamped into shadow roots are still picked up by the shell's normal walk.
+function CSSStyleSheet(options) {
+  this.__hodoCssText = '';
+  this.__hodoOptions = options === undefined ? null : options;
+  this.cssText = '';
+}
+CSSStyleSheet.prototype.replaceSync = function (text) {
+  this.__hodoCssText = String(text === undefined ? '' : text);
+  this.cssText = this.__hodoCssText;
+};
+CSSStyleSheet.prototype.replace = function (text) {
+  this.replaceSync(text);
+  return Promise.resolve(this);
+};
+Object.defineProperty(CSSStyleSheet.prototype, 'cssRules', {
+  get: function () { return []; }, configurable: true
+});
+CSSStyleSheet.prototype.insertRule = function () {
+  throw new TypeError('CSSStyleSheet.insertRule is not supported in hodo page scripts');
+};
+CSSStyleSheet.prototype.deleteRule = function () {
+  throw new TypeError('CSSStyleSheet.deleteRule is not supported in hodo page scripts');
+};
+globalThis.CSSStyleSheet = CSSStyleSheet;
+// Storage-only accessor on both prototypes: libraries may set/read the array,
+// but wave-1 does not feed it into styling. Defining it on Document.prototype
+// is what Lit's feature probe checks.
+function __hodoAdoptedStyleSheets() {
+  return {
+    get: function () { return this.__hodoAdoptedStyleSheets || []; },
+    set: function (value) { this.__hodoAdoptedStyleSheets = value; },
+    configurable: true, enumerable: true
+  };
+}
+Object.defineProperty(ShadowRoot.prototype, 'adoptedStyleSheets', __hodoAdoptedStyleSheets());
+Object.defineProperty(Document.prototype, 'adoptedStyleSheets', __hodoAdoptedStyleSheets());
+function HTMLTemplateElement() {
+  if (this.constructor === HTMLTemplateElement) {
+    throw new TypeError('Illegal constructor: HTMLTemplateElement');
+  }
+}
+HTMLTemplateElement.prototype = Object.create(HTMLElement.prototype);
+HTMLTemplateElement.prototype.constructor = HTMLTemplateElement;
+Object.defineProperty(HTMLTemplateElement.prototype, 'content', {
+  get: function () {
+    var node = this.__hodoNode;
+    if (node === undefined) return null;
+    var handle = __hodoTemplateContentHandle(node);
+    return __hodoDomWrap(handle, null, null, DocumentFragment.prototype);
+  },
+  configurable: true
+});
+// source-parsed <template> children live in hodo-html's side-map fragment,
+// which is unparented and unreachable from JS; `.content` here is an empty
+// view in that case. Runtime-created templates (Lit's path) parse into this
+// fragment via the innerHTML setter, so cloning/importing works.
+
+function DOMParser() {}
+DOMParser.prototype.parseFromString = function (html, mime) {
+  var type = String(mime === undefined ? 'text/html' : mime).toLowerCase();
+  if (type !== 'text/html') {
+    throw new TypeError('DOMParser: only text/html is supported in hodo page scripts');
+  }
+  return __hodoNewDocument(String(html));
+};
+
+// The bundle constructs one MutationObserver at load and one TreeWalker pair;
+// with native shadow DOM its ShadyDOM branch stays inactive, so these only
+// need to be honest capability surfaces (no mutation records are generated).
+function MutationObserver(callback) { this.__hodoCallback = callback; }
+MutationObserver.prototype.observe = function () {};
+MutationObserver.prototype.disconnect = function () {};
+MutationObserver.prototype.takeRecords = function () { return []; };
+var NodeFilter = {
+  SHOW_ALL: -1, SHOW_ELEMENT: 1, SHOW_ATTRIBUTE: 2, SHOW_TEXT: 4,
+  SHOW_CDATA_SECTION: 8, SHOW_ENTITY_REFERENCE: 16, SHOW_ENTITY: 32,
+  SHOW_PROCESSING_INSTRUCTION: 64, SHOW_COMMENT: 128, SHOW_DOCUMENT: 256,
+  SHOW_DOCUMENT_TYPE: 512, SHOW_DOCUMENT_FRAGMENT: 1024, SHOW_NOTATION: 2048,
+  FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3
+};
+function __hodoNodeTypeBit(handle) {
+  switch (__hodo_dom_node_type(handle)) {
+    case 1: return 1; case 2: return 2; case 3: return 4; case 4: return 8;
+    case 5: return 16; case 6: return 32; case 7: return 64; case 8: return 128;
+    case 9: return 256; case 10: return 512; case 11: return 1024; case 12: return 2048;
+    default: return 0;
+  }
+}
+function __hodoTreeWalker(root, whatToShow, filter) {
+  var current = root;
+  var api = {
+    whatToShow: whatToShow === undefined ? -1 : whatToShow,
+    filter: filter === undefined ? null : filter,
+    expandEntityReferences: true
+  };
+  Object.defineProperty(api, 'currentNode', {
+    get: function () { return current; },
+    set: function (handle) {
+      current = (handle && handle.__hodoNode !== undefined)
+        ? handle.__hodoNode : handle;
+    },
+    enumerable: true
+  });
+  // Three-way result, exactly as DOM specifies. A SHOW_ mask miss is SKIP
+  // (subtree still traversed), never REJECT. FILTER_SKIP drops only the node;
+  // FILTER_REJECT prunes the whole subtree. Lit stamps parts by counting the
+  // nodes nextNode() returns, so conflating SKIP and REJECT shifts every part
+  // index and makes ChildPart materialisation grab the wrong marker.
+  function classify(handle) {
+    var bit = __hodoNodeTypeBit(handle);
+    if (bit === 0 || (api.whatToShow !== -1 && (api.whatToShow & bit) === 0)) {
+      return NodeFilter.FILTER_SKIP;
+    }
+    if (api.filter === null || api.filter === undefined) return NodeFilter.FILTER_ACCEPT;
+    var asFunction = typeof api.filter === 'function' ? api.filter : api.filter.acceptNode;
+    if (typeof asFunction !== 'function') return NodeFilter.FILTER_ACCEPT;
+    var result;
+    try {
+      result = asFunction.call(
+        typeof api.filter === 'function' ? undefined : api.filter,
+        __hodoWrapAny(handle));
+    } catch (e) {
+      __hodoReportError(e);
+      return NodeFilter.FILTER_ACCEPT;
+    }
+    return result === NodeFilter.FILTER_REJECT || result === NodeFilter.FILTER_SKIP
+      ? result : NodeFilter.FILTER_ACCEPT;
+  }
+  // First ACCEPTED node in handle's subtree, in document (pre-)order.
+  function firstAccepted(handle) {
+    var verdict = classify(handle);
+    if (verdict === NodeFilter.FILTER_REJECT) return null;
+    if (verdict === NodeFilter.FILTER_ACCEPT) return handle;
+    var kids = __hodo_dom_child_nodes(handle);
+    for (var i = 0; i < kids.length; i++) {
+      var hit = firstAccepted(kids[i]);
+      if (hit !== null) return hit;
+    }
+    return null;
+  }
+  // Last node in reverse document order within handle's subtree.
+  function lastAccepted(handle) {
+    var verdict = classify(handle);
+    if (verdict === NodeFilter.FILTER_REJECT) return null;
+    var kids = __hodo_dom_child_nodes(handle);
+    for (var i = kids.length - 1; i >= 0; i--) {
+      var hit = lastAccepted(kids[i]);
+      if (hit !== null) return hit;
+    }
+    return verdict === NodeFilter.FILTER_ACCEPT ? handle : null;
+  }
+  api.nextNode = function () {
+    if (current === null || current === undefined) return null;
+    var kids = __hodo_dom_child_nodes(current);
+    for (var k = 0; k < kids.length; k++) {
+      var child = firstAccepted(kids[k]);
+      if (child !== null) return move(child);
+    }
+    var node = current;
+    while (node !== null && node !== undefined) {
+      var parent = __hodo_dom_parent(node);
+      if (parent === null) return null;
+      var siblings = __hodo_dom_child_nodes(parent);
+      var index = siblings.indexOf(node);
+      for (var s = index + 1; s < siblings.length; s++) {
+        var hit = firstAccepted(siblings[s]);
+        if (hit !== null) return move(hit);
+      }
+      node = parent;
+    }
+    return null;
+  };
+  api.previousNode = function () {
+    if (current === null || current === undefined) return null;
+    var kids = __hodo_dom_child_nodes(current);
+    for (var k = kids.length - 1; k >= 0; k--) {
+      var child = lastAccepted(kids[k]);
+      if (child !== null) return move(child);
+    }
+    var node = current;
+    while (node !== null && node !== undefined) {
+      var parent = __hodo_dom_parent(node);
+      if (parent === null) return null;
+      var siblings = __hodo_dom_child_nodes(parent);
+      var index = siblings.indexOf(node);
+      for (var s = index - 1; s >= 0; s--) {
+        var hit = lastAccepted(siblings[s]);
+        if (hit !== null) return move(hit);
+      }
+      node = parent;
+    }
+    return null;
+  };
+  function move(handle) {
+    if (handle !== null && handle !== undefined) {
+      current = handle;
+      api.currentNode = handle;
+      return __hodoWrapAny(handle);
+    }
+    return null;
+  }
+  api.parentNode = function () { return move(__hodo_dom_parent(current)); };
+  api.firstChild = function () {
+    var handles = __hodo_dom_child_nodes(current);
+    for (var i = 0; i < handles.length; i++) {
+      var hit = firstAccepted(handles[i]);
+      if (hit !== null) return move(hit);
+    }
+    return null;
+  };
+  api.lastChild = function () {
+    var handles = __hodo_dom_child_nodes(current);
+    for (var i = handles.length - 1; i >= 0; i--) {
+      var hit = lastAccepted(handles[i]);
+      if (hit !== null) return move(hit);
+    }
+    return null;
+  };
+  api.nextSibling = function () {
+    var parent = __hodo_dom_parent(current);
+    if (parent === null) return null;
+    var handles = __hodo_dom_child_nodes(parent);
+    var index = handles.indexOf(current);
+    for (var i = index + 1; i < handles.length; i++) {
+      var hit = firstAccepted(handles[i]);
+      if (hit !== null) return move(hit);
+    }
+    return null;
+  };
+  api.previousSibling = function () {
+    var parent = __hodo_dom_parent(current);
+    if (parent === null) return null;
+    var handles = __hodo_dom_child_nodes(parent);
+    var index = handles.indexOf(current);
+    for (var i = index - 1; i >= 0; i--) {
+      var hit = lastAccepted(handles[i]);
+      if (hit !== null) return move(hit);
+    }
+    return null;
+  };
+  return api;
+}
+
+// Composition-path walk: parents are real arena links, so shadow children
+// terminate at their #shadow-root wrapper and everything else at the document.
+Node.prototype.getRootNode = function () {
+  var node = this.__hodoNode;
+  if (node === undefined) return this;
+  if (__hodo_dom_tag(node) === '#shadow-root') return __hodoWrapAny(node);
+  var cur = node;
+  var parent;
+  while ((parent = __hodo_dom_parent(cur)) !== null) {
+    if (__hodo_dom_tag(parent) === '#shadow-root') return __hodoWrapAny(parent);
+    cur = parent;
+  }
+  if (__hodoDocs[cur] !== undefined) return __hodoDocs[cur];
+  return cur === __hodoRoot ? document : __hodoWrapAny(cur);
+};
+
+function __hodoQueryMethods(root) {
+  return {
+    querySelector: function (selector) {
+      return __hodoWrapAny(__hodo_dom_query(root, String(selector)));
+    },
+    querySelectorAll: function (selector) {
+      var handles = __hodo_dom_query_all(root, String(selector));
+      var out = [];
+      for (var i = 0; i < handles.length; i++) {
+        var wrapped = __hodoWrapAny(handles[i]);
+        if (wrapped !== null) out.push(wrapped);
+      }
+      return out;
+    },
+    getElementById: function (id) {
+      return __hodoWrapAny(__hodo_dom_get_element_by_id(root, String(id)));
+    }
+  };
+}
+
+Element.prototype.attachShadow = function (options) {
+  var mode = (options || {}).mode;
+  if (mode !== 'open' && mode !== 'closed') {
+    throw new TypeError('attachShadow: mode must be "open" or "closed"');
+  }
+  var handle = __hodo_dom_attach_shadow(this.__hodoNode);
+  if (handle === null) throw new Error('attachShadow: element already has a shadow root');
+  var methods = __hodoQueryMethods(handle);
+  var root = __hodoDomWrap(handle, methods, {
+    host: { get: function () { return __hodoWrapAny(__hodo_dom_parent(handle)); } },
+    mode: { get: function () { return mode; } }
+  }, ShadowRoot.prototype);
+  __hodoShadowRoots[this.__hodoNode] = { root: root, mode: mode };
+  return root;
+};
+// Closed roots stay reachable from JS code holding the root object (the
+// element's own code), but the public `shadowRoot` getter stays null.
+Object.defineProperty(Element.prototype, 'shadowRoot', {
+  get: function () {
+    var entry = __hodoShadowRoots[this.__hodoNode];
+    return entry !== undefined && entry.mode === 'open' ? entry.root : null;
+  },
+  configurable: true
+});
+
+function __hodoNewDocument(html) {
+  var root = __hodo_dom_parse_detached(String(html));
+  var methods = __hodoQueryMethods(root);
+  var api = __hodoDomWrap(root, {
+    querySelector: methods.querySelector,
+    querySelectorAll: methods.querySelectorAll,
+    getElementById: methods.getElementById,
+    createElement: function (tag) { return __hodoCreateElement(String(tag)); },
+    createDocumentFragment: function () { return new DocumentFragment(); },
+    createTextNode: function (data) {
+      return __hodoWrapAny(__hodo_dom_create_text_node(String(data)));
+    },
+    createComment: function (data) {
+      return __hodoWrapAny(__hodo_dom_create_comment(String(data)));
+    },
+    importNode: function (node, deep) {
+      return __hodoCloneNode(node.__hodoNode, !!deep);
+    }
+  }, {
+    documentElement: {
+      get: function () {
+        var htmlEl = __hodoWrapAny(__hodo_dom_find_tag(root, 'html'));
+        return htmlEl !== null ? htmlEl : __hodoWrapAny(root);
+      }
+    },
+    body: {
+      get: function () {
+        var body = __hodoWrapAny(__hodo_dom_find_tag(root, 'body'));
+        return body !== null ? body : __hodoWrapAny(root);
+      }
+    },
+    head: {
+      get: function () { return __hodoWrapAny(__hodo_dom_find_tag(root, 'head')); }
+    },
+    title: {
+      get: function () { return __hodoDocTitles[root] || ''; },
+      set: function (value) { __hodoDocTitles[root] = String(value); }
+    }
+  }, Document.prototype);
+  __hodoDocs[root] = api;
+  return api;
+}
 function __hodoUnsupportedMethod(name) {
   return function () { throw new TypeError(name + ' is not supported in hodo page scripts'); };
 }
-Node.prototype.cloneNode = __hodoUnsupportedMethod('cloneNode');
+// Wave-1 clone: a detached copy with the curated attribute names copied and,
+// when `deep`, recursively cloned children. shortcut: custom-element instances
+// clone as plain base elements (no re-upgrade), and only the curated attribute
+// names survive until Dom exposes a real attrs() iterator.
+function __hodoCloneNode(handle, deep) {
+  var type = __hodo_dom_node_type(handle);
+  if (type === 3) return __hodoWrapAny(__hodo_dom_create_text_node(__hodo_dom_text(handle)));
+  if (type === 8) return __hodoWrapAny(__hodo_dom_create_comment(__hodo_dom_text(handle)));
+  if (type === 9) throw new TypeError('cloneNode: document nodes are not supported in hodo page scripts');
+  var copy;
+  if (type === 11) {
+    copy = __hodoWrapAny(__hodo_dom_create_fragment());
+  } else {
+    copy = __hodoWrapAny(__hodo_dom_create_element(__hodo_dom_tag(handle)));
+    var attrs = __hodoDomAttributes(handle);
+    for (var i = 0; i < attrs.length; i++) {
+      __hodo_dom_set_attribute(copy.__hodoNode, attrs[i].name, attrs[i].value);
+    }
+  }
+  if (deep) {
+    var kids = __hodo_dom_child_nodes(handle);
+    for (var j = 0; j < kids.length; j++) {
+      copy.appendChild(__hodoCloneNode(kids[j], true));
+    }
+  }
+  // Templates clone their content even for a shallow clone (spec behavior);
+  // Lit relies on that when stamping a cached template result.
+  if (type === 1 && String(__hodo_dom_tag(handle)).toLowerCase() === 'template') {
+    var sourceContent = __hodoTemplateContentHandle(handle);
+    var targetContent = __hodoTemplateContentHandle(copy.__hodoNode);
+    var contentKids = __hodo_dom_child_nodes(sourceContent);
+    for (var k = 0; k < contentKids.length; k++) {
+      copy.content.appendChild(__hodoCloneNode(contentKids[k], true));
+    }
+  }
+  return copy;
+}
+Node.prototype.cloneNode = function (deep) {
+  return __hodoCloneNode(this.__hodoNode, !!deep);
+};
 
-var __hodoRoot = __hodo_dom_root();
+function __hodoCreateElement(tag) {
+  var raw = String(tag);
+  var node = __hodo_dom_create_element(raw);
+  var ctor = __hodoCustomElements[raw.toLowerCase()];
+  if (ctor !== undefined) return __hodoMakeInstance(node, ctor);
+  return __hodoWrapAny(node);
+}
+
+"#;
+
+/// Per-page half of the page prelude: captures the DOM root, `location`,
+/// `history`, the custom-element registry and rAF state. Evaluated once per
+/// real page load (after the live DOM/URL are known); the STATIC half is primed
+/// ahead of time by [`crate::prime_page_prelude`]. The two halves concatenate
+/// back into the exact original prelude — see the byte-identity test in lib.rs.
+const PAGE_DYNAMIC: &str = r#"var __hodoRoot = __hodo_dom_root();
 var document = __hodoDomWrap(__hodoRoot, {
+  implementation: {
+    createHTMLDocument: function (title) {
+      var doc = __hodoNewDocument('');
+      if (title !== undefined) doc.title = String(title);
+      return doc;
+    }
+  },
+  createTreeWalker: function (root, whatToShow, filter) {
+    return __hodoTreeWalker(root === undefined || root === null
+      ? __hodoRoot : root.__hodoNode, whatToShow, filter);
+  },
   getElementById: function (id) {
-    return __hodoDomWrap(__hodo_dom_get_element_by_id(__hodoRoot, String(id)), null, null, HTMLElement.prototype);
+    return __hodoWrapAny(__hodo_dom_get_element_by_id(__hodoRoot, String(id)));
   },
   querySelector: function (selector) {
-    return __hodoDomWrap(__hodo_dom_query(__hodoRoot, String(selector)), null, null, HTMLElement.prototype);
+    return __hodoWrapAny(__hodo_dom_query(__hodoRoot, String(selector)));
   },
   querySelectorAll: function (selector) {
     var handles = __hodo_dom_query_all(__hodoRoot, String(selector));
     var out = [];
     for (var i = 0; i < handles.length; i++) {
-      var wrapped = __hodoDomWrap(handles[i], null, null, HTMLElement.prototype);
+      var wrapped = __hodoWrapAny(handles[i]);
       if (wrapped !== null) out.push(wrapped);
     }
     return out;
   },
-  createElement: function (tag) {
-    var raw = String(tag);
-    var node = __hodo_dom_create_element(raw);
-    var ctor = __hodoCustomElements[raw.toLowerCase()];
-    if (ctor !== undefined) return __hodoMakeInstance(node, ctor);
-    return __hodoDomWrap(node, null, null, HTMLElement.prototype);
+  // Snapshot array instead of a live HTMLCollection; good enough for the
+  // bundle's `getElementsByTagName('script'|'link')[0]` reads.
+  getElementsByTagName: function (name) {
+    var handles = __hodo_dom_find_all_tag(__hodoRoot, String(name));
+    var out = [];
+    for (var i = 0; i < handles.length; i++) {
+      var wrapped = __hodoWrapAny(handles[i]);
+      if (wrapped !== null) out.push(wrapped);
+    }
+    return out;
   },
+  createElement: __hodoCreateElement,
   createDocumentFragment: function () { return new DocumentFragment(); },
+  createTextNode: function (data) {
+    return __hodoWrapAny(__hodo_dom_create_text_node(String(data)));
+  },
+  createComment: function (data) {
+    return __hodoWrapAny(__hodo_dom_create_comment(String(data)));
+  },
   createRange: __hodoUnsupportedMethod('document.createRange'),
-  importNode: __hodoUnsupportedMethod('document.importNode'),
+  // Spec import is a clone into the calling document; our clones already live
+  // in the one page arena, so cloneNode(deep) is the honest equivalent here.
+  importNode: function (node, deep) {
+    return __hodoCloneNode(node.__hodoNode, !!deep);
+  },
   // The pre-`new Event()` API the webcomponents polyfill uses at load time.
   // Only the two event-interface domTypes that map cleanly to our Event shape
   // are accepted; anything else throws instead of returning a broken object.
@@ -1009,15 +1950,21 @@ var document = __hodoDomWrap(__hodoRoot, {
     set: function (value) { __hodo_set_title(String(value)); },
     enumerable: true
   },
+  documentElement: {
+    get: function () {
+      return __hodoWrapAny(__hodo_dom_find_tag(__hodoRoot, 'html'));
+    },
+    enumerable: true
+  },
   head: {
     get: function () {
-      return __hodoDomWrap(__hodo_dom_find_tag(__hodoRoot, 'head'), null, null, HTMLElement.prototype);
+      return __hodoWrapAny(__hodo_dom_find_tag(__hodoRoot, 'head'));
     },
     enumerable: true
   },
   body: {
     get: function () {
-      return __hodoDomWrap(__hodo_dom_find_tag(__hodoRoot, 'body'), null, null, HTMLElement.prototype);
+      return __hodoWrapAny(__hodo_dom_find_tag(__hodoRoot, 'body'));
     },
     enumerable: true
   },
@@ -1032,15 +1979,256 @@ var document = __hodoDomWrap(__hodoRoot, {
 // through it, and the properties below are the only web-isms this wave adds.
 var window = globalThis;
 var self = globalThis;
+// Capability surface only: `window` is the global object and cannot be
+// constructed. Linking its prototype to Window.prototype gives both
+// `window instanceof Window` and the inherited prototype properties the
+// webcomponents polyfill patches onto Window.prototype.
+function Window() {
+  if (this.constructor === Window) throw new TypeError('Illegal constructor: Window');
+}
+Object.setPrototypeOf(window, Window.prototype);
+// Wave-1 URL reflection: a tiny split-based parser over the threaded href. No
+// percent-decoding, punycode, IPv6 canonicalization or default-port elision:
+// those need a real URL implementation. Query/fragment keep their leading ?/#
+// so `location.search.slice(1)` works; a missing query is the empty string.
+function __hodoParseLocation(href) {
+  var text = String(href || '');
+  var rest = text;
+  var protocol = '', host = '', hostname = '', port = '';
+  var pathname = '', search = '', hash = '';
+  var cut = rest.indexOf('#');
+  if (cut >= 0) { hash = rest.slice(cut); rest = rest.slice(0, cut); }
+  cut = rest.indexOf('?');
+  if (cut >= 0) { search = rest.slice(cut); rest = rest.slice(0, cut); }
+  cut = rest.indexOf('://');
+  if (cut >= 0) {
+    protocol = rest.slice(0, cut + 1);
+    var after = rest.slice(cut + 3);
+    var slash = after.indexOf('/');
+    host = slash < 0 ? after : after.slice(0, slash);
+    pathname = slash < 0 ? '/' : after.slice(slash);
+    var colon = host.lastIndexOf(':');
+    if (colon > 0 && host.indexOf(']') < colon) {
+      hostname = host.slice(0, colon);
+      port = host.slice(colon + 1);
+    } else {
+      hostname = host;
+    }
+  } else {
+    pathname = rest;
+  }
+  return {
+    href: text, protocol: protocol, host: host, hostname: hostname,
+    port: port, pathname: pathname, search: search, hash: hash,
+    origin: (protocol && host) ? protocol + '//' + host : ''
+  };
+}
+// Wave-1 navigation surface. The href lives in JS so history.replaceState can
+// rewrite it; the URL is re-parsed on every write. Real navigation (network,
+// popstate, router reaction) is deliberately out of scope.
+var __hodoLocationHref = __hodo_page_url();
+var __hodoLocation = null;
+function __hodoRefreshLocation() {
+  var parts = __hodoParseLocation(__hodoLocationHref);
+  parts.assign = function (url) { __hodoSetLocationUrl(url); };
+  parts.replace = parts.assign;
+  var fields = ['href', 'pathname', 'search', 'hash'];
+  for (var i = 0; i < fields.length; i++) {
+    (function (field) {
+      Object.defineProperty(parts, field, {
+        get: function () { return __hodoParseLocation(__hodoLocationHref)[field]; },
+        set: function (value) {
+          var p = __hodoParseLocation(__hodoLocationHref);
+          p[field] = String(value);
+          var tail = p.pathname + p.search + p.hash;
+          var next = field === 'href' ? String(value)
+            : (p.protocol ? p.protocol + '//' + p.host + tail : tail);
+          __hodoLocationHref = __hodoResolveModuleSpec(next, __hodoLocationHref);
+          __hodoRefreshLocation();
+        },
+        enumerable: true
+      });
+    })(fields[i]);
+  }
+  return parts;
+}
+function __hodoSetLocationUrl(url) {
+  if (url === undefined || url === null || url === '') return;
+  var text = String(url);
+  if (text.charAt(0) === '#') {
+    var p = __hodoParseLocation(__hodoLocationHref);
+    text = p.pathname + p.search + text;
+  }
+  __hodoLocationHref = __hodoResolveModuleSpec(text, __hodoLocationHref);
+  __hodoLocation = __hodoRefreshLocation();
+}
+__hodoLocation = __hodoRefreshLocation();
 Object.defineProperty(window, 'location', {
-  value: Object.freeze({ href: __hodo_page_url() }),
-  writable: false,
+  get: function () { return __hodoLocation; },
   configurable: false,
   enumerable: true
 });
+
+// Router-facing history. Router init wraps pushState/replaceState/forward/go/
+// back on the object itself, so all five must be own, writable properties.
+// shortcut: one session-local entry, no stack, popstate or router reaction.
+var __hodoHistoryState = null;
+var __hodoHistoryNoopWarned = false;
+function __hodoHistoryNoop(name) {
+  return function () {
+    if (!__hodoHistoryNoopWarned) {
+      __hodoHistoryNoopWarned = true;
+      __hodo_log('hodo: history.' + name + ' is a no-op in page scripts');
+    }
+  };
+}
+var history = {
+  length: 1,
+  scrollRestoration: 'auto',
+  get state() { return __hodoHistoryState; },
+  pushState: function (state, title, url) {
+    __hodoHistoryState = state === undefined ? null : state;
+    __hodoSetLocationUrl(url);
+  },
+  replaceState: function (state, title, url) {
+    __hodoHistoryState = state === undefined ? null : state;
+    __hodoSetLocationUrl(url);
+  },
+  back: __hodoHistoryNoop('back'),
+  forward: __hodoHistoryNoop('forward'),
+  go: __hodoHistoryNoop('go')
+};
+window.history = history;
+
+// Schedulers. rAF is a house 16ms timer: the shell's wait/tick loop drains it,
+// which is enough for a Lit-style update to stamp its first frame.
+var __hodoRafTimers = Object.create(null);
+var __hodoRafNextId = 1;
+function requestAnimationFrame(callback) {
+  if (typeof callback !== 'function') throw new TypeError('requestAnimationFrame expects a function');
+  var id = __hodoRafNextId++;
+  __hodoRafTimers[id] = setTimeout(function () {
+    delete __hodoRafTimers[id];
+    try { callback(__hodoPerformance.now()); } catch (e) { __hodoReportError(e); }
+  }, 16);
+  return id;
+}
+function cancelAnimationFrame(id) {
+  var timer = __hodoRafTimers[id];
+  if (timer !== undefined) {
+    delete __hodoRafTimers[id];
+    clearTimeout(timer);
+  }
+}
+function queueMicrotask(callback) {
+  if (typeof callback !== 'function') throw new TypeError('queueMicrotask expects a function');
+  return Promise.resolve().then(callback);
+}
+
+// shortcut: observers are capability-only — constructor/observe/disconnect are
+// present so feature detection and polyfill setup succeed, but callbacks never
+// fire. No real observation is performed.
+function __hodoCapabilityObserver(callback) { this.callback = callback; }
+__hodoCapabilityObserver.prototype.observe = function () {};
+__hodoCapabilityObserver.prototype.unobserve = function () {};
+__hodoCapabilityObserver.prototype.disconnect = function () {};
+__hodoCapabilityObserver.prototype.takeRecords = function () { return []; };
+function MutationObserver(callback) { __hodoCapabilityObserver.call(this, callback); }
+function IntersectionObserver(callback) { __hodoCapabilityObserver.call(this, callback); }
+function ResizeObserver(callback) { __hodoCapabilityObserver.call(this, callback); }
+MutationObserver.prototype = IntersectionObserver.prototype = ResizeObserver.prototype =
+  __hodoCapabilityObserver.prototype;
+
+// Minimal computed style: only the inline font size the bundles read. An empty
+// fontSize is deliberate — NaN guards in the bundles skip style-dependent work.
+function getComputedStyle(element) {
+  var inline = (element && element.style) ? element.style : null;
+  return {
+    fontSize: (inline && typeof inline.fontSize === 'string') ? inline.fontSize : '',
+    getPropertyValue: function (name) {
+      return (inline && typeof inline.getPropertyValue === 'function')
+        ? inline.getPropertyValue(String(name)) : '';
+    }
+  };
+}
+function matchMedia(query) {
+  return {
+    media: String(query === undefined ? '' : query),
+    matches: false,
+    onchange: null,
+    addEventListener: function () {},
+    removeEventListener: function () {},
+    addListener: function () {},
+    removeListener: function () {},
+    dispatchEvent: function () { return true; }
+  };
+}
+// Wall-clock origin (Date.now), not a monotonic clock. getEntriesByType is
+// empty: hodo has no navigation timing data.
+var __hodoPerformanceOrigin = Date.now();
+var __hodoPerformance = {
+  now: function () { return Date.now() - __hodoPerformanceOrigin; },
+  getEntriesByType: function () { return []; }
+};
+window.requestAnimationFrame = requestAnimationFrame;
+window.cancelAnimationFrame = cancelAnimationFrame;
+window.queueMicrotask = queueMicrotask;
+window.MutationObserver = MutationObserver;
+window.IntersectionObserver = IntersectionObserver;
+window.ResizeObserver = ResizeObserver;
+window.getComputedStyle = getComputedStyle;
+window.matchMedia = matchMedia;
+window.performance = __hodoPerformance;
+// UTF-8 byte encoder the Sentry/abtest chunks use for payload sizing. Surrogate
+// pairs are encoded; lone surrogates become U+FFFD. No TextDecoder is exposed
+// because the bundle only feature-detects it.
+function TextEncoder() {}
+TextEncoder.prototype.encode = function (input) {
+  var text = String(input === undefined ? '' : input);
+  var out = [];
+  for (var i = 0; i < text.length; i++) {
+    var c = text.charCodeAt(i);
+    if (c < 0x80) {
+      out.push(c);
+    } else if (c < 0x800) {
+      out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+    } else if (c >= 0xd800 && c <= 0xdbff && i + 1 < text.length &&
+               text.charCodeAt(i + 1) >= 0xdc00 &&
+               text.charCodeAt(i + 1) <= 0xdfff) {
+      var cp = 0x10000 + ((c - 0xd800) << 10) + (text.charCodeAt(++i) - 0xdc00);
+      out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f),
+               0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+    } else {
+      out.push(0xef, 0xbf, 0xbd);
+    }
+  }
+  return new Uint8Array(out);
+};
+window.TextEncoder = TextEncoder;
+// Capability surface for the webcomponents loader: it only checks that
+// `window.URL` exists, then installs its own URL implementation over it. The
+// constructor parses the same fields as `location`; blob URL creation is
+// honestly unsupported (hodo has no blob store).
+function URL(href) {
+  var parts = __hodoParseLocation(href);
+  this.href = parts.href;
+  this.protocol = parts.protocol;
+  this.host = parts.host;
+  this.hostname = parts.hostname;
+  this.port = parts.port;
+  this.pathname = parts.pathname;
+  this.search = parts.search;
+  this.hash = parts.hash;
+}
+URL.prototype.toString = function () { return String(this.href); };
+URL.createObjectURL = __hodoUnsupportedMethod('URL.createObjectURL');
+URL.revokeObjectURL = __hodoUnsupportedMethod('URL.revokeObjectURL');
+window.URL = URL;
 window.addEventListener = function (type, fn) {
-  if (typeof fn !== 'function') throw new TypeError('addEventListener expects a function');
-  __hodo_dom_add_listener(__hodoRoot, String(type), fn);
+  __hodo_dom_add_listener(__hodoRoot, String(type), __hodoEventListener(fn));
+};
+window.removeEventListener = function (type, fn) {
+  __hodo_dom_remove_listener(__hodoRoot, String(type), __hodoEventListener(fn));
 };
 window.dispatchEvent = function (evt) {
   evt.target = window;
@@ -1050,6 +2238,7 @@ window.setTimeout = setTimeout;
 window.setInterval = setInterval;
 window.clearTimeout = clearTimeout;
 window.clearInterval = clearInterval;
+window.fetch = fetch;
 // Minimal CustomElementRegistry. Honest wave-1 surface: define/get/whenDefined,
 // upgrade of existing tags, construction on createElement, and connectedCallback
 // at upgrade/append. attributeChangedCallback, disconnectedCallback, observedAttributes
@@ -1066,7 +2255,17 @@ function __hodoIsCustomName(name) {
   }
   return true;
 }
-window.customElements = {
+// Class surface for capability sniffing / prototype patching. Direct `new` is
+// spec-illegal (a registry with no document behind it); the single window
+// instance below is aligned to this prototype so
+// `customElements instanceof CustomElementRegistry` holds and polyfills may
+// patch CustomElementRegistry.prototype safely.
+function CustomElementRegistry() {
+  if (this.constructor === CustomElementRegistry) {
+    throw new TypeError('Illegal constructor: CustomElementRegistry');
+  }
+}
+var __hodoCustomElementRegistry = {
   define: function (name, ctor) {
     var n = String(name).toLowerCase();
     if (typeof ctor !== 'function') {
@@ -1106,6 +2305,8 @@ window.customElements = {
     });
   }
 };
+Object.setPrototypeOf(__hodoCustomElementRegistry, CustomElementRegistry.prototype);
+window.customElements = __hodoCustomElementRegistry;
 // Explicit throwing getters instead of a Proxy: a script can catch these and
 // sees exactly which global is missing. No fake objects are handed out.
 function __hodoUnsupportedGlobal(name, ErrorType) {
@@ -1126,16 +2327,36 @@ var navigator = Object.freeze({
   language: 'en-US',
   languages: Object.freeze(['en-US']),
   platform: 'Win32',
-  vendor: ''
+  vendor: '',
+  // Honest no-op: analytics uses it for every ping; hodo sends no beacons.
+  sendBeacon: function () { return true; }
 });
 __hodoUnsupportedGlobal('screen');
-__hodoUnsupportedGlobal('history');
 __hodoUnsupportedGlobal('Range', TypeError);
 "#;
 
+/// The STATIC (cacheable) half of the page prelude, with placeholders filled.
+/// Contains only class/helper definitions — no DOM-native calls at eval time.
+#[must_use]
+pub fn build_page_static() -> String {
+    with_memo_config(PAGE_STATIC)
+}
+
+/// The per-page half of the page prelude. Captures the live DOM root and URL,
+/// so it must be evaluated once the real page state is installed.
+#[must_use]
+pub fn build_page_dynamic() -> &'static str {
+    PAGE_DYNAMIC
+}
+
 /// Build the page (popup) prelude for one runtime. Injection is intentionally
 /// minimal: a page must never be handed an extension API object.
+///
+/// Byte-identical to the original single-string prelude: all placeholders live
+/// in the STATIC half, so substituting before concatenation is equivalent.
 #[must_use]
 pub fn build_page_prelude() -> String {
-    with_memo_config(PAGE_HELPERS)
+    let mut out = build_page_static();
+    out.push_str(PAGE_DYNAMIC);
+    out
 }

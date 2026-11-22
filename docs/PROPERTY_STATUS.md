@@ -1,5 +1,27 @@
 # CSS property / feature status (Wave A baseline, plus current-tree verification)
 
+> **WAVE 6 (2026-11-22) — property/layout seam truth-sync:** the shell now
+> consumes the landed incremental/property APIs instead of leaving them idle.
+> `PageContext::recompute_if_changed` diffs per-node fingerprints into
+> `dirty_roots`, recomputes styles with the redirect-visited set, then classifies
+> the change with `hodo_style::style_change_class`: `PaintOnly` takes the
+> damage-only repaint path (geometry and item count unchanged), `LayoutAffecting`
+> calls `hodo_layout::layout_from` on the dirty top-level subtrees. One
+> `LayoutContext` lives per document; `reset()` on stylesheet swap / resize /
+> cross-inline edits, and the headless screenshot path uses `layout_from` too.
+> `:visited` is wired end-to-end (shell history → `compute_styles_with_visited`):
+> link colour flips only for visited hrefs (`examples/js-site` stays
+> byte-identical, SHA256 `09B8DCA9…8775D`). Module chunks take
+> `load_many` (cold, parallel) or per-chunk cached loads (warm, 304 revalidation)
+> through an adblock pre-check.
+>
+> Measured wave-6 perf (release, LARGE best-of-3): indexed styles 5.498 ms vs
+> brute 20.215 ms (rule index ≈3.7×), layout 38.316 ms, render 6.406 ms,
+> composite 50.22 ms (yesterday 68 ms); M5.3 gate PASS in both modes with new
+> pins 22.0/38.5/25.0/40.5 ms; one-node incremental 4.37×; measure cache 3.88×;
+> damage 0.3 % pixels. Parallel siblings remain negative (0.61×) — an honest
+> skip, not a shipped win. `archive.org` paints 19,542 bytes (prize).
+>
 > **WAVE 4 LANDED:** the wave-4 tree was gated (fmt + clippy `-D warnings` +
 > 837 workspace tests green; bigdoc perf PASS inside every 1.10× pin, no re-pin)
 > and committed. Newly verified below: `float` now drops a float below an
@@ -9,6 +31,23 @@
 > puts EFF's third featured row below the first row's float band. Every status
 > flip below was verified by reading current code (`file:line` evidence), not
 > `git log`; re-check before using this as a release gate.
+
+> **TRUTH-SYNC ROUND 2 (current uncommitted tree, NOT a commit):** re-read the
+> CSS/layout-adjacent rows below against live code. Newly verified: descendant
+> combinators are not folded (`.a .b` needs a real ancestor chain —
+> `crates/hodo-css/src/lib.rs:3020-3050`, function
+> `descendant_selectors_are_not_folded_into_one_compound`); a vendored
+> DroidSansFallback face supplies CJK glyphs when DejaVu lacks them, behind a
+> 1 MiB LRU atlas (`crates/hodo-render/src/lib.rs:13-15,39-49,73-75`,
+> `glyph_cached` at `:128-160`, eviction at `:178-187`,
+> tests `lib.rs:2400-2485`); and layout reads the flattened shadow-DOM child view
+> via `Dom::render_children` (`crates/hodo-layout/src/block.rs:45-47`, also
+> `flex.rs:174`, `grid.rs:94`, `forms.rs:51`, `table.rs:73`). Honest limits:
+> glyphs neither face covers still tofu, the atlas is an A8-coverage cap (not a
+> font-family shaping engine), and deeply nested HTML completes without a panic
+> but the 512-level cap is still not enforced on the HTML side
+> (`crates/hodo-fuzz/tests/robust.rs:108-146`, TODO at `110-113`). Rows not read
+> this round keep their old status; no commits.
 
 > **WAVE 3 LANDED:** the wave-3 tree was integrated, gated (fmt + clippy
 > `-D warnings` + 826 workspace tests green) and committed. Newly verified below:
@@ -55,7 +94,7 @@ effect**, not that the source text is rejected.
 | `margin` / `padding` + per-side longhands | ✓ | ✓ | ✓ | `25d03fa` expands shorthands; `f3e6d9d` consumes horizontal insets in line boxes. Margins **do not collapse**. |
 | `font-size` (`px` / `em` / `rem` / `%`) | ✓ | ✓ | ✓ | `25d03fa`, `f3e6d9d`; glyph metrics are approximate (`0.6 × font-size`), not real font shaping. |
 | Inline `style="…"` declarations | ✓ | ✓ | ✓ | `25d03fa`; `parse_style_attribute` feeds the cascade as an author-origin layer. |
-| Selectors: combinators, 7 attribute operators incl. `i`, 7 pseudo-classes, specificity, rule index + Bloom filter | ✓ | ✓ | n/a | `25d03fa`; capped at `MAX_CSS_RULES = 100 000` and 10 000 rules per stylesheet. |
+| Selectors: combinators, 7 attribute operators incl. `i`, 7 pseudo-classes, specificity, rule index + Bloom filter | ✓ | ✓ | n/a | `25d03fa`; capped at `MAX_CSS_RULES = 100 000` and 10 000 rules per stylesheet. Round 2: descendant combinators are **not** folded into one compound — `.a .b` / `.a #b` / `.a *` / `.a [data-x]` / `.a :first-child` each need an ancestor chain (`crates/hodo-css/src/lib.rs:3020-3050`, `descendant_selectors_are_not_folded_into_one_compound`, `.a` cases near `:3043`). |
 | `!important` (full origin ladder) | ✓ | ✓ | n/a | `25d03fa`; UA normal < author normal < inline normal < author `!important` < inline `!important` < UA `!important`. |
 | Inline box model: line boxes, fragment backgrounds/borders, anonymous blocks, `<br>`, linear hard-break | ✓ | ✓ | ✓ | `f3e6d9d`; the "normal only, no `inline-block`" limit was lifted — `white-space` modes and `inline-block` are now consumed/painted (`crates/hodo-layout/src/inline.rs:626-640,702-714`), see the verified section below. |
 | `<img src>` (relative URL resolved against the page directory) | ✓ | ✓ | ✓ | `cd1b1ec`; produces `DisplayItem::Image`. |
@@ -90,10 +129,10 @@ on layout.
 | `vertical-align`, `inline-block` | ✓ | ✓ | ✓ | Baseline shift `crates/hodo-layout/src/inline.rs:269-303,621`; `Display::InlineBlock` → `inline_block_atom` (`block.rs:525`, `inline.rs:702-714`), one atomic slot per line. |
 | Media queries: `@media` (`screen`/`print`, `min-`/`max-width`, `min-`/`max-height`, `orientation`, `hover`) + `@supports` + `@import` | ✓ | ✓ | n/a | Wave 2: `hodo_css::Viewport` (`crates/hodo-css/src/lib.rs:31-46`) plus `parse_stylesheet_with`, which evaluates conditions and drops non-matching blocks (`lib.rs:223-292,346-452`). The shell threads the real viewport and merges sheet bodies document-order (`crates/hodo-shell/src/app.rs:1101-1152`); `media="print"` links are skipped (`app.rs:1119-1127`). `@import`/`@layer` warn once and are skipped (`lib.rs:283-289`). CSS wave: `hover` (none matches, hover does not), `prefers-color-scheme` against `Viewport::dark` (shell threads `hpages::read_dark_enabled()`, default light), `not` inversion, top-level comma/`or` lists, MQ4 `width`/`height` ranges, `min-`/`max-resolution` and `-webkit-`/`-moz-` DPR aliases, reduced-motion/forced-colors/pointer; unknown conditions still warn once per sheet. |
 | Link/interaction pseudos (`:link`, `:visited`, `:hover`, `:focus`, `:active`) + `:where()` / `:is()` | ✓ | ✓ | n/a | Wave 2: parsed/encoded in `hodo-css` (`crates/hodo-css/src/lib.rs:124-128,949-952,1002,1121`); `:link`/`:visited` both match `a[href]` and pointer/focus states never match in a static render (`lib.rs:1652-1657`); `:where()` is zero-specificity, `:is()` takes its best branch (`lib.rs:1426`). Consumed by the `hodo-style` matcher. |
-| `font-family` | ✓ | ✓ | n/a | Wave 2: parsed as a declaration (`crates/hodo-css/src/lib.rs:1946-1958`), stored and inherited in `ComputedStyle` (`crates/hodo-style/src/lib.rs:212,925`) and seeded in the layout fallback style (`crates/hodo-layout/src/lib.rs:155`). Glyph selection still uses the single `fontdue` fallback chain — no per-family shaping. |
+| `font-family` | ✓ | ✓ | n/a | Wave 2: parsed as a declaration (`crates/hodo-css/src/lib.rs:1946-1958`), stored and inherited in `ComputedStyle` (`crates/hodo-style/src/lib.rs:212,925`) and seeded in the layout fallback style (`crates/hodo-layout/src/lib.rs:155`). Round 2: glyph selection now tries the primary face then the vendored DroidSansFallback (`crates/hodo-render/src/lib.rs:13-15,39-49`, `glyph_cached` at `:128-160`), with mixed Latin/CJK rasterization covered at `lib.rs:2416-2445` and a 1 MiB LRU A8 atlas (`lib.rs:73-75`, eviction at `:178-187`); still **no per-family shaping**, and codepoints neither face covers render the primary face's tofu (`lib.rs:142-150`). |
 | Viewport units `vh` / `vw` / `vmin` / `vmax` | ✓ | ✓ | ✓ | Wave 2: resolved to px against the stylesheet `Viewport` at parse time (`crates/hodo-css/src/lib.rs:632-655,639-650`), so `hodo-style`/`hodo-layout` consume them as ordinary lengths; tests `lib.rs:2607-2632`. `vi`/`vb` stay unresolved. CSS wave: `calc()` resolves at the same parse-time point (`calc(2*(10px+5px))` → `30px`; `/0` or garbage drops the declaration). `em`/`rem` in `calc()` use a 16px fallback — there is no element font-size context at parse time (TODO: thread it). `%` in `calc()` is dropped with one warning: plain `%` has no percentage basis in this pipeline and widths resolve late. |
 | Stylesheet merge order (cascade order) | ✓ | ✓ | n/a | Wave 2: `<style>`/`<link>` bodies are appended in document order so a later sheet wins a same-specificity tie (`crates/hodo-shell/src/app.rs:1107-1152`, test `app.rs:1235`); failed links warn and the page still renders (`app.rs:1132-1138`, test `app.rs:1300`). Wave 3: `@layer` now parses into real cascade layers (first-seen order, later layers win, `!important` inverts) — see the `var()`/`@layer` row above. |
-| `z-index` / stacking, `box-sizing`, `@font-face`, `background-image` / gradients | not audited | not audited | not audited | Unchanged from `9df4f23` (ТЗ M8 / post-M8 decision); not read this wave, so no status flip. `var()`/`calc()`/`@layer` are no longer in this row — they landed in wave 3 (see rows above); `@media` landed in wave 2. |
+| `z-index` / stacking, `box-sizing`, `@font-face`, `background-image` / gradients | not audited | not audited | not audited | Unchanged from `9df4f23` (ТЗ M8 / post-M8 decision); not read in truth-sync round 2 either, so no status flip. `var()`/`calc()`/`@layer` are no longer in this row — they landed in wave 3 (see rows above); `@media` landed in wave 2. |
 
 ## Non-CSS features with painted output
 
@@ -101,3 +140,5 @@ on layout.
 | --- | --- | --- |
 | Headless screenshots (`hodo-shell --screenshot <url> out.png`, opaque white composite) | ✓ painted | landed before the wave; still current at `9df4f23` |
 | `about:hodo` synthetic page with cache stats | ✓ painted | `cd1b1ec` |
+| Shadow-DOM flattened render view | ✓ painted (substrate) | Round 2: `Dom::attach_shadow`/`render_children`/`SHADOW_ROOT_TAG` (`crates/hodo-dom/src/lib.rs:32,382-424`); layout reads the flattened children in `crates/hodo-layout/src/block.rs:45-47`, `flex.rs:174`, `grid.rs:94`, `forms.rs:51`, `table.rs:73`; JS-visible light view filters the root (`crates/hodo-js/src/dom.rs:200-213,676-704`). Limit: slots/assignment are not modelled; `adoptedStyleSheets` is storage-only (`crates/hodo-js/src/prelude.rs:1436-1447`). |
+| Deeply nested HTML parse (crash class) | ✓ no panic; depth cap not enforced | `crates/hodo-fuzz/tests/robust.rs:108-146` — 600-deep `<div>` chain completes under 10 s and inside `MAX_DOM_NODES`; the TODO at `110-113` says the HTML layer still does not enforce `MAX_NESTING_DEPTH`, so the surplus nodes are retained rather than degraded. Not audited beyond this test. |

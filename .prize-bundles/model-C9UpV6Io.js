@@ -1,0 +1,1 @@
+var e=function(e){return e.SUCCESS=`success`,e.TYPE_ERROR=`type-error`,e.SIZE_ERROR=`size-error`,e.UPLOAD_FAILED=`upload-failed`,e.VERIFY_FAILED=`verify-failed`,e.WAITING_FOR_TASKS=`waiting-for-tasks`,e.WAITING_FOR_QUEUE=`waiting-for-queue`,e.ADMIN_ERROR=`admin-error`,e.RELOADING=`reloading`,e}({});export{e as t};

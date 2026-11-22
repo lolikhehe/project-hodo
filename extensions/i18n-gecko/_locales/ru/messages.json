@@ -1,0 +1,8 @@
+{
+  "appName": {
+    "message": "Демо i18n"
+  },
+  "appDesc": {
+    "message": "Демо-расширение i18n в стиле Gecko для браузера hodo"
+  }
+}

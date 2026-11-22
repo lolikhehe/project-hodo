@@ -3,7 +3,7 @@
 
 use super::*;
 use hodo_adblock::BlockDecision;
-use hodo_cookie::CookieJar;
+use hodo_cookie::{partition_key, CookieJar};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -270,8 +270,10 @@ pub(crate) fn upgrade_redirect(url: &str, private: bool) -> (String, bool) {
 
 /// CHIPS-style double key: request site plus top-level site. A `Partitioned`
 /// cookie set under site A is invisible when the same host loads under site B.
+/// Delegates to hodo-cookie's canonicalizer so store and read keys agree.
+// shortcut: empty top_site conflates no-embedder and about:blank embedder; split when frames land
 pub(crate) fn cookie_partition(scheme: &str, host: &str, top_site: &str) -> String {
-    format!("{}|{}|{}", scheme, registrable(host), top_site)
+    partition_key(scheme, host, top_site)
 }
 
 fn parse_hsts(header: &str) -> Option<(u64, bool)> {
@@ -345,6 +347,19 @@ fn observe_hsts(host: &str, max_age: u64, include_subdomains: bool, now: u64) {
             include_subdomains,
         },
     );
+}
+
+/// Observe a hop's `Strict-Transport-Security` header as soon as it arrives,
+/// not after the whole redirect chain. Later hops call `upgrade_redirect`,
+/// which must already see hop-1's policy. Private fetches never consult or
+/// mutate the process-wide map.
+pub(crate) fn observe_hsts_header(url: &str, header: &str, private: bool) {
+    if private {
+        return;
+    }
+    if let Some((max_age, include_subdomains)) = parse_hsts(header) {
+        observe_hsts(&host_of(url), max_age, include_subdomains, now_unix());
+    }
 }
 
 /// Forget all in-memory HSTS state (called at the start of a private fetch).
@@ -441,9 +456,13 @@ pub fn fetch(
                 .unwrap_or_else(|e| e.into_inner())
                 .store(set_cookie, &loaded.final_url, &cookie_partition, started_at);
         }
+        // A warm cache replay carries the entry's stored_at so a replayed
+        // max-age is measured from when the header was first seen, not from
+        // every request that happens to hit the cache.
+        let hsts_at = loaded.hsts_observed_at.unwrap_or(started_at);
         for (hop_url, header) in &loaded.hsts {
             if let Some((max_age, include_subdomains)) = parse_hsts(header) {
-                observe_hsts(&host_of(hop_url), max_age, include_subdomains, started_at);
+                observe_hsts(&host_of(hop_url), max_age, include_subdomains, hsts_at);
             }
         }
     }
@@ -500,6 +519,28 @@ pub fn revoke_site(site: &str) {
 
 pub fn is_site_allowed(site: &str) -> bool {
     hodo_adblock::is_site_allowed(site)
+}
+
+/// Privacy pre-check for callers that use the parallel [`crate::load_many`]
+/// loader (whose workers deliberately bypass the disk cache and the full
+/// [`fetch`] pipeline). Applies tracking-parameter stripping and the adblock
+/// decision, returning the URL to actually load. Blocked/warn-only hits are
+/// recorded exactly as `fetch` records them, so the batch path is not a hole.
+pub fn check_adblock(url: &str, opts: &FetchOptions) -> Result<String, FetchError> {
+    let stripped = if opts.strip_tracking {
+        strip_tracking_params(url)
+    } else {
+        url.to_string()
+    };
+    let third_party = is_third_party(&stripped, &opts.top_site, opts.referer.as_deref());
+    match hodo_adblock::should_block_record(&stripped, &opts.top_site, third_party, !opts.private) {
+        BlockDecision::Allow => Ok(stripped),
+        BlockDecision::Block { rule } => Err(FetchError::Blocked { rule }),
+        BlockDecision::Warn { .. } => {
+            note_warning(&stripped);
+            Ok(stripped)
+        }
+    }
 }
 
 pub fn privacy_stats() -> PrivacyStats {
@@ -737,8 +778,10 @@ mod tests {
         let server = OneShot::start("Set-Cookie: sid=abc123; Path=/; SameSite=None; Secure\r\n");
         let mut cache = temp_cache();
         let mut jar = CookieJar::new();
-        // Pre-seed a cookie for this loopback partition.
-        jar.store("seed=1", &server.url, "http|127.0.0.1|", 1_700_000_000);
+        // Pre-seed a cookie for this loopback partition (empty top_site now
+        // canonicalizes to the request site).
+        let partition = cookie_partition("http", "127.0.0.1", "");
+        jar.store("seed=1", &server.url, &partition, 1_700_000_000);
         let opts = FetchOptions {
             use_cache: false,
             strip_tracking: false,
@@ -754,7 +797,7 @@ mod tests {
         // The response cookie was stored into the caller's jar (Secure cookies
         // are retained but only sent over https, which loopback cannot do).
         assert_eq!(
-            jar.cookie_header(&server.url, "http|127.0.0.1|", "", 1_700_000_000),
+            jar.cookie_header(&server.url, &partition, "", 1_700_000_000),
             "seed=1"
         );
     }
@@ -894,6 +937,64 @@ mod tests {
     }
 
     #[test]
+    fn cookie_partition_canonicalizes_top_site_for_store_and_read() {
+        // Store on a top-level navigation (empty top_site), read as a
+        // subresource spelled with extra labels: one shared partition key.
+        let host = "site.test";
+        let nav = cookie_partition("https", host, "");
+        let sub = cookie_partition("https", host, "www.site.test");
+        assert_eq!(
+            nav, sub,
+            "top site must be reduced to its registrable domain"
+        );
+        assert_eq!(nav, "https|site.test|site.test");
+
+        let mut jar = CookieJar::new();
+        jar.store(
+            "nav=1; SameSite=None; Secure",
+            "https://site.test/",
+            &nav,
+            1_700_000_000,
+        );
+        assert_eq!(
+            jar.cookie_header(
+                "https://site.test/page",
+                &sub,
+                "www.site.test",
+                1_700_000_000
+            ),
+            "nav=1"
+        );
+
+        // 4-label host, both directions.
+        let four = "a.b.site.test";
+        let nav4 = cookie_partition("https", four, "");
+        let sub4 = cookie_partition("https", four, "c.d.site.test");
+        assert_eq!(nav4, sub4);
+        assert_eq!(nav4, "https|site.test|site.test");
+        let mut jar4 = CookieJar::new();
+        jar4.store(
+            "four=1; SameSite=None; Secure",
+            "https://a.b.site.test/",
+            &nav4,
+            1_700_000_000,
+        );
+        assert_eq!(
+            jar4.cookie_header(
+                "https://a.b.site.test/page",
+                &sub4,
+                "c.d.site.test",
+                1_700_000_000
+            ),
+            "four=1"
+        );
+        assert_eq!(
+            cookie_partition("https", "www.site.test", "a.b.site.test"),
+            nav4
+        );
+    }
+
+    #[test]
     fn hsts_never_applies_to_ip_literals() {
         let _guard = hsts_lock();
         clear_hsts();
@@ -994,6 +1095,273 @@ mod tests {
             "the shortest-lived host must be evicted first"
         );
         assert!(hsts_applies("n0.test", 101));
+        clear_hsts();
+    }
+
+    /// Loopback server addressed as `localhost` (not an IP literal, so HSTS
+    /// can apply to it). Serves scripted responses with a deadline so a
+    /// regression that stops the client early cannot hang the test.
+    struct LocalScript {
+        url: String,
+        join: Option<JoinHandle<()>>,
+    }
+
+    impl LocalScript {
+        fn start(responses: Vec<(u16, String, String)>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let join = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let _ = listener.set_nonblocking(true);
+                for (status, headers, body) in responses {
+                    let stream = loop {
+                        match listener.accept() {
+                            Ok((s, _)) => break Some(s),
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                if std::time::Instant::now() >= deadline {
+                                    break None;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                            }
+                            Err(_) => break None,
+                        }
+                    };
+                    let Some(mut stream) = stream else { return };
+                    // Windows accepted sockets can inherit nonblocking mode;
+                    // restore blocking I/O so the response is fully written.
+                    let _ = stream.set_nonblocking(false);
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                        match stream.read(&mut chunk) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let reason = if status == 302 { "Found" } else { "OK" };
+                    let extra = if headers.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{headers}\r\n")
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+            });
+            Self {
+                url: format!("http://localhost:{port}/start"),
+                join: Some(join),
+            }
+        }
+    }
+
+    impl Drop for LocalScript {
+        fn drop(&mut self) {
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+        }
+    }
+
+    #[test]
+    fn direct_nav_cookie_replays_for_a_same_site_subresource() {
+        let host = "site.test";
+        let direct = cookie_partition("https", host, "");
+        let subresource = cookie_partition("https", host, host);
+        assert_eq!(
+            direct, subresource,
+            "an empty top_site must canonicalize to the request site"
+        );
+
+        let mut jar = CookieJar::new();
+        jar.store(
+            "nav=1; Path=/; SameSite=Lax; Secure",
+            "https://site.test/",
+            &direct,
+            1_700_000_000,
+        );
+        assert_eq!(
+            jar.cookie_header("https://site.test/page", &subresource, host, 1_700_000_000),
+            "nav=1"
+        );
+
+        let cross = cookie_partition("https", host, "other.test");
+        assert_eq!(
+            jar.cookie_header(
+                "https://site.test/page",
+                &cross,
+                "other.test",
+                1_700_000_000
+            ),
+            "",
+            "a cross-site top stays partitioned"
+        );
+    }
+
+    #[test]
+    fn fetch_network_observes_sts_on_each_hop() {
+        let _guard = hsts_lock();
+        clear_hsts();
+        let server = LocalScript::start(vec![(
+            200,
+            "Strict-Transport-Security: max-age=1000; includeSubDomains".into(),
+            HTML.into(),
+        )]);
+        let fetched = fetch_network(&server.url, &Headers::new(), None, false).unwrap();
+        assert_eq!(fetched.data, HTML.as_bytes());
+        assert!(hsts_applies("localhost", now_unix() + 1));
+        assert!(
+            hsts_applies("sub.localhost", now_unix() + 1),
+            "includeSubDomains must be honoured from the observed hop"
+        );
+        clear_hsts();
+    }
+
+    #[test]
+    fn hop_hsts_is_observed_before_the_next_redirect_decision() {
+        let _guard = hsts_lock();
+        clear_hsts();
+        let now = now_unix();
+        observe_hsts("localhost", 1000, true, now);
+        assert!(hsts_applies("localhost", now + 1));
+
+        // Hop 1 clears HSTS and redirects over plain HTTP. If the clear is
+        // applied before hop 2's `upgrade_redirect`, hop 2 stays plain HTTP
+        // and reaches the loopback server. Post-fetch-only observation would
+        // wrongly upgrade hop 2 to https and fail.
+        let server = LocalScript::start(vec![
+            (
+                302,
+                "Location: /final\r\nStrict-Transport-Security: max-age=0".into(),
+                String::new(),
+            ),
+            (200, String::new(), "done".into()),
+        ]);
+        let fetched = fetch_network(&server.url, &Headers::new(), None, false).unwrap();
+        assert!(fetched.final_url.ends_with("/final"));
+        assert!(
+            !hsts_applies("localhost", now_unix() + 1),
+            "hop-1 max-age=0 must be observed before hop 2's upgrade decision"
+        );
+        clear_hsts();
+    }
+
+    #[test]
+    fn private_fetch_network_never_observes_sts() {
+        let _guard = hsts_lock();
+        clear_hsts();
+        let server = LocalScript::start(vec![(
+            200,
+            "Strict-Transport-Security: max-age=1000".into(),
+            HTML.into(),
+        )]);
+        fetch_network(&server.url, &Headers::new(), None, true).unwrap();
+        assert_eq!(hsts_hosts(), 0, "private fetches must not observe HSTS");
+        clear_hsts();
+    }
+
+    #[test]
+    fn warm_cache_hit_observes_the_stored_hsts_fact() {
+        let _guard = hsts_lock();
+        clear_hsts();
+        let mut cache = temp_cache();
+        let mut jar = CookieJar::new();
+        let url = "https://cached.example.test/page";
+        let entry = CacheEntry {
+            url: url.into(),
+            content_type: "text/html".into(),
+            data: HTML.as_bytes().to_vec(),
+            status_code: 200,
+            expires_at: Some(u64::MAX),
+            etag: None,
+            last_modified: None,
+            vary: BTreeMap::new(),
+            headers: BTreeMap::from([(
+                "strict-transport-security".to_string(),
+                "max-age=1000".to_string(),
+            )]),
+            partition_key: String::new(),
+            request_method: "GET".into(),
+            stored_at: now_unix(),
+        };
+        cache.put(&CacheKey::new("GET", url, ""), &entry).unwrap();
+        assert_eq!(hsts_hosts(), 0);
+
+        let opts = FetchOptions {
+            strip_tracking: false,
+            ..FetchOptions::default()
+        };
+        let outcome = fetch(url, &opts, &mut cache, &mut jar).unwrap();
+        assert!(outcome.resource.is_some());
+        assert!(
+            hsts_applies("cached.example.test", now_unix() + 1),
+            "a warm cache hit must still observe the stored HSTS fact"
+        );
+        clear_hsts();
+    }
+
+    #[test]
+    fn warm_hsts_replay_does_not_refresh_a_stale_max_age() {
+        let _guard = hsts_lock();
+        clear_hsts();
+        let mut cache = temp_cache();
+        let mut jar = CookieJar::new();
+        let now = now_unix();
+        let opts = FetchOptions {
+            strip_tracking: false,
+            ..FetchOptions::default()
+        };
+
+        // Stored 90s ago with max-age=60: already expired. Replaying it at the
+        // current request time would wrongly revive it forever.
+        let stale_url = "https://stale.example.test/page";
+        let entry = CacheEntry {
+            url: stale_url.into(),
+            content_type: "text/html".into(),
+            data: HTML.as_bytes().to_vec(),
+            status_code: 200,
+            expires_at: Some(u64::MAX),
+            etag: None,
+            last_modified: None,
+            vary: BTreeMap::new(),
+            headers: BTreeMap::from([(
+                "strict-transport-security".to_string(),
+                "max-age=60".to_string(),
+            )]),
+            partition_key: String::new(),
+            request_method: "GET".into(),
+            stored_at: now - 90,
+        };
+        cache
+            .put(&CacheKey::new("GET", stale_url, ""), &entry)
+            .unwrap();
+        fetch(stale_url, &opts, &mut cache, &mut jar).unwrap();
+        assert!(
+            !hsts_applies("stale.example.test", now + 1),
+            "warm replay must measure max-age from stored_at, not request time"
+        );
+        clear_hsts();
+
+        // A fresh entry carrying the same header still applies.
+        let fresh_url = "https://fresh.example.test/page";
+        let mut fresh = entry;
+        fresh.url = fresh_url.into();
+        fresh.stored_at = now;
+        cache
+            .put(&CacheKey::new("GET", fresh_url, ""), &fresh)
+            .unwrap();
+        fetch(fresh_url, &opts, &mut cache, &mut jar).unwrap();
+        assert!(
+            hsts_applies("fresh.example.test", now + 1),
+            "a fresh HSTS fact must still apply"
+        );
         clear_hsts();
     }
 }

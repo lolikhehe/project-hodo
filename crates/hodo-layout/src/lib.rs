@@ -18,13 +18,18 @@
 //! formatting); `table`, `flex`, `grid` and `forms` are reserved stubs.
 
 mod block;
+mod cache;
 mod flex;
 mod forms;
 mod grid;
+mod incremental;
 mod inline;
+mod parallel;
 mod table;
 
-pub use block::layout;
+pub use block::{layout, layout_with_cache};
+pub use cache::MeasureCache;
+pub use incremental::{layout_from, LayoutContext, LayoutStats};
 
 pub(crate) use flex::layout_flex;
 pub(crate) use grid::layout_grid;
@@ -135,6 +140,10 @@ pub(crate) struct Ctx<'a> {
     pub(crate) dom: &'a Dom,
     pub(crate) styles: &'a StyleMap,
     pub(crate) list: &'a mut DisplayList,
+    /// Shared bounded cache of already-shaped text runs. Fresh scratch
+    /// contexts (flex measurement, fixed channel) get their own short-lived
+    /// cache so two mutable borrows of the caller's cache cannot collide.
+    pub(crate) cache: &'a mut MeasureCache,
 }
 
 /// The available box handed to a block: left edge, top edge and usable width.
@@ -149,6 +158,25 @@ pub(crate) struct Avail {
 /// floats and in-flow blocks share this helper.
 pub(crate) fn resolve_span(abs: f32, pct: Option<f32>, basis: f32) -> f32 {
     pct.map_or(abs, |p| (p / 100.0) * basis)
+}
+
+/// Resolve an element's width against its containing block. Deferred
+/// `%`-calcs (e.g. `calc(100% - 32px)`) come from the style seam first; a
+/// plain percentage and an absolute length keep their existing behaviour.
+pub(crate) fn resolve_width(
+    styles: &StyleMap,
+    id: NodeId,
+    style: &ComputedStyle,
+    basis: f32,
+) -> Option<f32> {
+    styles
+        .resolve_width_with_basis(id, basis)
+        .or_else(|| {
+            style
+                .width_percent
+                .map(|pct| resolve_span(0.0, Some(pct), basis))
+        })
+        .or(style.width)
 }
 
 /// Style used for text nodes that have no computed style of their own.
@@ -1246,6 +1274,59 @@ mod tests {
             "fixed nested two blocks deep and in a flex item must reach the root fixed channel"
         );
         assert_eq!(list.fixed_items.len(), list.fixed_node_map.len());
+    }
+
+    // ---- deferred `%` calc widths (hodo-style seam) ------------------------
+
+    fn calc_width_page(parent_display: &str, child_style: &str) -> Vec<Rect> {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let parent_style = format!("width:1000px;display:{parent_display}");
+        let parent = elem_with_attrs(&mut dom, root, "div", &[("style", parent_style.as_str())]);
+        elem_with_attrs(&mut dom, parent, "div", &[("style", child_style)]);
+        let styles = compute_styles(&dom, &[]);
+        let list = layout(
+            &dom,
+            &styles,
+            Size {
+                w: 1200.0,
+                h: 800.0,
+            },
+        );
+        rects(&list)
+    }
+
+    #[test]
+    fn deferred_calc_width_resolves_against_block_parent() {
+        let rs = calc_width_page("block", "width:calc(100% - 32px);background:#0000ff");
+        assert_eq!(rs.len(), 1, "one child background: {rs:?}");
+        assert!(
+            (rs[0].w - 968.0).abs() < 0.01,
+            "calc(100% - 32px) in a 1000px parent must be 968px: {rs:?}"
+        );
+    }
+
+    #[test]
+    fn deferred_calc_width_resolves_for_flex_child() {
+        let rs = calc_width_page("flex", "width:calc(100% - 32px);background:#0000ff");
+        assert!(
+            rs.iter().any(|r| (r.w - 968.0).abs() < 0.01),
+            "flex child must honour the resolved calc width: {rs:?}"
+        );
+    }
+
+    #[test]
+    fn plain_percent_and_px_widths_are_unchanged() {
+        let pct = calc_width_page("block", "width:50%;background:#0000ff");
+        assert!(
+            (pct[0].w - 500.0).abs() < 0.01,
+            "plain percentage still resolves to 500px: {pct:?}"
+        );
+        let px = calc_width_page("block", "width:200px;background:#0000ff");
+        assert!(
+            (px[0].w - 200.0).abs() < 0.01,
+            "absolute width unchanged: {px:?}"
+        );
     }
 
     #[test]

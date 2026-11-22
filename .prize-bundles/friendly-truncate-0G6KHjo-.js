@@ -1,0 +1,1 @@
+function e(e,t){let n=e.normalize(),r=[...n];if(r.length<=t)return n;let i=r.slice(0,t),a=i.length;if(t<=3||a<=3)return i.join(``);let o=i.slice(0,-2).reverse().findIndex(e=>/\s/.test(e))??0;return o<0&&(o=a-t),i.slice(0,a-o-3).join(``)+`...`}export{e as t};

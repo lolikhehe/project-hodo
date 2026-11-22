@@ -1,0 +1,1 @@
+var e=function(e){return e.light=`light`,e.dark=`dark`,e.auto=`auto`,e}({});export{e as t};

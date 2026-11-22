@@ -20,6 +20,7 @@ use hodo_ext_api::{
     canonical_namespace, ApiCall, ApiDialect, ApiRegistry, ApiResult, Clock, ExtEvent,
     RuntimeConfig, RuntimeInfo, SystemClock,
 };
+use hodo_ext_ipc::Message;
 use hodo_ext_manifest::{Manifest, ManifestVersion};
 use serde_json::{json, Value};
 
@@ -28,6 +29,12 @@ pub mod worker;
 
 /// Same cap as `hodo_net::MAX_BYTES`; a manifest or script is never allowed to grow unbounded.
 const MAX_MANIFEST_BYTES: usize = hodo_types::limits::MAX_MANIFEST_BYTES;
+/// `__hodo_ready` embeds *every* background script in one IPC frame. Keep the
+/// aggregate source bytes well under `MAX_MSG_BYTES` so the frame envelope and
+/// JSON escaping cannot trip the codec's encode assert (which panics the host).
+const MAX_SCRIPT_BYTES: usize = hodo_types::limits::MAX_MSG_BYTES - 64 * 1024;
+/// Retained worker events are bounded; overflow drops the oldest, not the host.
+const MAX_PENDING_WORKER_EVENTS: usize = 256;
 /// MV3 service workers unload after 30 seconds without events or API calls.
 const IDLE_UNLOAD_MS: u64 = 30_000;
 
@@ -70,7 +77,14 @@ pub struct Host {
     has_message_listener: Vec<bool>,
     /// Events for isolated workers that could not be delivered immediately
     /// (spawn in backoff, worker exiting). Replayed on the next (re)spawn.
+    ///
+    /// At-most-once: `Broker::send_event == true` only means the pipe accepted
+    /// the frame, not that a JS listener ran; there is no delivery ack. Events
+    /// that fail the write are retained here, capped at
+    /// [`MAX_PENDING_WORKER_EVENTS`] with oldest-first drops and one diagnostic.
     worker_pending_events: Vec<Vec<(String, Value)>>,
+    /// One-shot flag per extension for the retained-queue overflow diagnostic.
+    pending_queue_full_reported: Vec<bool>,
 }
 
 /// Either a shared registry event or an event injected by the browser/worker.
@@ -171,6 +185,7 @@ impl Default for Host {
             event_queues: Vec::new(),
             has_message_listener: Vec::new(),
             worker_pending_events: Vec::new(),
+            pending_queue_full_reported: Vec::new(),
         }
     }
 }
@@ -227,6 +242,18 @@ impl Host {
                 );
             }
         }
+        // Oversized scripts are not cosmetic: they ride in one `__hodo_ready`
+        // frame, so reject at load with a named diagnostic instead of letting
+        // the IPC encoder assert when the worker is spawned.
+        validate_script_sizes(
+            path,
+            manifest
+                .background_scripts
+                .iter()
+                .map(String::as_str)
+                .chain(manifest.service_worker.iter().map(String::as_str)),
+            &manifest.name,
+        )?;
 
         self.extensions.push(Extension {
             manifest,
@@ -240,6 +267,7 @@ impl Host {
         self.event_queues.push(Vec::new());
         self.has_message_listener.push(false);
         self.worker_pending_events.push(Vec::new());
+        self.pending_queue_full_reported.push(false);
         if let Some(broker) = self.broker.as_mut() {
             broker.ensure(self.extensions.len() - 1);
         }
@@ -427,12 +455,14 @@ impl Host {
             let mut bytes = Vec::new();
             let read = fs::File::open(&path)
                 .and_then(|file| {
-                    file.take(MAX_MANIFEST_BYTES as u64 + 1)
+                    file.take(MAX_SCRIPT_BYTES as u64 + 1)
                         .read_to_end(&mut bytes)
                 })
                 .map_err(|err| format!("background script {script}: {err}"))?;
-            if read > MAX_MANIFEST_BYTES {
-                return Err("background script too large".into());
+            if read > MAX_SCRIPT_BYTES {
+                return Err(format!(
+                    "background script {script} is {read} bytes, exceeding the {MAX_SCRIPT_BYTES} byte script limit"
+                ));
             }
             sources.push(
                 String::from_utf8(bytes)
@@ -532,6 +562,26 @@ impl Host {
                 // A deferred spawn is not a wake: retain the event below.
                 let _ = self.start_worker(ext_index);
             }
+            // A host-supplied payload (e.g. a content-script body) can be far
+            // larger than any worker frame. Check the serialized size here so
+            // an oversized event is diagnosed and dropped, never handed to
+            // `encode` (whose assert would panic the host).
+            let msg = Message::Event {
+                name: name.to_string(),
+                payload: payload.clone(),
+            };
+            if let Err(too_big) = broker::try_encode_bounded(&msg) {
+                let ext_name = self.extensions.get(ext_index).map_or_else(
+                    || format!("ext {ext_index}"),
+                    |ext| ext.manifest.name.clone(),
+                );
+                self.diagnostics.borrow_mut().push(format!(
+                    "{ext_name}: event '{name}' is {} bytes, exceeding the {} byte IPC cap; dropped",
+                    too_big.len,
+                    hodo_ext_ipc::MAX_MSG_BYTES
+                ));
+                return;
+            }
             let now = self.clock.now_ms();
             let delivered = {
                 let Some(broker) = self.broker.as_mut() else {
@@ -540,10 +590,11 @@ impl Host {
                 broker.touch(ext_index, now);
                 broker.send_event(ext_index, name, payload.clone())
             };
+            // At-most-once: `delivered` only means the pipe accepted the frame;
+            // there is no ack that a JS listener ran. Retain failures for
+            // replay; `retain_worker_event` bounds the queue and drops oldest.
             if !delivered {
-                if let Some(pending) = self.worker_pending_events.get_mut(ext_index) {
-                    pending.push((name.to_string(), payload));
-                }
+                self.retain_worker_event(ext_index, name, payload);
             }
             return;
         }
@@ -690,6 +741,42 @@ impl Host {
         result
     }
 
+    /// Retain an event a worker could not accept, with a bounded, oldest-first
+    /// queue. At-most-once: there is no ack from JS, so a retained event may
+    /// still be lost when the cap drops it; the loss is reported once per
+    /// extension instead of once per dropped event.
+    fn retain_worker_event(&mut self, ext_index: usize, name: &str, payload: Value) {
+        let ext_name = self.extensions.get(ext_index).map_or_else(
+            || format!("ext {ext_index}"),
+            |ext| ext.manifest.name.clone(),
+        );
+        let Some(pending) = self.worker_pending_events.get_mut(ext_index) else {
+            return;
+        };
+        let full = pending.len() >= MAX_PENDING_WORKER_EVENTS;
+        if full {
+            pending.remove(0); // drop-oldest: a stale event is less useful than a new one
+        }
+        // shortcut: no dedup — two identical frames in one poll window retain
+        // twice, and dead-sibling events persist until the cap evicts them;
+        // revisit when an ack protocol lands.
+        pending.push((name.to_string(), payload));
+        if full
+            && !self
+                .pending_queue_full_reported
+                .get(ext_index)
+                .copied()
+                .unwrap_or(false)
+        {
+            if let Some(reported) = self.pending_queue_full_reported.get_mut(ext_index) {
+                *reported = true;
+            }
+            self.diagnostics.borrow_mut().push(format!(
+                "{ext_name}: retained worker event queue reached its {MAX_PENDING_WORKER_EVENTS}-event cap; dropping oldest events (at-most-once, no ack protocol)"
+            ));
+        }
+    }
+
     /// Drain retained events into newly live workers, keeping anything that
     /// still cannot be delivered for the next restart.
     fn replay_pending_worker_events(&mut self) {
@@ -707,6 +794,11 @@ impl Host {
                 }
             }
             self.worker_pending_events[ext_index] = undelivered;
+            // The queue was just drained; allow the overflow diagnostic to fire
+            // again if a later burst refills it.
+            if let Some(reported) = self.pending_queue_full_reported.get_mut(ext_index) {
+                *reported = false;
+            }
         }
         self.broker = Some(broker);
     }
@@ -765,10 +857,13 @@ impl Host {
                 .filter(|&index| {
                     index != from
                         && Some(index) != in_process_target
+                        // During `tick` the broker is taken while polling; a
+                        // worker frame routed in that window must still reach
+                        // `send_to_worker`, which retains it for replay.
                         && self
                             .broker
                             .as_ref()
-                            .is_some_and(|broker| broker.is_live(index))
+                            .is_none_or(|broker| broker.is_live(index))
                 })
                 .collect();
             for target in targets {
@@ -782,17 +877,23 @@ impl Host {
             let _ = self.start_worker(target);
         }
         let now = self.clock.now_ms();
+        if self.broker.is_none() {
+            // `tick` takes the broker while polling. A message routed from
+            // another worker in that window must be retained, not dropped;
+            // `replay_pending_worker_events` delivers it once polling returns.
+            self.retain_worker_event(target, name, payload);
+            return;
+        }
         let delivered = {
-            let Some(broker) = self.broker.as_mut() else {
-                return;
-            };
+            let broker = self.broker.as_mut().expect("checked above");
             broker.touch(target, now);
             broker.send_event(target, name, payload.clone())
         };
+        // At-most-once: `delivered` only means the pipe accepted the frame, not
+        // that JS handled it; there is no ack protocol. Failures are retained
+        // for replay with the same oldest-first cap as `emit_event`.
         if !delivered {
-            if let Some(pending) = self.worker_pending_events.get_mut(target) {
-                pending.push((name.to_string(), payload));
-            }
+            self.retain_worker_event(target, name, payload);
         }
     }
 
@@ -910,6 +1011,38 @@ impl Host {
     }
 }
 
+/// Reject scripts that cannot fit in one `__hodo_ready` frame. The diagnostic
+/// names the extension, the measured size and the cap so a bad unpacked
+/// extension is actionable at load time rather than a panic at spawn time.
+fn validate_script_sizes<'a>(
+    root: &Path,
+    scripts: impl Iterator<Item = &'a str>,
+    name: &str,
+) -> Result<(), HostError> {
+    let mut total = 0usize;
+    for script in scripts {
+        // Missing files are cosmetic (warned about in `load_dir`).
+        let Ok(meta) = fs::metadata(root.join(script)) else {
+            continue;
+        };
+        let size = meta.len() as usize;
+        if size > MAX_SCRIPT_BYTES {
+            return Err(HostError::Io(format!(
+                "extension '{name}': background script '{script}' is {size} bytes, exceeding the {MAX_SCRIPT_BYTES} byte script limit (IPC frame cap {} bytes)",
+                hodo_types::limits::MAX_MSG_BYTES
+            )));
+        }
+        total = total.saturating_add(size);
+    }
+    if total > MAX_SCRIPT_BYTES {
+        return Err(HostError::Io(format!(
+            "extension '{name}': background scripts total {total} bytes, exceeding the {MAX_SCRIPT_BYTES} byte script limit (IPC frame cap {} bytes)",
+            hodo_types::limits::MAX_MSG_BYTES
+        )));
+    }
+    Ok(())
+}
+
 /// Stable in-process digest of the exact manifest bytes. The worker echoes it
 /// in `Hello`; no body-supplied digest is ever trusted.
 fn manifest_digest(bytes: &[u8]) -> String {
@@ -960,11 +1093,20 @@ impl broker::BrokerHost for Host {
         if let Some(broker) = self.broker.as_mut() {
             for index in 0..self.contexts.len() {
                 if index != ext_index && !self.disabled.get(index).copied().unwrap_or(false) {
-                    broker.send_event(
-                        index,
-                        "__hodoExtensionDisabled",
-                        json!({ "extension": ext_index, "reason": reason }),
-                    );
+                    let payload = json!({ "extension": ext_index, "reason": reason });
+                    let msg = Message::Event {
+                        name: "__hodoExtensionDisabled".to_string(),
+                        payload: payload.clone(),
+                    };
+                    if let Err(too_big) = broker::try_encode_bounded(&msg) {
+                        self.diagnostics.borrow_mut().push(format!(
+                            "disable fan-out to ext {index}: frame is {} bytes, exceeding the {} byte IPC cap; skipped",
+                            too_big.len,
+                            hodo_ext_ipc::MAX_MSG_BYTES
+                        ));
+                        continue;
+                    }
+                    let _ = broker.send_event(index, "__hodoExtensionDisabled", payload);
                 }
             }
         }
@@ -1156,6 +1298,23 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../extensions")
             .join(name)
+    }
+
+    /// Cargo builds the test-only fake worker alongside this crate.
+    fn fake_worker_path() -> PathBuf {
+        let exe = std::env::current_exe().expect("current exe");
+        let dir = exe.parent().expect("binary dir");
+        let target = dir.parent().unwrap_or(dir);
+        let path = target.join(format!(
+            "hodo-ext-fake-worker{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        assert!(
+            path.is_file(),
+            "build hodo-ext-fake-worker first: {}",
+            path.display()
+        );
+        path
     }
 
     fn storage_get(host: &mut Host, key: &str) -> Option<String> {
@@ -1369,6 +1528,180 @@ mod tests {
     }
 
     #[test]
+    fn oversized_background_script_is_rejected_at_load_without_panic() {
+        let tmp = TempExt::new(
+            r#"{
+                "manifest_version": 3, "name": "Oversized Script", "version": "1.0.0",
+                "permissions": [], "background": { "service_worker": "bg.js" }
+            }"#,
+        );
+        let size = 1050 * 1024; // 1.05 MiB: passes the 2 MiB manifest cap
+        fs::write(tmp.root.join("bg.js"), vec![b' '; size]).unwrap();
+        let mut host = HostBuilder::new().isolated(true).build();
+        let err = host
+            .load_dir(&tmp.root)
+            .expect_err("a 1.05 MiB script must be rejected at load");
+        let message = err.to_string();
+        assert!(message.contains("Oversized Script"), "{message}");
+        assert!(message.contains(&size.to_string()), "{message}");
+        assert!(message.contains(&MAX_SCRIPT_BYTES.to_string()), "{message}");
+        // No worker is spawned, so the IPC encoder's assert cannot be reached.
+        assert!(host.take_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn retained_worker_events_are_capped_with_oldest_dropped() {
+        let mut host = in_process_host();
+        host.worker_pending_events.push(Vec::new());
+        host.pending_queue_full_reported.push(false);
+        for i in 0..300u64 {
+            host.retain_worker_event(0, "probe", json!({ "i": i }));
+        }
+        let queue = &host.worker_pending_events[0];
+        assert_eq!(queue.len(), MAX_PENDING_WORKER_EVENTS);
+        assert_eq!(
+            queue.first().unwrap().1,
+            json!({ "i": 300 - MAX_PENDING_WORKER_EVENTS as u64 })
+        );
+        assert_eq!(queue.last().unwrap().1, json!({ "i": 299 }));
+        let diagnostics = host.take_diagnostics();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|line| line.contains("retained worker event queue"))
+                .count(),
+            1,
+            "the overflow must be a one-shot diagnostic: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_emit_event_payload_is_diagnosed_without_panicking() {
+        // MV2: emit_event will not try to spawn a worker, so no e2e process is
+        // needed to exercise the host->worker frame boundary.
+        let tmp = TempExt::new(GECKO_TABS);
+        let mut host = HostBuilder::new().isolated(true).build();
+        host.load_dir(&tmp.root).unwrap();
+        let big = "x".repeat(1050 * 1024);
+        host.emit_event(0, "probe", json!({ "body": big }));
+        let diags = host.take_diagnostics();
+        assert!(
+            diags
+                .iter()
+                .any(|line| line.contains("IPC cap") && line.contains("dropped")),
+            "expected an oversized-frame diagnostic: {diags:?}"
+        );
+        assert!(
+            host.worker_pending_events[0].is_empty(),
+            "an undeliverable event must not be retained"
+        );
+        assert!(!host.extension_disabled(0));
+        // The host is still alive and a normal event takes the regular path.
+        host.emit_event(0, "probe", json!({ "ok": true }));
+        assert_eq!(host.worker_pending_events[0].len(), 1);
+    }
+
+    #[test]
+    fn worker_message_routed_while_broker_taken_is_replayed_after_poll() {
+        let clock = Rc::new(FakeClock::new(0));
+        let mut host = HostBuilder::new()
+            .isolated(true)
+            .clock(clock.clone())
+            .worker_path(fake_worker_path())
+            .worker_env("HODO_FAKE_NO_STORAGE", "1")
+            .build();
+        host.load_dir(&repo_ext("hello-chrome")).unwrap();
+        host.load_dir(&repo_ext("hello-chrome")).unwrap();
+        // Only the target worker is live; the message originates from ext 0.
+        host.run_background_scripts(1).unwrap();
+        assert!(host.worker_is_live(1));
+
+        // Reproduce `tick`'s polling window: the broker is taken out of Host.
+        let broker = host.broker.take().expect("isolated host owns a broker");
+        host.route_worker_message(0, json!({ "cross": "worker" }));
+        assert_eq!(
+            host.worker_pending_events[1].len(),
+            1,
+            "a message routed during poll must be retained, not dropped"
+        );
+
+        // Poll returns: the broker is restored and the retained event replays.
+        host.broker = Some(broker);
+        host.replay_pending_worker_events();
+        assert!(
+            host.worker_pending_events[1].is_empty(),
+            "the retained message must be replayed"
+        );
+        // Stability: the target is a real fake-worker process, so delivery is
+        // timing-dependent. The 500 x 10 ms budget (~5 s) absorbs slow Windows
+        // process startup (verified on Windows CI); if a loaded runner ever
+        // flakes, raise the budget — do not re-ignore this regression.
+        let delivered = (0..500).any(|_| {
+            host.tick();
+            let found = host
+                .take_diagnostics()
+                .iter()
+                .any(|line| line.contains("event:runtime.onMessage"));
+            if found {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                false
+            }
+        });
+        assert!(delivered, "cross-worker message never reached its target");
+        host.terminate_worker(1);
+    }
+
+    #[test]
+    fn overflow_diagnostic_fires_again_after_a_drain() {
+        let clock = Rc::new(FakeClock::new(0));
+        let mut host = HostBuilder::new()
+            .isolated(true)
+            .clock(clock.clone())
+            .worker_path(fake_worker_path())
+            .worker_env("HODO_FAKE_NO_STORAGE", "1")
+            .build();
+        host.load_dir(&repo_ext("hello-chrome")).unwrap();
+        host.run_background_scripts(0).unwrap();
+        assert!(host.worker_is_live(0));
+
+        for i in 0..MAX_PENDING_WORKER_EVENTS + 1 {
+            host.retain_worker_event(0, "first", json!({ "i": i }));
+        }
+        assert_eq!(
+            host.take_diagnostics()
+                .iter()
+                .filter(|line| line.contains("retained worker event queue"))
+                .count(),
+            1
+        );
+
+        // A tick replays the retained queue to the live worker and resets the
+        // one-shot flag.
+        host.tick();
+        assert!(
+            host.worker_pending_events[0].is_empty(),
+            "the retained queue must drain"
+        );
+        host.take_diagnostics();
+
+        for i in 0..MAX_PENDING_WORKER_EVENTS + 1 {
+            host.retain_worker_event(0, "second", json!({ "i": i }));
+        }
+        let diags = host.take_diagnostics();
+        assert_eq!(
+            diags
+                .iter()
+                .filter(|line| line.contains("retained worker event queue"))
+                .count(),
+            1,
+            "a drained queue must allow a fresh overflow diagnostic: {diags:?}"
+        );
+        host.terminate_worker(0);
+    }
+
+    #[test]
     fn bad_index_is_an_error() {
         let mut host = in_process_host();
         let msg = ApiCall::SendMessage {
@@ -1409,11 +1742,18 @@ mod tests {
     fn host_resolves_action_title_at_load_time() {
         let mut host = in_process_host();
         host.load_dir(&repo_ext("i18n-gecko")).unwrap();
+        // `ui_locale()` follows the host OS locale, so the resolved title is
+        // either the en or ru message; the contract is that the token is gone.
+        let title = host.extension_title(0).expect("action title");
+        assert!(
+            matches!(title, "i18n Demo" | "Демо i18n"),
+            "unexpected resolved title: {title}"
+        );
+        assert_ne!(title, "__MSG_appName__");
         assert_eq!(
             host.extensions()[0].manifest.action_title.as_deref(),
-            Some("i18n Demo")
+            Some(title)
         );
-        assert_eq!(host.extension_title(0), Some("i18n Demo"));
     }
 
     #[test]

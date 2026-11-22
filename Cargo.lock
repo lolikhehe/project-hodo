@@ -1253,6 +1253,7 @@ dependencies = [
  "hodo-css",
  "hodo-dom",
  "hodo-ext-api",
+ "hodo-html",
  "hodo-types",
  "serde_json",
 ]
@@ -1316,6 +1317,7 @@ dependencies = [
  "fontdue",
  "hodo-adblock",
  "hodo-cache",
+ "hodo-cookie",
  "hodo-css",
  "hodo-dom",
  "hodo-ext-api",

@@ -426,7 +426,7 @@ pub fn get_accept_languages() -> Vec<String> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     struct TempDir(PathBuf);
@@ -634,5 +634,25 @@ mod tests {
         assert!(!locale.is_empty());
         let languages = get_accept_languages();
         assert!(languages.contains(&"en".to_owned()));
+    }
+
+    #[test]
+    fn i18n_gecko_fixture_resolves_en_and_ru() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../extensions/i18n-gecko");
+        let en = load_locales(&root, Some("en"), "en").expect("en locale loads");
+        assert_eq!(en.locale, "en");
+        assert_eq!(en.get_message("appName", &[]), "i18n Demo");
+        assert_eq!(
+            en.get_message("appDesc", &[]),
+            "Gecko-style i18n demo extension for the hodo browser"
+        );
+
+        let ru = load_locales(&root, Some("en"), "ru").expect("ru locale loads");
+        assert_eq!(ru.locale, "ru");
+        assert_eq!(ru.get_message("appName", &[]), "Демо i18n");
+        assert_eq!(
+            ru.get_message("appDesc", &[]),
+            "Демо-расширение i18n в стиле Gecko для браузера hodo"
+        );
     }
 }

@@ -6,7 +6,8 @@
 //! browser-like "microtask before next timer" ordering.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -42,6 +43,84 @@ use boa_engine::{
 #[cfg(feature = "js")]
 thread_local! {
     static HANDLES: RefCell<HashMap<u64, Rc<RuntimeState>>> = RefCell::new(HashMap::new());
+    /// One primed page realm, built ahead of the next navigation so its STATIC
+    /// prelude parse overlaps the host's network fetch. One-shot: each primed
+    /// context is used by exactly one page, preserving full realm isolation.
+    static PRIMED_PAGE: RefCell<Option<PrimedPage>> = const { RefCell::new(None) };
+}
+
+#[cfg(feature = "js")]
+struct PrimedPage {
+    context: Context,
+    id: u64,
+    state: Rc<RuntimeState>,
+    executor: Rc<HodoJobExecutor>,
+    hooks: Rc<ExtensionHooks>,
+}
+
+/// Parse and evaluate the STATIC half of the page prelude into a fresh realm,
+/// ready for the next [`ExtScriptRuntime::new_page_with_url`] checkout.
+///
+/// Call this at the start of a navigation (before fetching scripts) so the
+/// ~56 ms prelude parse overlaps the network round-trip. It is a no-op when a
+/// previously primed realm has not yet been checked out. The realm is one-shot:
+/// checking it out rebinds it to the real DOM/URL, evaluates the small DYNAMIC
+/// half, and never shares it with another page.
+#[cfg(feature = "js")]
+pub fn prime_page_prelude() {
+    PRIMED_PAGE.with(|slot| {
+        if slot.borrow().is_some() {
+            return;
+        }
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let config = RuntimeConfig::default();
+        let registry = Rc::new(RefCell::new(ApiRegistry::new()));
+        let mut state_inner = RuntimeState::new(registry, Rc::new(SystemClock), config.clone());
+        // Placeholder page: the real DOM/URL are installed at checkout.
+        state_inner.page = Some(dom::PageState::new(
+            Rc::new(RefCell::new(hodo_dom::Dom::new())),
+            String::new(),
+        ));
+        let state = Rc::new(state_inner);
+        HANDLES.with(|h| h.borrow_mut().insert(id, Rc::clone(&state)));
+        let executor = Rc::new(HodoJobExecutor::default());
+        let hooks = Rc::new(ExtensionHooks::new(config.extension_name.clone()));
+        let mut context = Context::builder()
+            .job_executor(Rc::clone(&executor))
+            .host_hooks(Rc::clone(&hooks))
+            .build()
+            .expect("building a fresh boa context should not fail");
+        let mut limits = context.runtime_limits();
+        limits.set_loop_iteration_limit(LOOP_ITERATION_LIMIT);
+        limits.set_recursion_limit(RECURSION_LIMIT);
+        context.set_runtime_limits(limits);
+        register_natives(&mut context, id);
+        dom::register_natives(&mut context, id);
+        let static_prelude = prelude::build_page_static();
+        context
+            .eval(Source::from_bytes(static_prelude.as_str()))
+            .expect("the STATIC page prelude is valid JavaScript");
+        *slot.borrow_mut() = Some(PrimedPage {
+            context,
+            id,
+            state,
+            executor,
+            hooks,
+        });
+    });
+}
+
+/// Explicitly drop a still-primed page realm on its owning thread. A boa
+/// `Context` left inside a thread-local until process teardown can fault during
+/// GC finalisation; callers that may exit without another navigation (headless
+/// screenshots, GUI shutdown) call this first so teardown is orderly.
+#[cfg(feature = "js")]
+pub fn drop_primed_page_prelude() {
+    PRIMED_PAGE.with(|slot| {
+        if let Some(primed) = slot.borrow_mut().take() {
+            drop(primed);
+        }
+    });
 }
 
 #[cfg(feature = "js")]
@@ -55,7 +134,9 @@ const LOOP_ITERATION_LIMIT: u64 = 1_000_000;
 const RECURSION_LIMIT: usize = 256;
 /// Boa 0.22 parses deeply nested literals recursively; guard the parser before
 /// handing it extension-controlled source (runtime limits apply only after parse).
-const MAX_SOURCE_BRACKET_DEPTH: usize = 24;
+/// 24 rejected real minified bundles (regex/template braces counted as nesting),
+/// so accept up to 64 — still far below anything that threatens the C stack.
+const MAX_SOURCE_BRACKET_DEPTH: usize = 64;
 
 /// Default wall budget for a *series* of page-script evals. The host owns the
 /// loop that eval's scripts; hodo-js owns the value so the limit cannot drift.
@@ -127,6 +208,33 @@ struct Timer {
     args: Value,
 }
 
+// BinaryHeap pops the greatest element; reverse the key so the earliest
+// deadline pops first. Ties break on `id`, which is monotonic with insertion,
+// preserving the old "sort by id, take smallest" FIFO order at equal deadlines.
+#[cfg(feature = "js")]
+impl Ord for Timer {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        other
+            .deadline
+            .cmp(&self.deadline)
+            .then_with(|| other.id.cmp(&self.id))
+    }
+}
+#[cfg(feature = "js")]
+impl PartialOrd for Timer {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+#[cfg(feature = "js")]
+impl PartialEq for Timer {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline == other.deadline && self.id == other.id
+    }
+}
+#[cfg(feature = "js")]
+impl Eq for Timer {}
+
 #[cfg(feature = "js")]
 enum Task {
     Failure {
@@ -156,6 +264,21 @@ enum Task {
     },
 }
 
+/// One `import(spec)` the page asked the host to load. The native records it
+/// here; the shell drains the queue, evaluates the module graph, then settles
+/// the matching promise with [`ExtScriptRuntime::resolve_dynamic_import`] (or
+/// [`ExtScriptRuntime::reject_dynamic_import`]).
+#[cfg(feature = "js")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynamicModuleRequest {
+    /// Absolute spec, already resolved against `base_url` by the prelude.
+    pub spec: String,
+    /// `__hodoModuleBaseUrl` at the call site (the importing module's URL).
+    pub base_url: String,
+    /// Opaque id correlating the host result to the pending JS promise.
+    pub promise_id: u64,
+}
+
 /// Generic host-facing seam for message replies. The host decides how a reply
 /// is correlated to a request; hodo-js only produces `(message, response)`.
 #[cfg(feature = "js")]
@@ -167,7 +290,11 @@ pub(crate) struct RuntimeState {
     clock: Rc<dyn Clock>,
     config: RuntimeConfig,
     queue: RefCell<VecDeque<Task>>,
-    timers: RefCell<Vec<Timer>>,
+    /// Min-heap by deadline, FIFO by id. Cancelled timers leave entries here
+    /// until due and are skipped lazily (see `next_task`).
+    timers: RefCell<BinaryHeap<Timer>>,
+    /// Ids with a live timer. A popped entry whose id is absent is a tombstone.
+    live_timers: RefCell<HashSet<u64>>,
     logs: RefCell<Vec<String>>,
     /// Host-side permission-gated implementation of `fetch` (absent in tests).
     fetch_hook: RefCell<Option<FetchHook>>,
@@ -196,6 +323,9 @@ pub(crate) struct RuntimeState {
     /// writes are ignored with one warning.
     doc_write_open: Cell<bool>,
     doc_write_warned: Cell<bool>,
+    /// Dynamic `import()` requests pending host attention (see
+    /// [`DynamicModuleRequest`]); drained by the shell after script eval.
+    dynamic_module_requests: RefCell<Vec<DynamicModuleRequest>>,
 }
 
 #[cfg(feature = "js")]
@@ -210,7 +340,8 @@ impl RuntimeState {
             clock,
             config,
             queue: RefCell::new(VecDeque::new()),
-            timers: RefCell::new(Vec::new()),
+            timers: RefCell::new(BinaryHeap::new()),
+            live_timers: RefCell::new(HashSet::new()),
             logs: RefCell::new(Vec::new()),
             fetch_hook: RefCell::new(None),
             dispatch_hook: RefCell::new(None),
@@ -224,7 +355,32 @@ impl RuntimeState {
             doc_write_buffer: RefCell::new(String::new()),
             doc_write_open: Cell::new(true),
             doc_write_warned: Cell::new(false),
+            dynamic_module_requests: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Rebind a primed realm to a fresh page: free the placeholder's DOM
+    /// handles and clear every per-page field before installing `page`.
+    #[cfg(feature = "js")]
+    fn bind_page(&mut self, page: dom::PageState) {
+        dom::drop_page(self);
+        self.timers.borrow_mut().clear();
+        self.live_timers.borrow_mut().clear();
+        self.queue.borrow_mut().clear();
+        self.logs.borrow_mut().clear();
+        *self.fetch_hook.borrow_mut() = None;
+        *self.dispatch_hook.borrow_mut() = None;
+        *self.reply_hook.borrow_mut() = None;
+        self.message_replies.borrow_mut().clear();
+        self.title.borrow_mut().clear();
+        self.next_id.set(1);
+        self.memo_epoch.set(1);
+        self.pending_writes.set(0);
+        self.doc_write_buffer.borrow_mut().clear();
+        self.doc_write_open.set(true);
+        self.doc_write_warned.set(false);
+        self.dynamic_module_requests.borrow_mut().clear();
+        self.page = Some(page);
     }
 
     /// Emit at most one stderr warning for post-load `document.write` calls.
@@ -287,17 +443,18 @@ impl RuntimeState {
         interval: Option<u64>,
         args: Value,
     ) -> Result<(), String> {
-        let mut timers = self.timers.borrow_mut();
-        if timers.len() >= MAX_TIMERS {
+        let mut live = self.live_timers.borrow_mut();
+        if live.len() >= MAX_TIMERS {
             return Err(format!("timer limit of {MAX_TIMERS} exceeded"));
         }
         let now = self.clock.now_ms();
-        timers.push(Timer {
+        self.timers.borrow_mut().push(Timer {
             id,
             deadline: now.saturating_add(delay_ms.max(1)),
             interval_ms: interval,
             args,
         });
+        live.insert(id);
         Ok(())
     }
 }
@@ -419,12 +576,51 @@ impl ExtScriptRuntime {
     #[cfg(feature = "js")]
     #[must_use]
     pub fn new_page_with_url(dom: Rc<RefCell<hodo_dom::Dom>>, url: impl Into<String>) -> Self {
+        let url = url.into();
+        // One-shot checkout of a realm primed by `prime_page_prelude`: the
+        // expensive STATIC parse already happened (overlapping the host's
+        // fetch). Rebind it to the real page and evaluate only the small
+        // DYNAMIC tail. Each primed realm serves exactly one page.
+        if let Some(primed) = PRIMED_PAGE.with(|slot| slot.borrow_mut().take()) {
+            let PrimedPage {
+                mut context,
+                id,
+                mut state,
+                executor,
+                hooks,
+            } = primed;
+            // The primed state has exactly two Rc holders: this local and the
+            // HANDLES entry. Drop the entry so `get_mut` can rebind the page;
+            // the natives key off `id`, so re-inserting restores their lookup.
+            HANDLES.with(|h| {
+                h.borrow_mut().remove(&id);
+            });
+            Rc::get_mut(&mut state)
+                .expect("primed state has no other owners")
+                .bind_page(dom::PageState::new(dom, url));
+            HANDLES.with(|h| {
+                h.borrow_mut().insert(id, Rc::clone(&state));
+            });
+            let dynamic = prelude::build_page_dynamic();
+            context
+                .eval(Source::from_bytes(dynamic))
+                .expect("the DYNAMIC page prelude is valid JavaScript");
+            hooks.set_block_compile(true);
+            return Self {
+                registry: Rc::clone(&state.registry),
+                context,
+                id,
+                state,
+                executor,
+                hooks,
+            };
+        }
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let config = RuntimeConfig::default();
         let registry = Rc::new(RefCell::new(ApiRegistry::new()));
         let mut state_inner =
             RuntimeState::new(Rc::clone(&registry), Rc::new(SystemClock), config.clone());
-        state_inner.page = Some(dom::PageState::new(dom, url.into()));
+        state_inner.page = Some(dom::PageState::new(dom, url));
         let state = Rc::new(state_inner);
         HANDLES.with(|handles| {
             handles.borrow_mut().insert(id, Rc::clone(&state));
@@ -495,6 +691,25 @@ impl ExtScriptRuntime {
     /// Always returns an error; see the `js` feature.
     #[cfg(not(feature = "js"))]
     pub fn eval(&mut self, _code: &str) -> Result<String, String> {
+        Err("js engine disabled".to_string())
+    }
+
+    /// Evaluate a shell-emitted ESM graph through the engine's strict eval path.
+    /// The shell's scanner strips each chunk's `"use strict";` directive, so the
+    /// prefix here is what makes every emitted factory (and its body) strict.
+    /// Everything else — limits, microtask draining, return conversion — is the
+    /// same host `eval` used after page-ready.
+    ///
+    /// # Errors
+    /// Same as [`Self::eval`].
+    #[cfg(feature = "js")]
+    pub fn eval_module_graph(&mut self, code: &str) -> Result<String, String> {
+        self.eval(&format!("\"use strict\";\n{code}"))
+    }
+
+    /// Non-JS builds have no eval.
+    #[cfg(not(feature = "js"))]
+    pub fn eval_module_graph(&mut self, _code: &str) -> Result<String, String> {
         Err("js engine disabled".to_string())
     }
 
@@ -591,6 +806,48 @@ impl ExtScriptRuntime {
         });
     }
 
+    /// Drain the dynamic `import()` requests the page produced since the last
+    /// call. The shell evaluates each requested graph, then settles the promise
+    /// with [`Self::resolve_dynamic_import`] / [`Self::reject_dynamic_import`].
+    #[cfg(feature = "js")]
+    #[must_use]
+    pub fn take_dynamic_module_requests(&self) -> Vec<DynamicModuleRequest> {
+        std::mem::take(&mut *self.state.dynamic_module_requests.borrow_mut())
+    }
+
+    /// Settle a pending dynamic import successfully. `exports` is delivered as
+    /// the promise's value. Unknown/already-settled ids are a no-op in the
+    /// prelude, so a late host callback can never throw into page code.
+    #[cfg(feature = "js")]
+    pub fn resolve_dynamic_import(&mut self, promise_id: u64, exports: &Value) {
+        let value = match JsValue::from_json(exports, &mut self.context) {
+            Ok(value) => value,
+            Err(err) => {
+                self.state
+                    .log(format!("dynamic import result conversion failed: {err}"));
+                return;
+            }
+        };
+        let args = [JsValue::from(promise_id as f64), value];
+        if let Err(err) = call_global(&mut self.context, "__hodoDynResolved", &args) {
+            self.state.log(err);
+        }
+        self.tick();
+    }
+
+    /// Settle a pending dynamic import with an `Error(msg)` rejection.
+    #[cfg(feature = "js")]
+    pub fn reject_dynamic_import(&mut self, promise_id: u64, msg: &str) {
+        let args = [
+            JsValue::from(promise_id as f64),
+            JsValue::from(JsString::from(msg)),
+        ];
+        if let Err(err) = call_global(&mut self.context, "__hodoDynRejected", &args) {
+            self.state.log(err);
+        }
+        self.tick();
+    }
+
     /// Install a host callback for message replies. Keeping this generic lets
     /// the host own request/reply correlation without exposing its queue here.
     #[cfg(feature = "js")]
@@ -619,7 +876,7 @@ impl ExtScriptRuntime {
     pub fn timer_count(&self) -> usize {
         #[cfg(feature = "js")]
         {
-            self.state.timers.borrow().len()
+            self.state.live_timers.borrow().len()
         }
         #[cfg(not(feature = "js"))]
         {
@@ -739,6 +996,7 @@ impl Drop for ExtScriptRuntime {
         // All timers and queued callbacks live only in this context; clearing
         // them here prevents any late delivery after the context is gone.
         self.state.timers.borrow_mut().clear();
+        self.state.live_timers.borrow_mut().clear();
         self.state.queue.borrow_mut().clear();
         dom::drop_page(&self.state);
     }
@@ -748,34 +1006,47 @@ impl Drop for ExtScriptRuntime {
 impl ExtScriptRuntime {
     fn next_task(&self) -> Option<Task> {
         let now = self.state.clock.now_ms();
-        let mut timers = self.state.timers.borrow_mut();
-        let mut due: Vec<u64> = timers
-            .iter()
-            .filter(|timer| timer.deadline <= now)
-            .map(|timer| timer.id)
-            .collect();
-        if !due.is_empty() {
-            due.sort_unstable();
-            let id = due[0];
-            let timer = timers.iter().find(|t| t.id == id).expect("just found");
+        loop {
+            // Peek under a short borrow, then release before touching the live
+            // set — no RefCell is held across a mutation of another.
+            let due = self
+                .state
+                .timers
+                .borrow()
+                .peek()
+                .is_some_and(|timer| timer.deadline <= now);
+            if !due {
+                break;
+            }
+            let timer = self
+                .state
+                .timers
+                .borrow_mut()
+                .pop()
+                .expect("peeked a due timer");
+            if !self.state.live_timers.borrow_mut().remove(&timer.id) {
+                // Tombstone: a cancelled timer whose heap entry survived.
+                continue;
+            }
             let args = timer.args.clone();
             let next_deadline = timer
                 .interval_ms
                 .map(|interval| timer.deadline.saturating_add(interval.max(1)));
             if let Some(deadline) = next_deadline {
-                if let Some(timer) = timers.iter_mut().find(|t| t.id == id) {
-                    timer.deadline = deadline;
-                }
-            } else {
-                timers.retain(|t| t.id != id);
+                self.state.timers.borrow_mut().push(Timer {
+                    id: timer.id,
+                    deadline,
+                    interval_ms: timer.interval_ms,
+                    args: timer.args,
+                });
+                self.state.live_timers.borrow_mut().insert(timer.id);
             }
             return Some(Task::Timer {
-                id,
+                id: timer.id,
                 args,
                 repeating: next_deadline.is_some(),
             });
         }
-        drop(timers);
         self.state.queue.borrow_mut().pop_front()
     }
 
@@ -958,6 +1229,31 @@ impl ExtScriptRuntime {
                 return;
             }
         };
+        // Host events are plain JSON, so give the payload Event.prototype:
+        // listeners call `e.stopPropagation()` (and `e.preventDefault()`), and
+        // the flag it sets is what the loop below checks after each callback.
+        if let Some(object) = value.as_object() {
+            let event_proto = self
+                .context
+                .global_object()
+                .get(JsString::from("Event"), &mut self.context)
+                .ok()
+                .and_then(|ctor| ctor.as_callable())
+                .and_then(|ctor| {
+                    ctor.get(JsString::from("prototype"), &mut self.context)
+                        .ok()
+                })
+                .and_then(|proto| proto.as_object());
+            if let Some(proto) = event_proto {
+                let _ = object.set_prototype(Some(proto));
+            }
+            let _ = object.set(
+                JsString::from("type"),
+                JsString::from(kind),
+                false,
+                &mut self.context,
+            );
+        }
         for callback_id in callbacks {
             let key = PropertyKey::from(JsString::from(format!("__hodoListener_{callback_id}")));
             let callback = match self.context.global_object().get(key, &mut self.context) {
@@ -977,6 +1273,22 @@ impl ExtScriptRuntime {
                     self.state
                         .log(format!("page listener: {}", error_message(&err)));
                 }
+            }
+            // Wave 1: a host event is one flat walk over the target node's
+            // listeners — no capture/bubble two-phase. `stopPropagation` just
+            // halts this walk, keyed by the same `__hodoStopPropagation` flag
+            // `op_dom_dispatch_event` reads (now set by the real Event method).
+            let stopped = value
+                .as_object()
+                .and_then(|object| {
+                    object
+                        .get(JsString::from("__hodoStopPropagation"), &mut self.context)
+                        .ok()
+                })
+                .and_then(|flag| flag.as_boolean())
+                .unwrap_or(false);
+            if stopped {
+                break;
             }
         }
     }
@@ -1475,10 +1787,9 @@ fn op_clear_timer(id: u64) -> NativeFunction {
         let state = with_state(id, Rc::clone).map_err(js_error)?;
         let timer_id = args.get_or_undefined(0).as_number().unwrap_or(-1.0) as i64;
         if timer_id >= 0 {
-            state
-                .timers
-                .borrow_mut()
-                .retain(|timer| timer.id != timer_id as u64);
+            // Lazy deletion: drop the live id now, leave the heap entry to be
+            // popped-and-skipped when it comes due (see `next_task`).
+            state.live_timers.borrow_mut().remove(&(timer_id as u64));
         }
         Ok(JsValue::undefined())
     })
@@ -1515,6 +1826,51 @@ fn op_message_reply(id: u64) -> NativeFunction {
     })
 }
 
+/// Called by the prelude's `__hodoDynImport`. Records the request for the
+/// shell; the pending JS promise is settled later through `__hodoDynResolved`
+/// / `__hodoDynRejected`. A throwing native here would reject the promise
+/// through the prelude's own try/catch.
+#[cfg(feature = "js")]
+fn op_load_dynamic_module(id: u64) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |_this, args, ctx| {
+        let state = with_state(id, Rc::clone).map_err(js_error)?;
+        let spec = string_arg(args, 0, ctx).map_err(js_error)?;
+        let base_url = string_arg(args, 1, ctx).map_err(js_error)?;
+        let promise_id = args
+            .get_or_undefined(2)
+            .as_number()
+            .ok_or_else(|| js_error("dynamic import: missing promise id".to_string()))?
+            as u64;
+        // The shell drains the reply hook, not our queue (it owns the graph
+        // fetcher). Queue locally only when no hook is installed — otherwise
+        // this Vec grows by one entry for every import for the page's lifetime.
+        if state.reply_hook.borrow().is_none() {
+            state
+                .dynamic_module_requests
+                .borrow_mut()
+                .push(DynamicModuleRequest {
+                    spec: spec.clone(),
+                    base_url: base_url.clone(),
+                    promise_id,
+                });
+        }
+        // The shell listens on the landed `__hodo_message_reply` channel for
+        // `{__hodoDynImport:1, spec, base, id}`. Posting here makes this native
+        // the single request seam whether the host drains our queue or its own
+        // reply hook (it does the latter today).
+        let message = json!({
+            "__hodoDynImport": 1,
+            "spec": spec,
+            "base": base_url,
+            "id": promise_id,
+        });
+        if let Some(hook) = state.reply_hook.borrow().as_ref() {
+            hook(&message, &Value::Null);
+        }
+        Ok(JsValue::undefined())
+    })
+}
+
 #[cfg(feature = "js")]
 fn register(context: &mut Context, name: &str, length: usize, function: NativeFunction) {
     context
@@ -1531,6 +1887,12 @@ fn register_natives(context: &mut Context, id: u64) {
     register(context, "__hodo_clear_timer", 1, op_clear_timer(id));
     register(context, "__hodo_log", 1, op_log(id));
     register(context, "__hodo_message_reply", 2, op_message_reply(id));
+    register(
+        context,
+        "__hodo_load_dynamic_module",
+        3,
+        op_load_dynamic_module(id),
+    );
 }
 
 #[cfg(test)]
@@ -1540,6 +1902,264 @@ mod tests {
     use hodo_ext_api::{ApiDialect, FakeClock};
     use serde_json::json;
     use std::time::Instant;
+
+    #[test]
+    #[ignore = "bench"]
+    fn bench_prelude_breakdown() {
+        use boa_engine::{Context, Script, Source};
+
+        let src = prelude::build_page_prelude();
+        let n = 20u32;
+
+        fn fresh_context(id: u64) -> Context {
+            let config = RuntimeConfig::default();
+            let registry = Rc::new(RefCell::new(ApiRegistry::new()));
+            let mut state_inner = RuntimeState::new(registry, Rc::new(SystemClock), config.clone());
+            let dom = Rc::new(RefCell::new(hodo_dom::Dom::new()));
+            state_inner.page = Some(dom::PageState::new(dom, "http://example.com/".into()));
+            let state = Rc::new(state_inner);
+            HANDLES.with(|h| h.borrow_mut().insert(id, state));
+            let executor = Rc::new(HodoJobExecutor::default());
+            let hooks = Rc::new(ExtensionHooks::new(String::new()));
+            let mut ctx = Context::builder()
+                .job_executor(executor)
+                .host_hooks(hooks)
+                .build()
+                .unwrap();
+            let mut limits = ctx.runtime_limits();
+            limits.set_loop_iteration_limit(LOOP_ITERATION_LIMIT);
+            limits.set_recursion_limit(RECURSION_LIMIT);
+            ctx.set_runtime_limits(limits);
+            register_natives(&mut ctx, id);
+            dom::register_natives(&mut ctx, id);
+            ctx
+        }
+
+        let t = Instant::now();
+        for i in 0..n {
+            let dom = Rc::new(RefCell::new(hodo_dom::Dom::new()));
+            let rt = ExtScriptRuntime::new_page_with_url(dom, "http://example.com/");
+            std::hint::black_box(rt);
+            let _ = i;
+        }
+        println!(
+            "FULL new_page_with_url:        {:?} / load",
+            t.elapsed() / n
+        );
+
+        let t = Instant::now();
+        for i in 0..n {
+            let ctx = fresh_context(9000 + u64::from(i));
+            std::hint::black_box(ctx);
+        }
+        println!(
+            "CTX + natives only (no prelude): {:?} / load",
+            t.elapsed() / n
+        );
+
+        let t = Instant::now();
+        for i in 0..n {
+            let mut ctx = fresh_context(9100 + u64::from(i));
+            let script = Script::parse(Source::from_bytes(src.as_str()), None, &mut ctx).unwrap();
+            std::hint::black_box(script);
+        }
+        println!(
+            "PARSE only:                    {:?} / load",
+            t.elapsed() / n
+        );
+
+        let t = Instant::now();
+        for i in 0..n {
+            let mut ctx = fresh_context(9200 + u64::from(i));
+            let script = Script::parse(Source::from_bytes(src.as_str()), None, &mut ctx).unwrap();
+            let cb = script.codeblock(&mut ctx).unwrap();
+            std::hint::black_box(cb);
+        }
+        println!(
+            "PARSE + COMPILE:               {:?} / load",
+            t.elapsed() / n
+        );
+
+        let t = Instant::now();
+        for i in 0..n {
+            let mut ctx = fresh_context(9300 + u64::from(i));
+            let v = ctx.eval(Source::from_bytes(src.as_str())).unwrap();
+            std::hint::black_box(v);
+        }
+        println!(
+            "PARSE + COMPILE + EVAL:        {:?} / load",
+            t.elapsed() / n
+        );
+    }
+
+    #[test]
+    #[ignore = "bench"]
+    fn bench_timer_wheel_1000() {
+        const N: u64 = 1000;
+        let timers: Vec<Timer> = (0..N)
+            .map(|i| Timer {
+                id: i + 1,
+                deadline: 1_000_000 + i,
+                interval_ms: None,
+                args: Value::Null,
+            })
+            .collect();
+        let now = 2_000_000; // every timer is due
+
+        // BEFORE: the old linear next_task — scan all, sort due ids, drop first.
+        let t = Instant::now();
+        {
+            let mut work = timers.clone();
+            let mut n = 0;
+            loop {
+                let mut due: Vec<u64> = work
+                    .iter()
+                    .filter(|timer| timer.deadline <= now)
+                    .map(|timer| timer.id)
+                    .collect();
+                if due.is_empty() {
+                    break;
+                }
+                due.sort_unstable();
+                work.retain(|timer| timer.id != due[0]);
+                n += 1;
+            }
+            assert_eq!(n, N as usize);
+            std::hint::black_box(work);
+        }
+        let before = t.elapsed();
+
+        // AFTER: BinaryHeap + live-id set with lazy tombstone deletion.
+        let t = Instant::now();
+        {
+            let mut heap: BinaryHeap<Timer> = timers.into_iter().collect();
+            let mut live: HashSet<u64> = (1..=N).collect();
+            let mut n = 0;
+            loop {
+                if !heap.peek().is_some_and(|timer| timer.deadline <= now) {
+                    break;
+                }
+                let timer = heap.pop().expect("peeked");
+                if !live.remove(&timer.id) {
+                    continue;
+                }
+                n += 1;
+            }
+            assert_eq!(n, N as usize);
+            std::hint::black_box(heap);
+            std::hint::black_box(live);
+        }
+        let after = t.elapsed();
+        println!("1000-timer drain  linear(before): {before:?}   heap(after): {after:?}");
+    }
+
+    #[test]
+    fn primed_page_prelude_matches_fresh_runtime() {
+        // The two halves must rebuild the exact original prelude bytes.
+        let full = prelude::build_page_prelude();
+        let mut joined = prelude::build_page_static();
+        joined.push_str(prelude::build_page_dynamic());
+        assert_eq!(full, joined);
+        assert!(full.contains("}\n\nvar __hodoRoot = __hodo_dom_root();"));
+
+        prime_page_prelude();
+        let mut primed = ExtScriptRuntime::new_page_with_url(
+            Rc::new(RefCell::new(hodo_dom::Dom::new())),
+            "http://a.example/",
+        );
+        let mut fresh = ExtScriptRuntime::new_page_with_url(
+            Rc::new(RefCell::new(hodo_dom::Dom::new())),
+            "http://a.example/",
+        );
+        for expr in [
+            "window.location.href",
+            "typeof document",
+            "typeof window.customElements",
+            "1 + 1",
+        ] {
+            assert_eq!(
+                primed.eval(expr).unwrap(),
+                fresh.eval(expr).unwrap(),
+                "{expr}"
+            );
+        }
+    }
+
+    #[test]
+    fn primed_page_state_does_not_bleed_between_loads() {
+        prime_page_prelude();
+        let mut a = ExtScriptRuntime::new_page_with_url(
+            Rc::new(RefCell::new(hodo_dom::Dom::new())),
+            "http://first.example/",
+        );
+        // Seed six independent pieces of per-page state in realm A.
+        a.eval(
+            "customElements.define('x-first', function () {}); \
+             window.__mark = 'from-a'; \
+             document.title = 'title-a'; \
+             setTimeout(function () {}, 60000);",
+        )
+        .unwrap();
+        assert_eq!(
+            a.eval("window.location.href").unwrap(),
+            "http://first.example/"
+        );
+        assert_eq!(
+            a.eval("customElements.get('x-first') !== null").unwrap(),
+            "true"
+        );
+        assert_eq!(a.document_title(), "title-a");
+        assert_eq!(a.timer_count(), 1);
+
+        // A second navigation primes again (the shell would do this before its fetch).
+        prime_page_prelude();
+        let mut b = ExtScriptRuntime::new_page_with_url(
+            Rc::new(RefCell::new(hodo_dom::Dom::new())),
+            "http://second.example/",
+        );
+        // 1/6 location, 2/6 custom elements, 3/6 window globals, 4/6 title,
+        // 5/6 timers, 6/6 a fresh registry still accepts new definitions.
+        assert_eq!(
+            b.eval("window.location.href").unwrap(),
+            "http://second.example/"
+        );
+        assert_eq!(b.eval("customElements.get('x-first')").unwrap(), "null");
+        assert_eq!(b.eval("typeof window.__mark").unwrap(), "undefined");
+        assert_eq!(b.document_title(), "");
+        assert_eq!(b.timer_count(), 0);
+        b.eval("customElements.define('x-second', function () {});")
+            .unwrap();
+        assert_eq!(
+            b.eval("customElements.get('x-second') !== null").unwrap(),
+            "true"
+        );
+    }
+
+    #[test]
+    #[ignore = "bench"]
+    fn bench_page_prelude_prime() {
+        let n = 12u32;
+        let t = Instant::now();
+        for _ in 0..n {
+            let dom = Rc::new(RefCell::new(hodo_dom::Dom::new()));
+            let rt = ExtScriptRuntime::new_page_with_url(dom, "http://example.com/");
+            std::hint::black_box(rt);
+        }
+        println!(
+            "BASELINE full load (no prime):   {:?} / load",
+            t.elapsed() / n
+        );
+
+        let t = Instant::now();
+        prime_page_prelude();
+        println!("PRIME cost (one-time, off path): {:?}", t.elapsed());
+
+        let t = Instant::now();
+        let dom = Rc::new(RefCell::new(hodo_dom::Dom::new()));
+        let rt = ExtScriptRuntime::new_page_with_url(dom, "http://example.com/");
+        std::hint::black_box(rt);
+        println!("CHECKOUT (on critical path):     {:?} / load", t.elapsed());
+    }
 
     fn get(registry: &Rc<RefCell<ApiRegistry>>, key: &str) -> Value {
         match registry
@@ -1772,6 +2392,58 @@ mod tests {
                 "timer2".to_string()
             ]
         );
+        assert_eq!(runtime.timer_count(), 0);
+    }
+
+    #[test]
+    fn equal_deadline_timers_fire_fifo_by_id() {
+        let clock = Rc::new(FakeClock::new(0));
+        let mut runtime = ExtScriptRuntime::with_config_and_registry(
+            RuntimeConfig::default(),
+            Rc::new(RefCell::new(ApiRegistry::new())),
+            clock.clone(),
+        );
+        runtime
+            .eval(
+                "setTimeout(function () { __hodo_log('a'); }, 5); \
+                 setTimeout(function () { __hodo_log('b'); }, 5); \
+                 setTimeout(function () { __hodo_log('c'); }, 5);",
+            )
+            .unwrap();
+        clock.set_ms(5);
+        runtime.tick();
+        // Same-deadline timers dispatch in id (insertion) order — the heap's
+        // tie-break preserves the old `sort_unstable` + take-smallest rule.
+        assert_eq!(
+            trace(&mut runtime),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert_eq!(runtime.timer_count(), 0);
+    }
+
+    #[test]
+    fn cancelled_timer_leaves_no_tombstone_delivery() {
+        let clock = Rc::new(FakeClock::new(0));
+        let mut runtime = ExtScriptRuntime::with_config_and_registry(
+            RuntimeConfig::default(),
+            Rc::new(RefCell::new(ApiRegistry::new())),
+            clock.clone(),
+        );
+        runtime
+            .eval(
+                // The canceler is scheduled first (smaller id) so it fires
+                // first and cancels `a` while `a`'s heap entry is still pending.
+                // `var a` is hoisted, so the callback sees it by the time it runs.
+                "setTimeout(function () { clearTimeout(a); __hodo_log('b'); }, 5); \
+                 var a = setTimeout(function () { __hodo_log('a'); }, 5);",
+            )
+            .unwrap();
+        assert_eq!(runtime.timer_count(), 2);
+        clock.set_ms(5);
+        runtime.tick();
+        // `a` is cancelled from inside `b`'s callback; its heap entry is a
+        // tombstone and must never fire. Live count excludes it throughout.
+        assert_eq!(trace(&mut runtime), vec!["b".to_string()]);
         assert_eq!(runtime.timer_count(), 0);
     }
 

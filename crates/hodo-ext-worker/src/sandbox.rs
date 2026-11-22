@@ -34,15 +34,31 @@ const ENOSYS: i32 = 38;
 #[cfg(any(target_os = "linux", test))]
 const EOPNOTSUPP: i32 = 95;
 
-/// Only these two errnos mean "this kernel has no Landlock". Anything else
-/// (EACCES, EINVAL, EPERM, ...) is a real failure and must stay fatal:
-/// classifying it as "unsupported" would boot an unrestricted worker.
+/// Which Landlock operation failed. Only the two kernel-entry syscalls can
+/// prove the kernel lacks Landlock; a failure anywhere else is real.
 #[cfg(any(target_os = "linux", test))]
-fn errno_means_no_landlock(errnos: impl IntoIterator<Item = Option<i32>>) -> Option<i32> {
-    errnos
-        .into_iter()
-        .flatten()
-        .find(|&errno| errno == ENOSYS || errno == EOPNOTSUPP)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LandlockCall {
+    /// `landlock_create_ruleset(2)` — the kernel-entry probe.
+    CreateRuleset,
+    /// `landlock_restrict_self(2)` — enforcement of the prepared ruleset.
+    RestrictSelf,
+    /// `handle_access`, `add_rule`, `prctl(PR_SET_NO_NEW_PRIVS)`, flag setup...
+    Other,
+}
+
+/// Only ENOSYS/EOPNOTSUPP from the `create`/`restrict_self` syscalls mean "this
+/// kernel has no Landlock". An errno from any other call — or EACCES/EINVAL/
+/// EPERM from those calls — is a real failure and must stay fatal: classifying
+/// it as "unsupported" would boot an unrestricted worker.
+#[cfg(any(target_os = "linux", test))]
+fn errno_means_no_landlock(call: LandlockCall, errno: Option<i32>) -> Option<i32> {
+    match call {
+        LandlockCall::CreateRuleset | LandlockCall::RestrictSelf => {
+            errno.filter(|&errno| errno == ENOSYS || errno == EOPNOTSUPP)
+        }
+        LandlockCall::Other => None,
+    }
 }
 
 /// Landlock with `HardRequirement` (BestEffort is forbidden here): a kernel
@@ -86,23 +102,26 @@ fn landlock_fs(log: &impl Fn(String)) -> Result<(), String> {
     }
 }
 
-/// Walk the error chain for *raw* OS errnos only. Error text is deliberately
-/// ignored: a message containing "Unsupported" from an unrelated failure is
-/// not evidence that the kernel lacks Landlock.
+/// Classify a Landlock failure by the syscall that produced it. Only the raw
+/// errno of `create`/`restrict_self` can mean "kernel has no Landlock"; an
+/// ENOSYS buried anywhere else in the chain (error text included) is a real
+/// failure and stays fatal.
 #[cfg(target_os = "linux")]
 fn kernel_lacks_landlock(err: &landlock::RulesetError) -> Option<i32> {
-    use std::error::Error;
-    use std::io;
+    use landlock::{CreateRulesetError, RestrictSelfError, RulesetError};
 
-    let mut errnos = Vec::new();
-    let mut current: Option<&(dyn Error + 'static)> = Some(err);
-    while let Some(cause) = current {
-        if let Some(io) = cause.downcast_ref::<io::Error>() {
-            errnos.push(io.raw_os_error());
+    let (call, errno) = match err {
+        RulesetError::CreateRuleset(CreateRulesetError::CreateRulesetCall { source, .. }) => {
+            (LandlockCall::CreateRuleset, source.raw_os_error())
         }
-        current = cause.source();
-    }
-    errno_means_no_landlock(errnos)
+        RulesetError::RestrictSelf(RestrictSelfError::RestrictSelfCall { source, .. }) => {
+            (LandlockCall::RestrictSelf, source.raw_os_error())
+        }
+        // `SetNoNewPrivsCall`, `HandleAccesses`, `AddRules`, `RestrictSelfFlags`
+        // and `Scope` are setup/configuration failures, not a missing kernel.
+        _ => (LandlockCall::Other, None),
+    };
+    errno_means_no_landlock(call, errno)
 }
 
 /// Syscalls permitted after the filter is installed. Numbers are from the
@@ -127,6 +146,7 @@ const X86_64_ALLOWED: &[i64] = &[
     28,  // madvise: allocator page hints
     39,  // getpid: std process/thread ids
     60,  // exit: worker's fatal exits
+    72,  // fcntl: std fd flags on the inherited IPC pipes
     157, // prctl: seccompiler setup / no_new_privs
     158, // arch_prctl: x86_64 TLS (FS base) during startup
     160, // setrlimit: rustix fallback on older kernels
@@ -235,23 +255,37 @@ mod tests {
 
     #[test]
     fn errno_classification_is_exact_and_fail_closed() {
-        assert_eq!(errno_means_no_landlock([Some(ENOSYS)]), Some(38));
-        assert_eq!(errno_means_no_landlock([Some(EOPNOTSUPP)]), Some(95));
-        assert_eq!(errno_means_no_landlock([None, Some(95)]), Some(95));
-        assert_eq!(errno_means_no_landlock([None]), None);
-        assert_eq!(
-            errno_means_no_landlock(std::iter::empty::<Option<i32>>()),
-            None
-        );
+        // Only the two kernel-entry syscalls with the two "not implemented"
+        // errnos classify as a kernel without Landlock.
+        for call in [LandlockCall::CreateRuleset, LandlockCall::RestrictSelf] {
+            assert_eq!(errno_means_no_landlock(call, Some(ENOSYS)), Some(38));
+            assert_eq!(errno_means_no_landlock(call, Some(EOPNOTSUPP)), Some(95));
+            assert_eq!(errno_means_no_landlock(call, None), None);
+        }
         // EACCES/EINVAL/EPERM and friends are real failures, even if their
         // Debug text happens to say "Unsupported". They must stay fatal.
-        assert_eq!(errno_means_no_landlock([Some(13), Some(22), Some(1)]), None);
+        for errno in [Some(13), Some(22), Some(1), None] {
+            for call in [LandlockCall::CreateRuleset, LandlockCall::RestrictSelf] {
+                assert_eq!(errno_means_no_landlock(call, errno), None);
+            }
+            // An ENOSYS/EOPNOTSUPP from anywhere else in the error chain is
+            // not evidence the kernel lacks Landlock.
+            assert_eq!(errno_means_no_landlock(LandlockCall::Other, errno), None);
+        }
+        assert_eq!(
+            errno_means_no_landlock(LandlockCall::Other, Some(ENOSYS)),
+            None
+        );
+        assert_eq!(
+            errno_means_no_landlock(LandlockCall::Other, Some(EOPNOTSUPP)),
+            None
+        );
     }
 
     #[test]
     fn seccomp_tables_cover_rust_startup_without_duplicates() {
         let required_x86_64 = [
-            0, 1, 3, 9, 10, 11, 12, 13, 14, 15, 39, 60, 157, 158, 160, 186, 202, 204, 218, 228,
+            0, 1, 3, 9, 10, 11, 12, 13, 14, 15, 39, 60, 72, 157, 158, 160, 186, 202, 204, 218, 228,
             231, 257, 262, 273, 302, 317, 318,
         ];
         for number in required_x86_64 {

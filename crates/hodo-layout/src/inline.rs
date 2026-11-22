@@ -625,9 +625,131 @@ fn hard_break(flow: &mut Flow, list: &mut DisplayList) {
     flow.pending_space = None;
 }
 
+fn white_space_code(ws: WhiteSpace) -> u8 {
+    match ws {
+        WhiteSpace::Normal => 0,
+        WhiteSpace::Pre => 1,
+        WhiteSpace::NoWrap => 2,
+        WhiteSpace::PreWrap => 3,
+        WhiteSpace::PreLine => 4,
+    }
+}
+
+fn text_align_code(align: TextAlign) -> u8 {
+    match align {
+        TextAlign::Left => 0,
+        TextAlign::Center => 1,
+        TextAlign::Right => 2,
+    }
+}
+
+/// Replay a shaped run: push the finished lines straight into the display list
+/// and keep the still-open line as atoms so a later inline sibling can join it.
+/// No word scan, no width arithmetic, no line-breaking decisions.
+fn replay_cached_run(
+    flow: &mut Flow,
+    list: &mut DisplayList,
+    plan: &crate::cache::TextRunPlan,
+    template: &Atom,
+    meta: AtomMeta,
+) {
+    // The cached metrics are the reason the run was memoised; assert they stay
+    // consistent with the replayed geometry in debug builds.
+    debug_assert_eq!(
+        plan.line_count,
+        plan.lines.len() + usize::from(!plan.pending.is_empty())
+    );
+    debug_assert!(plan.height >= 0.0 && plan.width >= 0.0);
+
+    // No floats/indent on the cached path, so the content edge is `flow.left`
+    // at both shape time and replay time.
+    let content_left = flow.left;
+    let mut y = flow.y;
+    for line in &plan.lines {
+        list.push(
+            template.owner,
+            DisplayItem::Text {
+                rect: Rect {
+                    x: content_left + line.shift,
+                    y,
+                    w: line.w,
+                    h: line.h,
+                },
+                text: line.text.clone(),
+                color: template.color,
+                font_size: template.font_size,
+                weight: template.weight,
+                href: template.href.clone(),
+                underline: template.underline,
+                line_through: template.line_through,
+            },
+        );
+        y += line.h;
+    }
+    flow.y = y;
+    if let Some(last) = plan.lines.last() {
+        flow.last_line_h = last.h;
+    }
+
+    let mut x = content_left + flow.line_w;
+    for atom in &plan.pending {
+        push_atom_meta(
+            flow,
+            Atom {
+                text: atom.text.clone(),
+                font_size: template.font_size,
+                color: template.color,
+                weight: template.weight,
+                href: template.href.clone(),
+                underline: template.underline,
+                line_through: template.line_through,
+                x,
+                w: atom.w,
+                boxes: template.boxes.clone(),
+                spacer: atom.spacer,
+                owner: template.owner,
+            },
+            meta,
+        );
+        x += atom.w;
+    }
+    flow.line_w = plan.pending_line_w;
+    flow.pending_space = plan.pending_space;
+}
+
+/// Capture the just-emitted run as a reusable plan. Only the flushed Text
+/// items and the atoms still on the open line are needed; every paint field
+/// is re-applied from the caller's template on replay.
+fn record_text_run(items: &[DisplayItem], flow: &Flow) -> crate::cache::TextRunPlan {
+    let lines = items
+        .iter()
+        .filter_map(|item| match item {
+            DisplayItem::Text { rect, text, .. } => Some(crate::cache::CachedLine {
+                text: text.clone(),
+                w: rect.w,
+                h: rect.h,
+                shift: rect.x - flow.left,
+            }),
+            _ => None,
+        })
+        .collect();
+    let pending = flow
+        .line
+        .iter()
+        .map(|atom| crate::cache::PendingAtom {
+            text: atom.text.clone(),
+            w: atom.w,
+            spacer: atom.spacer,
+        })
+        .collect();
+    crate::cache::TextRunPlan::new(lines, pending, flow.line_w, flow.pending_space)
+}
+
 /// Feed a text node into the inline flow. Collapsing modes fold whitespace
 /// runs; preserving modes keep them; all modes honour hard `\n` breaks when
-/// `white-space` requests them.
+/// `white-space` requests them. Identical self-contained runs hit the shared
+/// [`MeasureCache`](crate::MeasureCache) and replay their line boxes.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn feed_text(
     flow: &mut Flow,
     list: &mut DisplayList,
@@ -636,6 +758,7 @@ pub(crate) fn feed_text(
     href: Option<String>,
     boxes: &[usize],
     owner: NodeId,
+    cache: &mut crate::MeasureCache,
 ) {
     if text.is_empty() {
         return;
@@ -689,6 +812,80 @@ pub(crate) fn feed_text(
         owner,
     };
 
+    // Cache only a self-contained run on a fresh, box-free, float-free line.
+    // Inset fragments, bullets, first-line indent and float wrapping all make
+    // the emitted geometry depend on state outside the shaping key; those
+    // runs keep the original path and the frozen goldens.
+    let cacheable = flow.line.is_empty()
+        && flow.content == 0
+        && flow.line_w == 0.0
+        && flow.pending_space.is_none()
+        && flow.boxes.is_empty()
+        && !flow.bullet
+        && flow.float_l.is_none()
+        && flow.float_r.is_none()
+        && style.text_indent == 0.0
+        && matches!(style.vertical_align, VerticalAlign::Baseline)
+        && fs.is_finite()
+        && space_w.is_finite()
+        && meta.char_w.is_finite();
+    let key = if cacheable {
+        let avail_w = if flow.wrap {
+            (flow.right - flow.left).max(0.0)
+        } else {
+            f32::INFINITY
+        };
+        Some(crate::cache::MeasureKey::new(
+            text,
+            fs,
+            meta.char_w,
+            space_w,
+            line_h,
+            avail_w,
+            white_space_code(ws),
+            text_align_code(style.text_align),
+            crate::MeasureCache::style_bits(
+                style.color,
+                style.font_weight,
+                template.href.as_deref(),
+                style.underline,
+                style.line_through,
+            ),
+            cache.generation(),
+        ))
+    } else {
+        None
+    };
+
+    if let Some(ref key) = key {
+        if let Some(plan) = cache.get(key) {
+            replay_cached_run(flow, list, plan, &template, meta);
+            return;
+        }
+    }
+
+    let start = list.items.len();
+    feed_text_uncached(
+        flow, list, text, &template, meta, space_w, preserve, hard_nl,
+    );
+
+    if let Some(key) = key {
+        cache.insert(key, record_text_run(&list.items[start..], flow));
+    }
+}
+
+/// The original word-scanner, unchanged apart from taking precomputed values.
+#[allow(clippy::too_many_arguments)]
+fn feed_text_uncached(
+    flow: &mut Flow,
+    list: &mut DisplayList,
+    text: &str,
+    template: &Atom,
+    meta: AtomMeta,
+    space_w: f32,
+    preserve: bool,
+    hard_nl: bool,
+) {
     let mut rest = text;
     loop {
         let seg = match rest.find('\n') {
@@ -696,9 +893,9 @@ pub(crate) fn feed_text(
             None => rest,
         };
         if preserve {
-            emit_preserved(flow, list, seg, &template, meta);
+            emit_preserved(flow, list, seg, template, meta);
         } else {
-            emit_collapsed(flow, list, seg, &template, meta, space_w);
+            emit_collapsed(flow, list, seg, template, meta, space_w);
         }
         if seg.len() == rest.len() {
             break;
@@ -1336,7 +1533,16 @@ mod tests {
         let mut direct = crate::DisplayList::default();
         let mut st = crate::fallback_style();
         st.font_size = f32::INFINITY;
-        feed_text(&mut flow, &mut direct, "x", &st, None, &[], d);
+        feed_text(
+            &mut flow,
+            &mut direct,
+            "x",
+            &st,
+            None,
+            &[],
+            d,
+            &mut crate::MeasureCache::new(),
+        );
         flush_line(&mut flow, &mut direct);
         let dr = direct.items.iter().find_map(|it| match it {
             crate::DisplayItem::Text { rect, .. } => Some(*rect),

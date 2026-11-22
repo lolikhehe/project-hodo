@@ -32,6 +32,11 @@ struct Sink {
     templates: RefCell<HashMap<NodeId, NodeId>>,
     /// Detached node used to take children out of their parent (Dom has no detach API).
     trash: NodeId,
+    /// True when the arena was already at `MAX_DOM_NODES` when this sink was
+    /// built, so `create()` handed back the document root instead of a trash
+    /// node. Attaching anything to that "trash" would leak overflow content
+    /// under the visible root; overflow is dropped instead.
+    drop_overflow: bool,
     /// Mirrors html5ever's TreeBuilderOpts::scripting_enabled: gates the
     /// <noscript> display:none injection so scripting-off semantics render.
     scripting_enabled: bool,
@@ -47,22 +52,39 @@ impl Sink {
     fn new(scripting_enabled: bool) -> Self {
         // Shell page parsing owns the hot DOM path; intern tag/attr strings so
         // repetitive documents pay per distinct string, not per element.
-        let mut dom = Dom::with_interning();
+        Self::with_dom(Dom::with_interning(), scripting_enabled)
+    }
+
+    /// Build a sink around an existing arena so `parse_fragment` can parse into
+    /// the caller's `Dom`. The tree-construction core (the `TreeSink` impl) is
+    /// shared with document parsing unchanged.
+    fn with_dom(mut dom: Dom, scripting_enabled: bool) -> Self {
         let trash = dom.create(NodeKind::Element {
             tag: "#detached".to_string(),
             attrs: Vec::new(),
         });
+        // `create` returns `root_id` when the cap is exhausted; that is not a
+        // trash node, and appending to it would make degraded content visible.
+        let drop_overflow = trash == dom.root();
         Self {
             dom: RefCell::new(dom),
             names: RefCell::new(HashMap::new()),
             templates: RefCell::new(HashMap::new()),
             trash,
+            drop_overflow,
             scripting_enabled,
         }
     }
 
     fn detach(&self, id: NodeId) {
-        self.dom.borrow_mut().append(self.trash, id);
+        let mut dom = self.dom.borrow_mut();
+        if self.drop_overflow {
+            // Detach without re-attach: the node is unreachable, never parented
+            // under the root, and its slot is not recycled into the live tree.
+            dom.detach_orphan(id);
+        } else {
+            dom.append(self.trash, id);
+        }
     }
 
     /// Re-append the given children in order, which reorders a parent's child list.
@@ -196,7 +218,9 @@ impl TreeSink for Sink {
     fn create_comment(&self, text: Tendril<UTF8>) -> Self::Handle {
         self.dom.borrow_mut().create(NodeKind::Element {
             tag: "#comment".to_string(),
-            attrs: vec![("text".to_string(), text.to_string())],
+            // `data` is the key the JS CharacterData accessors and serializer
+            // read; storing under `text` made parse-created comments read empty.
+            attrs: vec![("data".to_string(), text.to_string())],
         })
     }
 
@@ -211,6 +235,9 @@ impl TreeSink for Sink {
     }
 
     fn append(&self, parent: &Self::Handle, child: NodeOrText<Self::Handle>) {
+        if self.drop_overflow {
+            return; // cap exhausted at construction: drop all further content
+        }
         let parent = self
             .templates
             .borrow()
@@ -260,6 +287,9 @@ impl TreeSink for Sink {
     fn set_quirks_mode(&self, _mode: html5ever::tree_builder::QuirksMode) {}
 
     fn append_before_sibling(&self, sibling: &Self::Handle, new_node: NodeOrText<Self::Handle>) {
+        if self.drop_overflow {
+            return;
+        }
         let Some(parent) = self.dom.borrow().parent(*sibling) else {
             return;
         };
@@ -339,9 +369,73 @@ pub fn parse_document_with(scripting_enabled: bool, html: &str) -> Dom {
         .one(html.as_bytes())
 }
 
+/// Error returned by [`parse_fragment`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseError {
+    /// The supplied `parent` is not a live node of the target arena.
+    InvalidParent,
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidParent => f.write_str("fragment parent is not a live node in this arena"),
+        }
+    }
+}
+impl std::error::Error for ParseError {}
+
+/// Parse an HTML fragment into an existing arena, appending its content under
+/// `parent`.
+///
+/// Fragment semantics: no `<html>`/`<body>` injection. html5ever still builds a
+/// synthetic `<html>` root to hold parsed nodes; this lifts its children to
+/// `parent` and detaches the synthetic node, so only the real fragment content
+/// lands in the caller's arena. Depth capping, adjacent-text merging and the
+/// template side-map are the same as document parsing.
+///
+/// The parse context is `parent` itself. The sink's name table does not know
+/// pre-existing nodes, so namespace/insertion mode fall back to `<div>` in the
+/// HTML namespace ("in body") — the documented default. Scripting is enabled,
+/// matching [`parse_document`].
+pub fn parse_fragment(dom: &mut Dom, parent: NodeId, html: &str) -> Result<(), ParseError> {
+    if !dom.validate(parent) {
+        return Err(ParseError::InvalidParent);
+    }
+    let root = dom.root();
+    let new_child_at = dom.children(root).len();
+
+    // Own the arena for the parse, then hand it back. `parent` stays valid:
+    // the slots and generations are unchanged by the move.
+    let sink = Sink::with_dom(std::mem::take(dom), true);
+    let mut opts = html5ever::ParseOpts::default();
+    opts.tree_builder.scripting_enabled = true;
+    let mut parsed = html5ever::driver::parse_fragment_for_element(sink, opts, parent, true, None)
+        .from_utf8()
+        .one(html.as_bytes());
+
+    // html5ever appended the synthetic <html> root to the document root.
+    if let Some(synthetic) = parsed.children(root).get(new_child_at).copied() {
+        debug_assert_eq!(parsed.tag(synthetic), Some("html"));
+        for child in parsed.children(synthetic).to_vec() {
+            parsed.append(parent, child);
+        }
+        parsed.detach_subtree(synthetic);
+    }
+    *dom = parsed;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn elem(dom: &mut Dom, tag: &str) -> NodeId {
+        dom.create(NodeKind::Element {
+            tag: tag.into(),
+            attrs: Vec::new(),
+        })
+    }
 
     fn find_tag(dom: &Dom, tag: &str) -> NodeId {
         let mut found = None;
@@ -666,6 +760,232 @@ mod tests {
         assert!(
             max_depth >= MAX_NESTING_DEPTH - 4,
             "the capped prefix must survive, got depth {max_depth}"
+        );
+        assert_sane(&dom);
+    }
+
+    // ---- Fragment parsing --------------------------------------------------
+
+    #[test]
+    fn parse_fragment_appends_under_parent_without_html_body_wrapping() {
+        let mut dom = Dom::new();
+        let parent = elem(&mut dom, "div");
+        dom.append(dom.root(), parent);
+
+        parse_fragment(&mut dom, parent, "<p>hi</p><span>there</span>").unwrap();
+
+        let tags: Vec<&str> = dom
+            .children(parent)
+            .iter()
+            .filter_map(|&id| dom.tag(id))
+            .collect();
+        assert_eq!(tags, vec!["p", "span"]);
+        // No synthetic <html>/<body> wrapper leaked into the caller's tree.
+        let root_tags: Vec<&str> = dom
+            .children(dom.root())
+            .iter()
+            .filter_map(|&id| dom.tag(id))
+            .collect();
+        assert_eq!(root_tags, vec!["div"]);
+        assert_sane(&dom);
+    }
+
+    #[test]
+    fn parse_fragment_merges_adjacent_text_and_handles_entities() {
+        let mut dom = Dom::new();
+        let parent = elem(&mut dom, "div");
+        dom.append(dom.root(), parent);
+
+        parse_fragment(&mut dom, parent, "Hello &amp; goodbye").unwrap();
+        let children = dom.children(parent);
+        assert_eq!(children.len(), 1, "adjacent text must share one node");
+        assert_eq!(dom.text(children[0]), Some("Hello & goodbye"));
+
+        parse_fragment(&mut dom, parent, "<b>bold</b> tail").unwrap();
+        let tail = dom.children(parent).last().copied().unwrap();
+        assert_eq!(dom.text(tail), Some(" tail"));
+        assert_sane(&dom);
+    }
+
+    #[test]
+    fn parse_fragment_rejects_invalid_parent() {
+        let mut dom = Dom::new();
+        let parent = elem(&mut dom, "div");
+        dom.append(dom.root(), parent);
+        dom.detach_subtree(parent);
+        assert_eq!(
+            parse_fragment(&mut dom, parent, "<p>x</p>"),
+            Err(ParseError::InvalidParent)
+        );
+    }
+
+    #[test]
+    fn parse_fragment_caps_reachable_nesting_at_central_limit() {
+        let mut dom = Dom::new();
+        let parent = elem(&mut dom, "div");
+        dom.append(dom.root(), parent);
+        let html = format!(
+            "{}x{}",
+            "<div>".repeat(MAX_NESTING_DEPTH + 88),
+            "</div>".repeat(MAX_NESTING_DEPTH + 88)
+        );
+        parse_fragment(&mut dom, parent, &html).unwrap();
+
+        // Depth is measured from `parent`, not the document root.
+        let mut max_depth = 0;
+        let mut stack = vec![(parent, 0usize)];
+        while let Some((id, depth)) = stack.pop() {
+            max_depth = max_depth.max(depth);
+            for &child in dom.children(id) {
+                stack.push((child, depth + 1));
+            }
+        }
+        assert!(
+            max_depth <= MAX_NESTING_DEPTH,
+            "fragment depth {max_depth} exceeds the cap of {MAX_NESTING_DEPTH}"
+        );
+        assert_sane(&dom);
+    }
+
+    #[test]
+    fn parse_fragment_keeps_template_content_outside_the_live_tree() {
+        let mut dom = Dom::new();
+        let parent = elem(&mut dom, "div");
+        dom.append(dom.root(), parent);
+
+        parse_fragment(
+            &mut dom,
+            parent,
+            "<template><h2>not rendered</h2></template><p>real</p>",
+        )
+        .unwrap();
+
+        let rendered: Vec<&str> = dom
+            .children(parent)
+            .iter()
+            .filter_map(|&id| dom.tag(id))
+            .collect();
+        assert_eq!(rendered, vec!["template", "p"]);
+        let mut h2_live = false;
+        dom.walk(|id, _| {
+            if dom.tag(id) == Some("h2") {
+                h2_live = true;
+            }
+        });
+        assert!(!h2_live, "template content must not be in the live tree");
+        assert_eq!(text_content(&dom, find_tag(&dom, "p")), "real");
+        assert_sane(&dom);
+    }
+
+    #[test]
+    fn parse_fragment_into_shadow_root_uses_render_children() {
+        let mut dom = Dom::new();
+        let host = elem(&mut dom, "my-widget");
+        dom.append(dom.root(), host);
+        let shadow = dom.attach_shadow(host).unwrap();
+
+        let light = elem(&mut dom, "light");
+        dom.append(host, light);
+        parse_fragment(&mut dom, shadow, "<p>shadow content</p><b>bold</b>").unwrap();
+
+        let rendered: Vec<&str> = dom
+            .render_children(host)
+            .iter()
+            .filter_map(|&id| dom.tag(id))
+            .collect();
+        assert_eq!(rendered, vec!["p", "b"]);
+        let p = dom.render_children(host)[0];
+        assert_eq!(text_content(&dom, p), "shadow content");
+        // The light child is still a plain child, just not rendered.
+        assert!(dom.children(host).contains(&light));
+        assert!(!dom.render_children(host).contains(&light));
+        assert_sane(&dom);
+    }
+
+    #[test]
+    fn parse_fragment_preserves_comment_data_verbatim() {
+        let mut dom = Dom::new();
+        let parent = elem(&mut dom, "div");
+        dom.append(dom.root(), parent);
+
+        parse_fragment(
+            &mut dom,
+            parent,
+            "<!--<?lit$834982315>-->x<!--/*lit*/--><!--a<b>c-->",
+        )
+        .unwrap();
+
+        let comments: Vec<&str> = dom
+            .children(parent)
+            .iter()
+            .filter(|&&id| dom.tag(id) == Some("#comment"))
+            .filter_map(|&id| dom.attr(id, "data"))
+            .collect();
+        assert_eq!(comments, vec!["<?lit$834982315>", "/*lit*/", "a<b>c"]);
+        assert_sane(&dom);
+    }
+
+    #[test]
+    fn parse_document_preserves_comment_data_verbatim() {
+        let dom = parse_document("<!--<?lit$834982315>-->x<!--/*lit*/-->");
+        let comments: Vec<&str> = all_tags(&dom, "#comment")
+            .iter()
+            .filter_map(|&id| dom.attr(id, "data"))
+            .collect();
+        assert_eq!(comments, vec!["<?lit$834982315>", "/*lit*/"]);
+        assert_sane(&dom);
+    }
+
+    #[test]
+    fn node_cap_overflow_is_dropped_not_visible_under_root() {
+        use hodo_types::limits::MAX_DOM_NODES;
+
+        // Fill the arena with a shallow-branching tree: a 1M-wide sibling chain
+        // would make the debug-mode chain-length checks quadratic.
+        let mut dom = Dom::new();
+        let mut ids: Vec<NodeId> = Vec::with_capacity(MAX_DOM_NODES - 1);
+        while dom.len() < MAX_DOM_NODES {
+            let i = ids.len();
+            let id = dom.create(NodeKind::Text("x".into()));
+            let parent = if i == 0 { dom.root() } else { ids[(i - 1) / 8] };
+            dom.append(parent, id);
+            ids.push(id);
+        }
+        assert_eq!(dom.len(), MAX_DOM_NODES);
+        // At the cap every create() hands back the document root.
+        assert_eq!(dom.create(NodeKind::Text("y".into())), dom.root());
+
+        let parent = ids[0];
+        let root_children_before = dom.children(dom.root()).len();
+        let parent_children_before = dom.children(parent).len();
+
+        parse_fragment(
+            &mut dom,
+            parent,
+            "<p>overflow</p><span>tail</span><b>more</b>",
+        )
+        .unwrap();
+
+        assert_eq!(
+            dom.children(dom.root()).len(),
+            root_children_before,
+            "overflow must not be appended under the visible root"
+        );
+        assert_eq!(dom.children(parent).len(), parent_children_before);
+        let leaked: Vec<&str> = {
+            let mut out = Vec::new();
+            dom.walk(|id, _| {
+                if let Some(tag) = dom.tag(id) {
+                    if matches!(tag, "p" | "span" | "b") {
+                        out.push(tag);
+                    }
+                }
+            });
+            out
+        };
+        assert!(
+            leaked.is_empty(),
+            "overflow tags leaked into the live tree: {leaked:?}"
         );
         assert_sane(&dom);
     }

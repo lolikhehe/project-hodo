@@ -10,12 +10,13 @@
 mod privacy;
 
 pub use privacy::{
-    adblock_blocked_count, allow_site, blocked_count, blocked_urls, clear_hsts, cookie_count,
-    fetch, hsts_hosts, is_site_allowed, privacy_stats, revoke_site, set_adblock_enabled,
-    strip_tracking_params, warned_urls, warning_count, FetchOutcome, PrivacyStats, Warning,
+    adblock_blocked_count, allow_site, blocked_count, blocked_urls, check_adblock, clear_hsts,
+    cookie_count, fetch, hsts_hosts, is_site_allowed, privacy_stats, revoke_site,
+    set_adblock_enabled, strip_tracking_params, warned_urls, warning_count, FetchOutcome,
+    PrivacyStats, Warning,
 };
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -472,19 +473,24 @@ pub fn resolve_location(base: &str, location: &str) -> Result<String, FetchError
     let Some((scheme, rest)) = base.split_once("://") else {
         return Err(FetchError::InvalidUrl);
     };
-    let authority_end = rest.find('/').unwrap_or(rest.len());
+    // The authority ends at the first `/`, `?` or `#`. Finding only `/` lets a
+    // slash inside a query value (`https://x?next=/foo`) swallow the authority.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
     let resolved = if let Some(stripped) = location.strip_prefix("//") {
         format!("{scheme}://{stripped}")
     } else if location.starts_with('/') {
         format!("{scheme}://{authority}{location}")
     } else {
-        // Resolve relative to the path after the authority, not the whole rest.
-        // Cut the query/fragment first: a `/` inside a query value is not a
-        // path separator.
+        // Resolve relative to the path after the authority. Strip query and
+        // fragment first: a `/` in the query is not a path separator, and a
+        // query-only base resolves relative to `/`.
         let tail = &rest[authority_end..];
         let path_part = tail.split(['?', '#']).next().unwrap_or(tail);
-        let path = &path_part[..path_part.rfind('/').map(|p| p + 1).unwrap_or(0)];
+        let path = match path_part.rfind('/') {
+            Some(p) => &path_part[..p + 1],
+            None => "/",
+        };
         format!("{scheme}://{authority}{path}{location}")
     };
     normalize_url(&resolved)
@@ -823,12 +829,20 @@ struct Fetched {
 }
 
 /// Resource plus the privacy side effects observed while loading it.
-pub(crate) struct Loaded {
-    pub(crate) resource: Resource,
-    pub(crate) set_cookies: Vec<String>,
+#[derive(Debug)]
+pub struct Loaded {
+    /// The decoded body (HTML text or bytes plus MIME).
+    pub resource: Resource,
+    /// `Set-Cookie` values from every network hop in this load.
+    pub set_cookies: Vec<String>,
     /// (URL of the hop that sent the header, raw HSTS value).
-    pub(crate) hsts: Vec<(String, String)>,
-    pub(crate) final_url: String,
+    pub hsts: Vec<(String, String)>,
+    /// When the HSTS facts were observed: `None` for a live network hop (use
+    /// the request time), `Some(stored_at)` for a warm cache replay. Computing
+    /// expiry from the request time on replay would refresh max-age forever.
+    pub hsts_observed_at: Option<u64>,
+    /// The URL that actually served the body (after redirects).
+    pub final_url: String,
 }
 
 const MAX_REDIRECTS: usize = 5;
@@ -875,6 +889,10 @@ pub(crate) fn fetch_network(
         let (headers, cookies) = response_headers(&res);
         set_cookies.extend(cookies);
         if let Some(sts) = headers.get("strict-transport-security") {
+            // Observe now, before the next hop's `upgrade_redirect` decision.
+            // `Loaded.hsts` still carries the fact for the privacy layer's
+            // cached/304 paths; this is the per-hop redirect path.
+            privacy::observe_hsts_header(&current, sts, private);
             hsts.push((current.clone(), sts.clone()));
         }
         if matches!(status, 301 | 302 | 303 | 307 | 308) {
@@ -961,6 +979,10 @@ fn fetch_network_streaming(
         let (headers, cookies) = response_headers(&res);
         set_cookies.extend(cookies);
         if let Some(sts) = headers.get("strict-transport-security") {
+            // Observe now, before the next hop's `upgrade_redirect` decision.
+            // `Loaded.hsts` still carries the fact for the privacy layer's
+            // cached/304 paths; this is the per-hop redirect path.
+            privacy::observe_hsts_header(&current, sts, private);
             hsts.push((current.clone(), sts.clone()));
         }
         if matches!(status, 301 | 302 | 303 | 307 | 308) {
@@ -1227,6 +1249,63 @@ pub fn load_with(
     Ok(load_cached(&key, opts, cache, &Headers::new())?.resource)
 }
 
+/// Load `urls` concurrently with a bounded pool of
+/// `min(6, available_parallelism)` workers and return the successful loads in
+/// **input order**.
+///
+/// Each URL is isolated: a bad URL, network error or oversize body drops only
+/// that entry — it never aborts its siblings. The result is therefore a
+/// subsequence of `urls` (one [`Loaded`] per successful input, in order).
+///
+/// This is a parallel *network* loader. Workers deliberately bypass the disk
+/// cache so they never contend for its mutex, i.e. it behaves like `opts` with
+/// `use_cache = false` and ignores `offline`, `partition` and
+/// `stream_to_cache`. Callers that need RFC 9111 caching / 304 revalidation
+/// must use [`load_with`] or [`crate::fetch`] instead.
+pub fn load_many(urls: &[String], opts: &FetchOptions) -> Vec<Loaded> {
+    if urls.is_empty() {
+        return Vec::new();
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(6)
+        .min(urls.len());
+    // shortcut: workers bypass the disk cache to avoid its mutex; upgrade when
+    // a per-worker cache or a phased lookup -> fetch -> put path exists (would
+    // restore 304 revalidation for batch loads).
+    let queue = Mutex::new((0..urls.len()).collect::<VecDeque<_>>());
+    let results = Mutex::new(
+        (0..urls.len())
+            .map(|_| None)
+            .collect::<Vec<Option<Loaded>>>(),
+    );
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let queue = &queue;
+            let results = &results;
+            scope.spawn(move || loop {
+                let idx = queue.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+                let Some(idx) = idx else { break };
+                // A panic in one worker is scoped to that worker; the other
+                // workers keep draining the queue (per-URL isolation).
+                let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    load_uncached_privacy(&urls[idx], opts, &Headers::new())
+                }));
+                if let Ok(Ok(loaded)) = loaded {
+                    results.lock().unwrap_or_else(|e| e.into_inner())[idx] = Some(loaded);
+                }
+            });
+        }
+    });
+    results
+        .into_inner()
+        .expect("results mutex not poisoned")
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
 fn loaded_from_fetched(fetched: Fetched) -> Loaded {
     let resource = resource_from(
         fetched.data,
@@ -1237,8 +1316,46 @@ fn loaded_from_fetched(fetched: Fetched) -> Loaded {
         resource,
         set_cookies: fetched.set_cookies,
         hsts: fetched.hsts,
+        hsts_observed_at: None,
         final_url: fetched.final_url,
     }
+}
+
+/// One load with no cache reads or writes. Shared by the private/uncached
+/// branch of [`load_with_privacy`] and by [`load_many`], whose workers must not
+/// contend for the cache lock.
+fn load_uncached_privacy(
+    url: &str,
+    opts: &FetchOptions,
+    extra_headers: &Headers,
+) -> Result<Loaded, FetchError> {
+    let normalized = normalize_url(url)?;
+    if let Some(path) = normalized.strip_prefix("file://") {
+        return Ok(Loaded {
+            resource: load_path(Path::new(path))?,
+            set_cookies: Vec::new(),
+            hsts: Vec::new(),
+            hsts_observed_at: None,
+            final_url: normalized,
+        });
+    }
+    if !normalized.starts_with("http://") && !normalized.starts_with("https://") {
+        return Ok(Loaded {
+            resource: load(&normalized)?,
+            set_cookies: Vec::new(),
+            hsts: Vec::new(),
+            hsts_observed_at: None,
+            final_url: normalized,
+        });
+    }
+    let mut headers = our_request_headers(&normalized);
+    headers.extend(extra_headers.iter().map(|(k, v)| (k.clone(), v.clone())));
+    Ok(loaded_from_fetched(fetch_network(
+        &normalized,
+        &headers,
+        None,
+        opts.private,
+    )?))
 }
 
 /// Internal load used by [`crate::fetch`]. `extra_headers` carries the
@@ -1250,34 +1367,11 @@ pub(crate) fn load_with_privacy(
     cache: &mut DiskCache,
     extra_headers: &Headers,
 ) -> Result<Loaded, FetchError> {
-    let normalized = normalize_url(url)?;
     if opts.private || !opts.use_cache {
-        if let Some(path) = normalized.strip_prefix("file://") {
-            return Ok(Loaded {
-                resource: load_path(Path::new(path))?,
-                set_cookies: Vec::new(),
-                hsts: Vec::new(),
-                final_url: normalized,
-            });
-        }
-        if !normalized.starts_with("http://") && !normalized.starts_with("https://") {
-            return Ok(Loaded {
-                resource: load(&normalized)?,
-                set_cookies: Vec::new(),
-                hsts: Vec::new(),
-                final_url: normalized,
-            });
-        }
-        let mut headers = our_request_headers(&normalized);
-        headers.extend(extra_headers.iter().map(|(k, v)| (k.clone(), v.clone())));
-        return Ok(loaded_from_fetched(fetch_network(
-            &normalized,
-            &headers,
-            None,
-            opts.private,
-        )?));
+        return load_uncached_privacy(url, opts, extra_headers);
     }
 
+    let normalized = normalize_url(url)?;
     let key = CacheKey::new("GET", &normalized, &opts.partition);
     let Some(_guard) = PendingGuard::enter(&key) else {
         return Err(FetchError::InFlight);
@@ -1295,10 +1389,18 @@ fn load_cached(
     let mut request_headers = our_request_headers(&key.url);
     request_headers.extend(extra_headers.iter().map(|(k, v)| (k.clone(), v.clone())));
 
-    let cached = |resource: Resource, url: String| Loaded {
+    // A warm hit must replay the response's stored HSTS fact: the network hop
+    // that would have observed it never happens. The fact is re-observed at
+    // `observed_at` (the entry's stored_at), never at the current request time,
+    // so a replayed max-age cannot extend itself forever.
+    let cached = |resource: Resource, url: String, stored: &Headers, observed_at: u64| Loaded {
         resource,
         set_cookies: Vec::new(),
-        hsts: Vec::new(),
+        hsts: stored
+            .get("strict-transport-security")
+            .map(|value| vec![(url.clone(), value.clone())])
+            .unwrap_or_default(),
+        hsts_observed_at: Some(observed_at),
         final_url: url,
     };
 
@@ -1309,6 +1411,8 @@ fn load_cached(
             return Ok(cached(
                 resource_from(entry.data, Some(&entry.content_type), &key.url),
                 key.url.clone(),
+                &entry.headers,
+                entry.stored_at,
             ));
         }
         if opts.offline {
@@ -1335,11 +1439,21 @@ fn load_cached(
             stored_at: clock.now_unix(),
         };
         let _ = cache.put(key, &entry);
-        return Ok(cached(resource, key.url.clone()));
+        return Ok(cached(
+            resource,
+            key.url.clone(),
+            &entry.headers,
+            entry.stored_at,
+        ));
     }
 
     if !key.url.starts_with("http://") && !key.url.starts_with("https://") {
-        return Ok(cached(load(&key.url)?, key.url.clone()));
+        return Ok(cached(
+            load(&key.url)?,
+            key.url.clone(),
+            &Headers::new(),
+            clock.now_unix(),
+        ));
     }
 
     // Warm hits read metadata + an mmap-backed body slice instead of pulling
@@ -1348,8 +1462,11 @@ fn load_cached(
     if let Some(mapped) = cache.get_mapped(key) {
         let meta = mapped.metadata();
         if meta.is_fresh(&clock) && vary_matches(&meta.vary, &request_headers) {
+            // Clone the stored headers before `mapped` is consumed below.
+            let stored = meta.headers.clone();
+            let stored_at = meta.stored_at;
             if let Some(resource) = serve_cached_mapped(mapped, key, cache, &clock) {
-                return Ok(cached(resource, key.url.clone()));
+                return Ok(cached(resource, key.url.clone(), &stored, stored_at));
             }
             if opts.offline {
                 return Err(FetchError::Offline);
@@ -1382,6 +1499,7 @@ fn load_cached(
                             resource,
                             set_cookies: cookies,
                             hsts,
+                            hsts_observed_at: None,
                             final_url: key.url.clone(),
                         });
                     }
@@ -1390,6 +1508,7 @@ fn load_cached(
                             resource,
                             set_cookies: cookies,
                             hsts,
+                            hsts_observed_at: None,
                             final_url: key.url.clone(),
                         });
                     }
@@ -1442,6 +1561,7 @@ fn load_cached(
             resource,
             set_cookies: fetched.set_cookies,
             hsts: fetched.hsts,
+            hsts_observed_at: None,
             final_url: fetched.final_url,
         });
     }
@@ -1722,7 +1842,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     const HTML: &str = "<!doctype html><html><body>hodo</body></html>";
 
@@ -2281,6 +2401,9 @@ mod tests {
         path: String,
         host: Option<String>,
         content_type: Option<String>,
+        /// All request headers, lowercased names — lets tests assert on
+        /// conditional validators such as `if-none-match`.
+        headers: Vec<(String, String)>,
         body: Vec<u8>,
     }
 
@@ -2305,16 +2428,20 @@ mod tests {
         let mut content_length = 0usize;
         let mut content_type = None;
         let mut host = None;
+        let mut headers = Vec::new();
         for line in lines {
             let Some((name, value)) = line.split_once(':') else {
                 continue;
             };
-            match name.trim().to_ascii_lowercase().as_str() {
-                "content-length" => content_length = value.trim().parse().unwrap_or(0),
-                "content-type" => content_type = Some(value.trim().to_string()),
-                "host" => host = Some(value.trim().to_string()),
+            let name = name.trim().to_ascii_lowercase();
+            let value = value.trim().to_string();
+            match name.as_str() {
+                "content-length" => content_length = value.parse().unwrap_or(0),
+                "content-type" => content_type = Some(value.clone()),
+                "host" => host = Some(value.clone()),
                 _ => {}
             }
+            headers.push((name, value));
         }
         while buf.len() < header_end + content_length {
             match stream.read(&mut chunk) {
@@ -2328,6 +2455,7 @@ mod tests {
             path,
             host,
             content_type,
+            headers,
             body: buf[header_end..end].to_vec(),
         }
     }
@@ -2375,32 +2503,29 @@ mod tests {
     }
 
     /// Scripted server that can set arbitrary response headers (Set-Cookie,
-    /// ETag, Vary, HSTS, Location).
+    /// ETag, Vary, HSTS, Location) and records every request it receives.
     struct HeaderServer {
         url: String,
+        requests: Arc<Mutex<Vec<RecordedRequest>>>,
     }
 
     impl HeaderServer {
         fn start(script: Vec<(u16, String, String)>) -> Self {
+            Self::start_at("/r", script)
+        }
+
+        fn start_at(path: &str, script: Vec<(u16, String, String)>) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
-            let url = format!("http://127.0.0.1:{port}/r");
+            let url = format!("http://127.0.0.1:{port}{path}");
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::clone(&requests);
             let _join: JoinHandle<()> = std::thread::spawn(move || {
                 for (status, extra, body) in script {
                     let Ok((mut stream, _)) = listener.accept() else {
                         return;
                     };
-                    let mut buf = Vec::new();
-                    let mut chunk = [0u8; 4096];
-                    loop {
-                        if find_bytes(&buf, b"\r\n\r\n").is_some() {
-                            break;
-                        }
-                        match stream.read(&mut chunk) {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                        }
-                    }
+                    seen.lock().unwrap().push(read_request(&mut stream));
                     let response = format!(
                         "HTTP/1.1 {status} Scripted\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n{body}",
                         body.len()
@@ -2409,7 +2534,11 @@ mod tests {
                     let _ = stream.flush();
                 }
             });
-            Self { url }
+            Self { url, requests }
+        }
+
+        fn requests(&self) -> Vec<RecordedRequest> {
+            self.requests.lock().unwrap().clone()
         }
     }
 
@@ -2551,6 +2680,16 @@ mod tests {
             resolve_location("https://x/dir/page?next=/foo", "bar").unwrap(),
             "https://x/dir/bar",
             "a slash inside the query is not a base-path separator"
+        );
+        assert_eq!(
+            resolve_location("https://x?next=/foo", "bar").unwrap(),
+            "https://x/bar",
+            "a slash in a query-only base must not be read as the authority end"
+        );
+        assert_eq!(
+            resolve_location("https://x", "bar").unwrap(),
+            "https://x/bar",
+            "a base with no path resolves a relative reference from `/`"
         );
         assert!(matches!(
             resolve_location("not a url", "/x"),
@@ -2790,6 +2929,336 @@ mod tests {
                 let _ = join.join();
             }
         }
+    }
+
+    /// Loopback server whose reply body is the request path, with an optional
+    /// artificial per-request delay (RTT injection for the batch benchmark).
+    /// One request per connection, so many clients can load distinct paths.
+    struct PathServer {
+        base: String,
+        requests: Arc<AtomicUsize>,
+        join: Option<JoinHandle<()>>,
+    }
+
+    impl PathServer {
+        fn start(serves: usize, delay: Duration) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&requests);
+            let join = std::thread::spawn(move || {
+                let mut handlers = Vec::new();
+                for _ in 0..serves {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        break;
+                    };
+                    let seen = Arc::clone(&seen);
+                    handlers.push(std::thread::spawn(move || {
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        loop {
+                            if find_bytes(&buf, b"\r\n\r\n").is_some() {
+                                break;
+                            }
+                            match stream.read(&mut chunk) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        }
+                        let head = String::from_utf8_lossy(&buf[..buf.len().min(4096)]);
+                        let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
+                        seen.fetch_add(1, AtomicOrdering::Relaxed);
+                        if !delay.is_zero() {
+                            std::thread::sleep(delay);
+                        }
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+                            path.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.write_all(path.as_bytes());
+                        let _ = stream.flush();
+                    }));
+                }
+                for handler in handlers {
+                    let _ = handler.join();
+                }
+            });
+            Self {
+                base: format!("http://127.0.0.1:{port}"),
+                requests,
+                join: Some(join),
+            }
+        }
+
+        fn url(&self, path: &str) -> String {
+            format!("{}{}", self.base, path)
+        }
+
+        fn requests(&self) -> usize {
+            self.requests.load(AtomicOrdering::Relaxed)
+        }
+    }
+
+    impl Drop for PathServer {
+        fn drop(&mut self) {
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+        }
+    }
+
+    /// HTTP/1.1 keep-alive loopback server: many requests per accepted TCP
+    /// connection. Counts connections separately from requests so connection
+    /// reuse (rather than request count) can be asserted.
+    struct KeepAliveServer {
+        url: String,
+        connections: Arc<AtomicUsize>,
+        requests: Arc<AtomicUsize>,
+        join: Option<JoinHandle<()>>,
+    }
+
+    impl KeepAliveServer {
+        fn start(connections: usize) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let seen_connections = Arc::new(AtomicUsize::new(0));
+            let seen_requests = Arc::new(AtomicUsize::new(0));
+            let counted_connections = Arc::clone(&seen_connections);
+            let counted_requests = Arc::clone(&seen_requests);
+            let join = std::thread::spawn(move || {
+                for _ in 0..connections {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        return;
+                    };
+                    counted_connections.fetch_add(1, AtomicOrdering::Relaxed);
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+                    loop {
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        let mut idle = false;
+                        let header_end = loop {
+                            if let Some(pos) = find_bytes(&buf, b"\r\n\r\n") {
+                                break pos + 4;
+                            }
+                            match stream.read(&mut chunk) {
+                                Ok(0) => break buf.len(),
+                                Err(e)
+                                    if matches!(
+                                        e.kind(),
+                                        std::io::ErrorKind::TimedOut
+                                            | std::io::ErrorKind::WouldBlock
+                                    ) =>
+                                {
+                                    idle = true;
+                                    break buf.len();
+                                }
+                                Err(_) => break buf.len(),
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        };
+                        if idle || header_end == 0 {
+                            break;
+                        }
+                        counted_requests.fetch_add(1, AtomicOrdering::Relaxed);
+                        let body = b"keepalive";
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
+                            body.len()
+                        );
+                        if stream.write_all(response.as_bytes()).is_err()
+                            || stream.write_all(body).is_err()
+                            || stream.flush().is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            });
+            Self {
+                url: format!("http://127.0.0.1:{port}/r"),
+                connections: seen_connections,
+                requests: seen_requests,
+                join: Some(join),
+            }
+        }
+
+        fn connections(&self) -> usize {
+            self.connections.load(AtomicOrdering::Relaxed)
+        }
+
+        fn requests(&self) -> usize {
+            self.requests.load(AtomicOrdering::Relaxed)
+        }
+    }
+
+    impl Drop for KeepAliveServer {
+        fn drop(&mut self) {
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+        }
+    }
+
+    #[test]
+    fn load_many_preserves_input_order_and_isolates_errors() {
+        let server = PathServer::start(8, Duration::ZERO);
+        let mut urls: Vec<String> = (0..8)
+            .map(|i| server.url(&format!("/chunk-{i}.js")))
+            .collect();
+        // A bad URL in the middle: it must not kill its siblings or shift them.
+        urls.insert(3, "data:text/plain,bad".to_string());
+
+        let loaded = load_many(&urls, &options("load-many"));
+        assert_eq!(
+            loaded.len(),
+            8,
+            "one bad URL must not abort the other seven"
+        );
+        for (position, item) in loaded.iter().enumerate() {
+            // Input 3 is the bad URL, so output position p maps to input p+1
+            // from there on. The server echoes the path, not the whole URL.
+            let input = if position < 3 { position } else { position + 1 };
+            let rest = urls[input].split_once("://").unwrap().1;
+            let path = &rest[rest.find('/').unwrap()..];
+            match &item.resource {
+                Resource::Other { data, mime } => {
+                    assert_eq!(data, path.as_bytes());
+                    assert_eq!(mime, "application/javascript");
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+            assert_eq!(item.final_url, urls[input]);
+        }
+        assert_eq!(
+            server.requests(),
+            8,
+            "only the eight valid URLs reached the network"
+        );
+    }
+
+    #[test]
+    fn load_many_bench_seven_urls_vs_sequential() {
+        const DELAY: Duration = Duration::from_millis(50);
+        let server = PathServer::start(14, DELAY);
+        let urls: Vec<String> = (0..7)
+            .map(|i| server.url(&format!("/chunk-{i}.js")))
+            .collect();
+
+        let parallel_start = Instant::now();
+        let loaded = load_many(&urls, &options("bench-parallel"));
+        let parallel = parallel_start.elapsed();
+        assert_eq!(loaded.len(), 7);
+
+        let sequential_start = Instant::now();
+        for url in &urls {
+            let _ = load(url).unwrap();
+        }
+        let sequential = sequential_start.elapsed();
+
+        let ratio = sequential.as_secs_f64() / parallel.as_secs_f64();
+        eprintln!(
+            "load_many bench (7 URLs x {DELAY:?} RTT): parallel {parallel:?} vs sequential {sequential:?} ({ratio:.2}x)"
+        );
+        if std::thread::available_parallelism().is_ok_and(|n| n.get() >= 4) {
+            assert!(ratio >= 3.0, "expected >=3x speedup, got {ratio:.2}x");
+        }
+    }
+
+    #[test]
+    fn sequential_loads_reuse_one_connection_per_origin() {
+        let server = KeepAliveServer::start(1);
+        for _ in 0..2 {
+            match load(&server.url).unwrap() {
+                Resource::Other { data, .. } => assert_eq!(data, b"keepalive"),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(server.requests(), 2);
+        assert_eq!(
+            server.connections(),
+            1,
+            "two loads to one origin must reuse the pooled keep-alive connection"
+        );
+    }
+
+    #[test]
+    fn private_fetch_reuses_one_connection_per_origin() {
+        // Exercises `cache_agent()` (revalidation/private path), not just the
+        // frozen `load()` agent.
+        let server = KeepAliveServer::start(1);
+        let mut jar = hodo_cookie::CookieJar::new();
+        let mut t = TempCache::new();
+        let opts = FetchOptions {
+            private: true,
+            strip_tracking: false,
+            ..FetchOptions::default()
+        };
+        for _ in 0..2 {
+            let _ = fetch(&server.url, &opts, &mut t.cache, &mut jar).unwrap();
+        }
+        assert_eq!(server.requests(), 2);
+        assert_eq!(server.connections(), 1);
+    }
+
+    #[test]
+    fn chunk_url_second_load_revalidates_with_304_and_no_full_body() {
+        // Mirrors the shell's ESM chunk path: `load_resource` -> `load_with`.
+        // The first response is immediately stale with a validator; the second
+        // must be an If-None-Match revalidation answered by a bodyless 304,
+        // with the body served from the stored cache entry.
+        const BODY: &str = "export const chunk = 1;";
+        let server = HeaderServer::start_at(
+            "/assets/chunk-4f3a.js",
+            vec![
+                (
+                    200,
+                    "ETag: \"chunk-v1\"\r\nCache-Control: max-age=0\r\n".into(),
+                    BODY.into(),
+                ),
+                (304, "Cache-Control: max-age=600\r\n".into(), String::new()),
+            ],
+        );
+        let mut t = TempCache::new();
+        let opts = FetchOptions {
+            strip_tracking: false,
+            ..options("chunk-revalidate")
+        };
+
+        match load_with(&server.url, &opts, &mut t.cache).unwrap() {
+            Resource::Other { data, .. } => assert_eq!(data, BODY.as_bytes()),
+            other => panic!("unexpected {other:?}"),
+        }
+        match load_with(&server.url, &opts, &mut t.cache).unwrap() {
+            Resource::Other { data, .. } => assert_eq!(data, BODY.as_bytes()),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let seen = server.requests();
+        assert_eq!(
+            seen.len(),
+            2,
+            "the second load must reach the server to revalidate"
+        );
+        assert_eq!(seen[0].path, "/assets/chunk-4f3a.js");
+        assert!(
+            seen[1]
+                .headers
+                .iter()
+                .any(|(name, value)| name == "if-none-match" && value == "\"chunk-v1\""),
+            "second load must send the stored ETag, got {:?}",
+            seen[1].headers
+        );
+        let key = CacheKey::new(
+            "GET",
+            &normalize_url(&server.url).unwrap(),
+            "chunk-revalidate",
+        );
+        let entry = t.cache.get(&key).unwrap();
+        assert!(
+            entry.is_fresh(&SystemClock),
+            "304 must refresh the stored entry"
+        );
     }
 
     #[test]

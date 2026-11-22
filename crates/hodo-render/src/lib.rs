@@ -1,7 +1,7 @@
 //! Software rasterizer producing RGBA8 frames.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use fontdue::{Font, FontSettings, Metrics};
@@ -10,6 +10,9 @@ use hodo_types::{Color, Rect, Size};
 use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Rect as SkRect, Transform};
 
 static FONT: OnceLock<Option<Font>> = OnceLock::new();
+/// DejaVu Sans has no Han coverage; AOSP's DroidSansFallback (Apache-2.0)
+/// supplies it. Parsed lazily, exactly like `FONT`.
+static FONT_CJK: OnceLock<Option<Font>> = OnceLock::new();
 
 /// Decoded-pixel budget: 4096 × 4096 = 16.7M px; at 4 B/px that is 64 MiB
 /// worst case. Larger images are rejected before any pixel buffer is allocated
@@ -33,9 +36,21 @@ fn font() -> Option<&'static Font> {
     .as_ref()
 }
 
+fn font_cjk() -> Option<&'static Font> {
+    FONT_CJK
+        .get_or_init(|| {
+            Font::from_bytes(
+                include_bytes!("../../../assets/fonts/DroidSansFallback.ttf").as_slice(),
+                FontSettings::default(),
+            )
+            .ok()
+        })
+        .as_ref()
+}
+
 /// One rasterized glyph: an A8 coverage mask plus the fontdue metrics that
-/// position it. A unique `(size, codepoint)` pair is rasterized once per
-/// process in the common case (a rare first-touch race may duplicate one).
+/// position it. A unique `(size, face, codepoint)` triple is rasterized once
+/// per process in the common case (a rare first-touch race may duplicate one).
 struct GlyphBitmap {
     metrics: Metrics,
     coverage: Vec<u8>,
@@ -46,6 +61,8 @@ struct GlyphBitmap {
 struct GlyphKey {
     size_bits: u32,
     ch: char,
+    /// Which face rasterized the mask; keeps DejaVu and Droid entries apart.
+    cjk: bool,
 }
 
 struct AtlasState {
@@ -61,6 +78,25 @@ static GLYPH_ATLAS: OnceLock<RwLock<AtlasState>> = OnceLock::new();
 static ATLAS_TICK: AtomicU64 = AtomicU64::new(1);
 static ATLAS_HITS: AtomicU64 = AtomicU64::new(0);
 static ATLAS_MISSES: AtomicU64 = AtomicU64::new(0);
+/// How often the cmap fallback decision runs. Hot Latin hits never touch it.
+static ATLAS_HAS_GLYPH_PROBES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    /// Thread-local mirror for the direct-thread hot-path test's exact counts;
+    /// parallel render tests would otherwise add noise to the global counter.
+    static TEST_HAS_GLYPH_PROBES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// `has_glyph` is a cmap lookup; only call it from the atlas miss path. Tests
+/// also observe the global counter via `glyph_atlas_stats().has_glyph_probes`
+/// so probes made on band-worker threads are counted.
+fn probe_has_glyph(font: &Font, ch: char) -> bool {
+    #[cfg(test)]
+    TEST_HAS_GLYPH_PROBES.with(|c| c.set(c.get() + 1));
+    ATLAS_HAS_GLYPH_PROBES.fetch_add(1, Ordering::Relaxed);
+    font.has_glyph(ch)
+}
 
 fn glyph_atlas() -> &'static RwLock<AtlasState> {
     GLYPH_ATLAS.get_or_init(|| {
@@ -71,28 +107,58 @@ fn glyph_atlas() -> &'static RwLock<AtlasState> {
     })
 }
 
-/// Return the cached coverage mask for `ch`, rasterizing once on a miss.
-/// The returned `Arc` keeps the mask alive even if the atlas evicts it while
-/// the caller is blitting.
-fn glyph_cached(font: &Font, ch: char, font_size: f32) -> Arc<GlyphBitmap> {
-    let key = GlyphKey {
-        size_bits: font_size.to_bits(),
-        ch,
-    };
-    if let Some(bitmap) = glyph_atlas()
+/// Look up one atlas key, refreshing its LRU stamp on a hit.
+fn atlas_lookup(key: &GlyphKey) -> Option<Arc<GlyphBitmap>> {
+    let bitmap = glyph_atlas()
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .map
-        .get(&key)
-    {
-        let bitmap = Arc::clone(bitmap);
-        bitmap.last_used.store(
-            ATLAS_TICK.fetch_add(1, Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
-        ATLAS_HITS.fetch_add(1, Ordering::Relaxed);
+        .get(key)
+        .cloned()?;
+    bitmap.last_used.store(
+        ATLAS_TICK.fetch_add(1, Ordering::Relaxed),
+        Ordering::Relaxed,
+    );
+    ATLAS_HITS.fetch_add(1, Ordering::Relaxed);
+    Some(bitmap)
+}
+
+/// Return the cached coverage mask for `ch`, rasterizing once on a miss.
+/// Codepoints DejaVu lacks use the CJK fallback; the face is part of the key so
+/// the two masks never collide. The returned `Arc` keeps the mask alive even if
+/// the atlas evicts it while the caller is blitting.
+fn glyph_cached(font: &Font, ch: char, font_size: f32) -> Arc<GlyphBitmap> {
+    let size_bits = font_size.to_bits();
+    let primary = GlyphKey {
+        size_bits,
+        ch,
+        cjk: false,
+    };
+
+    // Fast path: most glyphs are Latin and live in the primary face. Probe its
+    // key first so the hot path never pays for a `has_glyph` cmap lookup.
+    if let Some(bitmap) = atlas_lookup(&primary) {
         return bitmap;
     }
+
+    // Miss only: decide whether the CJK fallback owns this codepoint. If
+    // neither covers it, the primary face still rasterizes today's tofu box.
+    let (font, cjk) = if probe_has_glyph(font, ch) {
+        (font, false)
+    } else {
+        match font_cjk() {
+            Some(fallback) if probe_has_glyph(fallback, ch) => (fallback, true),
+            _ => (font, false),
+        }
+    };
+    let key = GlyphKey { size_bits, ch, cjk };
+    // A CJK glyph may already be cached under its own key; re-probe that key.
+    if cjk {
+        if let Some(bitmap) = atlas_lookup(&key) {
+            return bitmap;
+        }
+    }
+
     ATLAS_MISSES.fetch_add(1, Ordering::Relaxed);
     // Rasterize outside the lock so threads never serialize on the slow path.
     // A duplicate rasterization on a race is harmless: identical coverage.
@@ -108,7 +174,9 @@ fn glyph_cached(font: &Font, ch: char, font_size: f32) -> Arc<GlyphBitmap> {
         state.bytes = state.bytes.saturating_sub(previous.coverage.len());
     }
     // Evict LRU entries until the byte cap fits. A single oversized glyph is
-    // kept: dropping it mid-blit would be invalid.
+    // kept: dropping it mid-blit would be invalid. A working set larger than
+    // the cap (e.g. a 2 MiB CJK page) thrashes by design — the cap is the RAM
+    // promise, not a guarantee that every glyph stays resident.
     while state.bytes > ATLAS_CAP_BYTES && state.map.len() > 1 {
         let Some(lru) = state
             .map
@@ -133,6 +201,8 @@ pub struct GlyphAtlasStats {
     pub capacity: usize,
     pub hits: u64,
     pub misses: u64,
+    /// cmap lookups; stays flat on the hot Latin hit path.
+    pub has_glyph_probes: u64,
 }
 
 /// Glyph atlas stats for performance reporting (cumulative since process start).
@@ -144,6 +214,7 @@ pub fn glyph_atlas_stats() -> GlyphAtlasStats {
         capacity: ATLAS_CAP_BYTES,
         hits: ATLAS_HITS.load(Ordering::Relaxed),
         misses: ATLAS_MISSES.load(Ordering::Relaxed),
+        has_glyph_probes: ATLAS_HAS_GLYPH_PROBES.load(Ordering::Relaxed),
     }
 }
 
@@ -776,11 +847,23 @@ const IMAGE_CACHE_CAP_ENTRIES: usize = 64;
 const IMAGE_CACHE_CAP_BYTES: usize = 16 * 1024 * 1024;
 /// Upper bound on threads spawned to warm a page's images in parallel.
 const IMAGE_WARM_THREADS: usize = 4;
+/// At most this many full-resolution decodes run at once. Each holds an rgba
+/// buffer up to 64 MiB plus a scaled copy; `IMAGE_CACHE_CAP_BYTES` counts only
+/// the scaled copy, so the transient scratch is bounded here instead (four
+/// parallel warm decodes would otherwise peak near 512 MiB unreported).
+const MAX_CONCURRENT_DECODES: usize = 2;
+static DECODE_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+static DECODE_PEAK_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+static DECODE_SCRATCH_PEAK_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Identity of one decoded image. `file_sig` is `(mtime_ns, byte_len)` for a
+/// plain local file — both signals invalidate the key, because a coarse mtime
+/// alone can miss a same-size rewrite. It is `None` for URL sources, which
+/// bypass the cache entirely (see `image_cache_get`).
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ImageKey {
     path: String,
-    mtime_ns: u128,
+    file_sig: Option<(u128, u64)>,
     target_w: u32,
     target_h: u32,
 }
@@ -868,6 +951,10 @@ pub struct ImageCacheStats {
     pub misses: u64,
     /// Actual decode attempts (one per successful cold load).
     pub decodes: u64,
+    /// Peak number of full-resolution decodes in flight (bounded by the gate).
+    pub peak_in_flight: usize,
+    /// Peak transient scratch bytes (full-res rgba + scaled copy) in one decode.
+    pub scratch_peak_bytes: u64,
 }
 
 /// Image cache stats: cumulative since process start, snapshot on call.
@@ -881,29 +968,89 @@ pub fn image_cache_stats() -> ImageCacheStats {
         hits: IMAGE_HITS.load(Ordering::Relaxed),
         misses: IMAGE_MISSES.load(Ordering::Relaxed),
         decodes: IMAGE_DECODES.load(Ordering::Relaxed),
+        peak_in_flight: DECODE_PEAK_IN_FLIGHT.load(Ordering::Relaxed),
+        scratch_peak_bytes: DECODE_SCRATCH_PEAK_BYTES.load(Ordering::Relaxed),
     }
 }
 
-/// Filesystem mtime in nanoseconds. On any failure (http URL, missing file)
-/// return a constant: the mtime component then never changes the key, so the
-/// cache stays keyed by (path, rect) as a safe fallback.
-fn image_mtime_ns(path: &str) -> u128 {
-    std::fs::metadata(path)
-        .and_then(|meta| meta.modified())
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0)
+/// Peak transient decode scratch (full-resolution rgba + scaled copy) seen so
+/// far, for observability. Not bounded by `IMAGE_CACHE_CAP_BYTES`; the in-flight
+/// gate (`MAX_CONCURRENT_DECODES`) is what bounds the aggregate.
+pub fn decode_scratch_peak() -> u64 {
+    DECODE_SCRATCH_PEAK_BYTES.load(Ordering::Relaxed)
+}
+
+/// Resolve an image source to the local path used for both the cache key and
+/// the mtime/size signature. `file:///C:/x.png` and `C:/x.png` name the same
+/// file, so the slash left before a Windows drive letter is removed. A Unix
+/// absolute path (`/home/...`) keeps its leading slash.
+fn image_local_path(path: &str) -> &str {
+    let local = path.strip_prefix("file://").unwrap_or(path);
+    if local.starts_with('/')
+        && local.as_bytes().get(1).is_some_and(u8::is_ascii_alphabetic)
+        && local.as_bytes().get(2) == Some(&b':')
+    {
+        &local[1..]
+    } else {
+        local
+    }
+}
+
+/// Content signal for a local file: `(mtime_ns, byte_len)`. Returns `None` for
+/// URL sources (http/data) and anything we cannot stat. `file://` URLs resolve
+/// to a local path, so they are stripped and treated as files. Two signals are
+/// needed because a filesystem mtime can be too coarse to notice a same-size
+/// rewrite; URL sources have no mtime at all and are never cached.
+fn image_file_sig(path: &str) -> Option<(u128, u64)> {
+    let local = image_local_path(path);
+    if local.contains("://") || local.starts_with("data:") {
+        return None;
+    }
+    let meta = std::fs::metadata(local).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some((mtime, meta.len()))
 }
 
 fn image_key(path: &str, rect: &hodo_types::Rect) -> ImageKey {
     ImageKey {
-        path: path.to_string(),
-        mtime_ns: image_mtime_ns(path),
+        // Key by the canonical local path, not the raw spelling, so a file://
+        // URL and a plain path share one cache entry.
+        path: image_local_path(path).to_string(),
+        file_sig: image_file_sig(path),
         // Identical integer transform to `blit_scaled`'s destination size.
         target_w: (rect.w.round() as i32).max(1) as u32,
         target_h: (rect.h.round() as i32).max(1) as u32,
     }
+}
+
+/// Cache lookup that refuses non-file sources. Without an mtime+size signal a
+/// cached http/data image could never notice a server-side byte swap, so URL
+/// sources are re-decoded on every load. Remote-image caching belongs in the
+/// net layer's cache (a later feature); faking it here would serve stale pixels
+/// forever. `file://` URLs carry a real signature and are cacheable.
+fn image_cache_get(key: &ImageKey) -> Option<Arc<ScaledImage>> {
+    // No signature means a URL source: there is no stable key, so bypass.
+    key.file_sig?;
+    image_cache()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
+}
+
+/// Mirror of `image_cache_get`: never store a source we cannot invalidate.
+fn image_cache_put(key: ImageKey, image: Arc<ScaledImage>) {
+    if key.file_sig.is_none() {
+        return;
+    }
+    image_cache()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, image);
 }
 
 /// Read + sniff + decode a file. The 4096² budget check stays inside each
@@ -959,11 +1106,49 @@ fn scale_to_target(
     (sw, sh, out)
 }
 
+/// RAII slot in the global decode gate. Dropped after the full-resolution
+/// buffer is released, so the in-flight count tracks live scratch memory.
+struct DecodePermit;
+
+impl Drop for DecodePermit {
+    fn drop(&mut self) {
+        DECODE_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Take a decode slot, queueing while `MAX_CONCURRENT_DECODES` are in flight.
+fn acquire_decode_permit() -> DecodePermit {
+    loop {
+        let mut current = DECODE_IN_FLIGHT.load(Ordering::Relaxed);
+        loop {
+            if current >= MAX_CONCURRENT_DECODES {
+                break;
+            }
+            match DECODE_IN_FLIGHT.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    DECODE_PEAK_IN_FLIGHT.fetch_max(current + 1, Ordering::Relaxed);
+                    return DecodePermit;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+        std::thread::yield_now();
+    }
+}
+
 /// Decode and downscale in one step. The full-resolution `rgba` is owned here
-/// and dropped on return — only the small scaled buffer survives.
+/// and dropped on return — only the small scaled buffer survives. A permit is
+/// held for the whole window in which that scratch buffer is live.
 fn load_scaled_image(path: &str, key: &ImageKey) -> Option<Arc<ScaledImage>> {
+    let _permit = acquire_decode_permit();
     let (iw, ih, rgba) = decode_image(path)?;
     let (w, h, scaled) = scale_to_target(iw, ih, &rgba, key.target_w, key.target_h);
+    DECODE_SCRATCH_PEAK_BYTES.fetch_max((rgba.len() + scaled.len()) as u64, Ordering::Relaxed);
     Some(Arc::new(ScaledImage {
         w,
         h,
@@ -976,10 +1161,7 @@ fn load_scaled_image(path: &str, key: &ImageKey) -> Option<Arc<ScaledImage>> {
 /// a placeholder instead of propagating an error into the frame pipeline.
 fn draw_image(pixmap: &mut Pixmap, rect: &hodo_types::Rect, path: &str) {
     let key = image_key(path, rect);
-    let cached = image_cache()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&key);
+    let cached = image_cache_get(&key);
     let image = if let Some(image) = cached {
         IMAGE_HITS.fetch_add(1, Ordering::Relaxed);
         image
@@ -989,10 +1171,7 @@ fn draw_image(pixmap: &mut Pixmap, rect: &hodo_types::Rect, path: &str) {
             draw_placeholder(pixmap, rect);
             return;
         };
-        image_cache()
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key, Arc::clone(&image));
+        image_cache_put(key, Arc::clone(&image));
         image
     };
     image.last_used.store(image_tick(), Ordering::Relaxed);
@@ -1002,22 +1181,14 @@ fn draw_image(pixmap: &mut Pixmap, rect: &hodo_types::Rect, path: &str) {
 /// Decode+scale one missing image without blitting it. `warm_images` calls
 /// this in parallel; `draw_image` uses `load_scaled_image` on its own cold path.
 fn warm_one(path: &str, key: &ImageKey) {
-    if image_cache()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(key)
-        .is_some()
-    {
+    if image_cache_get(key).is_some() {
         return;
     }
     IMAGE_MISSES.fetch_add(1, Ordering::Relaxed);
     let Some(image) = load_scaled_image(path, key) else {
         return;
     };
-    image_cache()
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(key.clone(), image);
+    image_cache_put(key.clone(), image);
 }
 
 /// Warm every visible, not-yet-cached image on a page *before* band workers
@@ -1046,6 +1217,10 @@ fn warm_images(list: &DisplayList, surface_w: i32, surface_h: i32) {
                 continue;
             }
             let key = image_key(path, rect);
+            // Non-file sources bypass the cache; warming them cannot be reused.
+            if key.file_sig.is_none() {
+                continue;
+            }
             if seen.insert(key.clone()) && guard.get(&key).is_none() {
                 missing.push((path.clone(), key));
             }
@@ -1264,6 +1439,134 @@ fn blend_glyph(data: &mut [u8], w: i32, h: i32, x: i32, y: i32, cov: u8, color: 
     data[i + 3] = (sa + data[i + 3] as u32 * inv / 255).min(255) as u8;
 }
 
+/// Eight-pixel u64-word blit (rung 1). Measured neutral-to-slower: 14.69 vs
+/// 14.96 ms on 25k-text LARGE, 6.745 vs 6.940 ms on hodo-perf LARGE (blits are
+/// only ~20% of the frame). Scalar stays the default; A/B test forces both.
+const GLYPH_CHUNKED_BLIT: bool = false;
+
+#[cfg(test)]
+/// 0 = production default, 1 = scalar, 2 = chunked; lets the A/B test select
+/// either path regardless of the production const.
+static TEST_BLIT_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn use_chunked_blit() -> bool {
+    #[cfg(test)]
+    match TEST_BLIT_MODE.load(Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    GLYPH_CHUNKED_BLIT
+}
+
+/// Blend one premultiplied RGBA pixel packed in native (little-endian) u32
+/// order. The scalar rounding is deliberately preserved: rounded source term,
+/// truncating destination term, identical to `blend_glyph`.
+#[inline]
+fn blend_glyph_packed(pixel: u32, cov: u8, cr: u32, cg: u32, cb: u32, ca: u32) -> u32 {
+    if cov == 0 {
+        return pixel;
+    }
+    let sa = (ca * cov as u32 + 127) / 255;
+    let inv = 255 - sa;
+    let r = ((cr * sa + 127) / 255 + (pixel & 0xff) * inv / 255).min(255);
+    let g = ((cg * sa + 127) / 255 + ((pixel >> 8) & 0xff) * inv / 255).min(255);
+    let b = ((cb * sa + 127) / 255 + ((pixel >> 16) & 0xff) * inv / 255).min(255);
+    let a = (sa + ((pixel >> 24) & 0xff) * inv / 255).min(255);
+    r | (g << 8) | (b << 16) | (a << 24)
+}
+
+/// Blend two adjacent pixels held in one u64 word. Zero coverage leaves its
+/// pixel untouched, exactly like the scalar path.
+#[inline]
+fn blend_glyph_word(data: &mut [u8], off: usize, cov_a: u8, cov_b: u8, color: Color) {
+    let (cr, cg, cb, ca) = (
+        color.r as u32,
+        color.g as u32,
+        color.b as u32,
+        color.a as u32,
+    );
+    match (cov_a, cov_b) {
+        (0, 0) => {}
+        (0, cov) => {
+            let dst = u32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap_or([0; 4]));
+            let out = blend_glyph_packed(dst, cov, cr, cg, cb, ca);
+            data[off + 4..off + 8].copy_from_slice(&out.to_le_bytes());
+        }
+        (cov, 0) => {
+            let dst = u32::from_le_bytes(data[off..off + 4].try_into().unwrap_or([0; 4]));
+            let out = blend_glyph_packed(dst, cov, cr, cg, cb, ca);
+            data[off..off + 4].copy_from_slice(&out.to_le_bytes());
+        }
+        (a, b) => {
+            let dst = u64::from_le_bytes(data[off..off + 8].try_into().unwrap_or([0; 8]));
+            let lo = blend_glyph_packed(dst as u32, a, cr, cg, cb, ca);
+            let hi = blend_glyph_packed((dst >> 32) as u32, b, cr, cg, cb, ca);
+            let out = u64::from(lo) | (u64::from(hi) << 32);
+            data[off..off + 8].copy_from_slice(&out.to_le_bytes());
+        }
+    }
+}
+
+/// Blend one glyph row: eight pixels per iteration read/written as four u64
+/// words (two pixels each), a two-pixel u64 word for short runs, and the
+/// original scalar blit for the last pixel. Clipping is resolved once per row.
+fn blend_glyph_row(
+    data: &mut [u8],
+    w: i32,
+    h: i32,
+    origin_x: i32,
+    y: i32,
+    coverage_row: &[u8],
+    color: Color,
+) {
+    if y < 0 || y >= h {
+        return;
+    }
+    // Half-open visible column range [start, end) in coverage coordinates.
+    let start = (-(origin_x as i64)).max(0);
+    let end = (w as i64 - origin_x as i64).min(coverage_row.len() as i64);
+    if start >= end {
+        return;
+    }
+    let (start, end) = (start as usize, end as usize);
+    let mut off = (y as usize * w as usize + (origin_x as i64 + start as i64) as usize) * 4;
+    let mut col = start;
+    while col + 8 <= end {
+        let cov_word = u64::from_le_bytes(coverage_row[col..col + 8].try_into().unwrap_or([0; 8]));
+        if cov_word != 0 {
+            for lane in 0..4 {
+                let shift = lane * 16;
+                blend_glyph_word(
+                    data,
+                    off + lane * 8,
+                    ((cov_word >> shift) & 0xff) as u8,
+                    ((cov_word >> (shift + 8)) & 0xff) as u8,
+                    color,
+                );
+            }
+        }
+        col += 8;
+        off += 32;
+    }
+    while col + 2 <= end {
+        blend_glyph_word(data, off, coverage_row[col], coverage_row[col + 1], color);
+        col += 2;
+        off += 8;
+    }
+    if col < end {
+        blend_glyph(
+            data,
+            w,
+            h,
+            origin_x + col as i32,
+            y,
+            coverage_row[col],
+            color,
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_text(
     pixmap: &mut Pixmap,
@@ -1324,6 +1627,7 @@ fn draw_text(
     };
 
     let data = pixmap.data_mut();
+    let chunked = use_chunked_blit();
     let mut pen_x = x;
     for ch in text.chars() {
         if ch.is_control() {
@@ -1341,17 +1645,30 @@ fn draw_text(
         // invariant under the integer y-shift used by damage/parallel bands.
         let origin_y = (baseline - metrics.height as f32 - metrics.ymin as f32).floor() as i32;
         for row in 0..metrics.height {
-            for col in 0..metrics.width {
-                let cov = coverage[row * metrics.width + col];
-                blend_glyph(
+            let row_start = row * metrics.width;
+            let row_end = row_start + metrics.width;
+            if chunked {
+                blend_glyph_row(
                     data,
                     w,
                     height,
-                    origin_x + col as i32,
+                    origin_x,
                     origin_y + row as i32,
-                    cov,
+                    &coverage[row_start..row_end],
                     color,
                 );
+            } else {
+                for (col, &cov) in coverage[row_start..row_end].iter().enumerate() {
+                    blend_glyph(
+                        data,
+                        w,
+                        height,
+                        origin_x + col as i32,
+                        origin_y + row as i32,
+                        cov,
+                        color,
+                    );
+                }
             }
         }
         let advance = if metrics.advance_width > 0.0 {
@@ -1422,9 +1739,64 @@ mod tests {
     /// serializes the ones that assert on those counters.
     static IMAGE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Glyph-atlas tests share process-wide state; serialize the ones that
+    /// assert on its contents, clear it, or flood it.
+    static GLYPH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn pixel(buf: &[u8], x: usize, y: usize, w: usize) -> [u8; 4] {
         let i = (y * w + x) * 4;
         [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+    }
+
+    /// FNV-1a full-frame hash: the A/B invariance shared by every perf rung.
+    fn frame_hash(bytes: &[u8]) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for &byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        hash
+    }
+
+    /// Text-heavy golden: mixed Latin + CJK, partial alpha, and rows that start
+    /// off-screen so the chunked path's clip/tail branches are exercised.
+    fn text_golden() -> (DisplayList, Size) {
+        let size = Size { w: 360.0, h: 160.0 };
+        let items = [
+            (4.0, "The quick brown fox 0123 Ajg", Color::BLACK, 16.0),
+            (
+                32.0,
+                "MMMMWWWWiiii....gggg",
+                Color::rgba(210, 40, 90, 200),
+                20.0,
+            ),
+            (64.0, "日本語 mix éè", Color::rgb(20, 90, 160), 18.0),
+            (
+                96.0,
+                "aaaa bbbb cccc dddd",
+                Color::rgba(30, 200, 40, 128),
+                14.0,
+            ),
+            (126.0, "WWWWWWWW", Color::rgb(255, 255, 255), 24.0),
+        ]
+        .into_iter()
+        .map(|(y, text, color, font_size)| DisplayItem::Text {
+            rect: Rect {
+                x: 12.0,
+                y,
+                w: 340.0,
+                h: font_size * 1.2,
+            },
+            text: text.into(),
+            color,
+            font_size,
+            weight: 400,
+            href: None,
+            underline: false,
+            line_through: false,
+        })
+        .collect();
+        (list(items), size)
     }
 
     #[test]
@@ -2136,6 +2508,200 @@ mod tests {
         );
     }
 
+    /// Rung 1 gate: chunked u64-word blit must be byte-for-byte the old scalar
+    /// path. The scalar path stays reachable behind `GLYPH_CHUNKED_BLIT` plus
+    /// the test-only override, so the same golden is rendered both ways.
+    #[test]
+    fn chunked_glyph_blit_matches_scalar_frame_hash() {
+        let _guard = GLYPH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (list, size) = text_golden();
+        TEST_BLIT_MODE.store(1, Ordering::Relaxed);
+        let scalar = render(&list, size);
+        TEST_BLIT_MODE.store(2, Ordering::Relaxed);
+        let chunked = render(&list, size);
+        TEST_BLIT_MODE.store(0, Ordering::Relaxed);
+        assert_eq!(
+            frame_hash(&scalar),
+            frame_hash(&chunked),
+            "A/B frame hash diverged between scalar and chunked blit"
+        );
+        assert_eq!(scalar, chunked, "A/B frame bytes diverged");
+    }
+
+    /// `cargo test -p hodo-render --release -- --ignored --nocapture perf_report_glyph_blit`
+    /// Text-heavy LARGE A/B: same corpus, scalar vs chunked, interleaved best of 5.
+    #[test]
+    #[ignore]
+    fn perf_report_glyph_blit() {
+        let _guard = GLYPH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use std::time::Instant;
+        let size = Size {
+            w: 1200.0,
+            h: 800.0,
+        };
+        let page = list(
+            (0..25_000)
+                .map(|i| DisplayItem::Text {
+                    rect: Rect {
+                        x: 4.0,
+                        y: (i / 60) as f32 * 20.0,
+                        w: 120.0,
+                        h: 19.2,
+                    },
+                    text: "The quick brown fox jumps over the lazy dog".into(),
+                    color: Color::rgb((i % 200) as u8, 40, 90),
+                    font_size: 16.0,
+                    weight: 400,
+                    href: None,
+                    underline: false,
+                    line_through: false,
+                })
+                .collect(),
+        );
+        // Warm the atlas first so both arms measure blit, not rasterization.
+        render(&page, size);
+        let mut scalar_ms = f64::MAX;
+        let mut chunked_ms = f64::MAX;
+        for _ in 0..5 {
+            for (mode, best) in [(1u8, &mut scalar_ms), (2u8, &mut chunked_ms)] {
+                TEST_BLIT_MODE.store(mode, Ordering::Relaxed);
+                let start = Instant::now();
+                let frame = render(&page, size);
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                std::hint::black_box(frame);
+                *best = (*best).min(ms);
+            }
+        }
+        TEST_BLIT_MODE.store(0, Ordering::Relaxed);
+        let delta_pct = (scalar_ms - chunked_ms) * 100.0 / scalar_ms;
+        println!(
+            "\n=== rung 1: text-heavy LARGE glyph blit (interleaved best of 5, 1200x800) ===\nscalar:  {scalar_ms:8.3} ms\nchunked: {chunked_ms:8.3} ms  ({delta_pct:+.1}%)"
+        );
+    }
+
+    /// Rung 2 gate: `render_into` already clips to the damage band, so clean
+    /// rows are neither re-rastered nor written. Poison them and prove they
+    /// survive; then prove the damaged band reproduces the full frame hash.
+    #[test]
+    fn damage_path_skips_clean_bands_and_preserves_frame_hash() {
+        let size = Size { w: 200.0, h: 120.0 };
+        let (w, h) = (size.w as i32, size.h as i32);
+        let baseline = list(vec![label(20.0, "alpha"), label(80.0, "beta")]);
+        let mut changed = baseline.clone();
+        if let DisplayItem::Text { text, .. } = &mut changed.items[1] {
+            *text = "gamma".into();
+        }
+        let damage = diff_display_lists(&baseline, &changed, size);
+        let Damage::Rects(rects) = &damage else {
+            panic!("one-node edit must produce rect damage, got {damage:?}");
+        };
+        assert_eq!(rects.len(), 1, "one-node edit must produce one band");
+        let band = IntRect {
+            x: 0,
+            y: rects[0].y,
+            w,
+            h: rects[0].h,
+        };
+        assert!(band.h > 0 && band.h < h, "damage must be a clipped band");
+        let full = IntRect { x: 0, y: 0, w, h };
+        let row_bytes = w as usize * 4;
+        let y0 = band.y.max(0) as usize;
+        let y1 = (band.y + band.h).min(h) as usize;
+
+        // Poison every clean row, then repaint only the damaged band.
+        let mut poisoned = Pixmap::new(w as u32, h as u32).unwrap();
+        render_into(&mut poisoned, &changed, full);
+        for (i, byte) in poisoned.data_mut().iter_mut().enumerate() {
+            if !(y0..y1).contains(&(i / row_bytes)) {
+                *byte = 0x7a;
+            }
+        }
+        render_into(&mut poisoned, &changed, band);
+        for (i, &byte) in poisoned.data().iter().enumerate() {
+            if !(y0..y1).contains(&(i / row_bytes)) {
+                assert_eq!(byte, 0x7a, "clean band row was re-rastered/written");
+            }
+        }
+
+        // A/B invariance: same band path on an unpoisoned pixmap must equal the
+        // full render, byte for byte and by frame hash.
+        let mut band_pixmap = Pixmap::new(w as u32, h as u32).unwrap();
+        render_into(&mut band_pixmap, &changed, full);
+        render_into(&mut band_pixmap, &changed, band);
+        let band_frame = rgba_rows(&band_pixmap, 0, h);
+        let full_frame = render(&changed, size);
+        assert_eq!(frame_hash(&band_frame), frame_hash(&full_frame));
+        assert_eq!(band_frame, full_frame);
+    }
+
+    /// Rung 3 gate: both faces are memoized in `OnceLock` (one parse per
+    /// process, on first glyph use) and lazy parsing keeps frame bytes intact.
+    #[test]
+    fn fonts_are_lazy_memoized_and_frame_hash_stable() {
+        let primary = font().expect("DejaVu font must parse");
+        assert!(std::ptr::eq(
+            primary,
+            font().expect("DejaVu font must parse")
+        ));
+        let fallback = font_cjk().expect("Droid fallback font must parse");
+        assert!(std::ptr::eq(
+            fallback,
+            font_cjk().expect("Droid fallback font must parse")
+        ));
+        let (list, size) = text_golden();
+        let first = render(&list, size);
+        let second = render(&list, size);
+        assert_eq!(frame_hash(&first), frame_hash(&second));
+        assert_eq!(first, second);
+    }
+
+    /// `cargo test -p hodo-render --release -- --ignored --nocapture perf_report_font_parse`
+    /// One-time parse cost that used to sit at startup; `font()`/`font_cjk()`
+    /// now pay it at first glyph use only. The first text frame additionally
+    /// rasterizes its unique glyphs; every later frame reuses the atlas.
+    #[test]
+    #[ignore]
+    fn perf_report_font_parse() {
+        use std::time::Instant;
+        let measure = |bytes: &'static [u8]| -> f64 {
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let start = Instant::now();
+                let parsed = Font::from_bytes(bytes, FontSettings::default());
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                assert!(parsed.is_ok(), "vendored font must parse");
+                std::hint::black_box(parsed.ok());
+                best = best.min(ms);
+            }
+            best
+        };
+        let dejavu_ms = measure(include_bytes!("../../../assets/fonts/DejaVuSans.ttf"));
+        let droid_ms = measure(include_bytes!(
+            "../../../assets/fonts/DroidSansFallback.ttf"
+        ));
+        println!(
+            "\n=== rung 3: one-time font parse deferred off startup (best of 3) ===\nDejaVu: {dejavu_ms:7.3} ms\nDroid:  {droid_ms:7.3} ms\nstartup deferred: {:.3} ms (sum)",
+            dejavu_ms + droid_ms
+        );
+
+        let (list, size) = text_golden();
+        {
+            let mut atlas = glyph_atlas().write().unwrap_or_else(|e| e.into_inner());
+            atlas.map.clear();
+            atlas.bytes = 0;
+        }
+        let start = Instant::now();
+        let first = render(&list, size);
+        let first_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let start = Instant::now();
+        let second = render(&list, size);
+        let second_ms = start.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(frame_hash(&first), frame_hash(&second));
+        println!(
+            "first text frame (cold atlas): {first_ms:7.3} ms; second (warm): {second_ms:7.3} ms"
+        );
+    }
+
     #[test]
     fn repeated_full_repaint_into_same_pixmap_matches_fresh_render() {
         let size = Size { w: 100.0, h: 100.0 };
@@ -2225,6 +2791,7 @@ mod tests {
     /// same metrics, same mask, same AA pixels.
     #[test]
     fn glyph_atlas_matches_fresh_rasterization_byte_for_byte() {
+        let _guard = GLYPH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let size = Size { w: 220.0, h: 80.0 };
         let list = list(vec![label(30.0, "The quick brown fox 0123 Ajg")]);
         let cached = render(&list, size);
@@ -2237,6 +2804,103 @@ mod tests {
         assert_eq!(
             cached, fresh,
             "atlas coverage must equal fresh fontdue rasterization"
+        );
+    }
+
+    /// Prove the fallback branch is live before relying on it for coverage.
+    #[test]
+    fn cjk_fallback_branch_is_live() {
+        let dejavu = font().expect("DejaVu font must parse");
+        let droid = font_cjk().expect("Droid fallback font must parse");
+        assert!(
+            !dejavu.has_glyph('日'),
+            "DejaVu must lack 日 for the fallback branch to be exercised"
+        );
+        assert!(droid.has_glyph('日'), "Droid fallback must cover 日");
+    }
+
+    #[test]
+    fn mixed_latin_cjk_text_rasterizes_both_faces() {
+        let _guard = GLYPH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // A font size no other test uses keeps these atlas keys unambiguous.
+        let font_size: f32 = 37.0;
+        let size_bits = font_size.to_bits();
+        let list = list(vec![DisplayItem::Text {
+            rect: Rect {
+                x: 4.0,
+                y: 4.0,
+                w: 320.0,
+                h: 1.2 * font_size,
+            },
+            text: "Hi 日本語".into(),
+            color: Color::BLACK,
+            font_size,
+            weight: 400,
+            href: None,
+            underline: false,
+            line_through: false,
+        }]);
+        let before = glyph_atlas_stats();
+        let buf = render(&list, Size { w: 400.0, h: 80.0 });
+        let after = glyph_atlas_stats();
+
+        assert!(
+            buf.len() == 400 * 80 * 4,
+            "mixed line must render a full frame"
+        );
+        assert!(
+            after.misses > before.misses,
+            "rendering must rasterize new glyphs (atlas misses must grow)"
+        );
+        assert!(after.bytes > 0, "atlas occupancy must grow");
+
+        let atlas = glyph_atlas().read().unwrap_or_else(|e| e.into_inner());
+        let entries = |face: bool| {
+            atlas
+                .map
+                .iter()
+                .filter(move |(key, _)| key.size_bits == size_bits && key.cjk == face)
+        };
+        assert!(entries(false).count() >= 2, "Latin must use DejaVu entries");
+        assert!(entries(true).count() >= 3, "日本語 must use Droid entries");
+        for face in [false, true] {
+            assert!(
+                entries(face).any(|(_, bitmap)| bitmap.coverage.iter().any(|&v| v > 0)),
+                "face {face} must rasterize non-zero coverage (no golden pixel diff)"
+            );
+        }
+    }
+
+    #[test]
+    fn glyph_atlas_enforces_byte_cap_under_flood() {
+        let _guard = GLYPH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let primary = font().expect("DejaVu font must parse");
+        let before = glyph_atlas_stats();
+        // 128px glyphs are a few KiB each; this flood far overflows 1 MiB.
+        // Each insert evicts back under the cap, so check counts, not `bytes > cap`.
+        for cp in 0x4E00u32..0x4E00 + 8_000 {
+            let Some(ch) = char::from_u32(cp) else {
+                continue;
+            };
+            glyph_cached(primary, ch, 128.0);
+        }
+        let stats = glyph_atlas_stats();
+        let rasterized = stats.misses - before.misses;
+        assert!(
+            rasterized >= 1_000,
+            "flood must rasterize many unique glyphs"
+        );
+        assert!(
+            stats.bytes > 0 && stats.bytes <= stats.capacity,
+            "LRU must enforce the cap: {} > {} B",
+            stats.bytes,
+            stats.capacity
+        );
+        assert!(
+            (stats.entries as u64) < rasterized,
+            "eviction must have dropped older entries ({} entries < {} rasterized)",
+            stats.entries,
+            rasterized
         );
     }
 
@@ -2281,7 +2945,7 @@ mod tests {
     // ---- M5.x image pipeline: cache / downscale / warmup --------------------
 
     #[test]
-    fn image_cache_hit_miss_and_mtime_invalidation() {
+    fn image_cache_hit_miss_and_rewrite_invalidation() {
         let _guard = IMAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = temp_dir();
         let path = dir.join("cache.png");
@@ -2316,26 +2980,211 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(pixel(&first, 3, 3, 16), c0);
 
-        // Same path, new bytes and a strictly newer mtime -> new cache key.
-        let mtime0 = image_mtime_ns(&path_str);
-        let mut changed = false;
-        for _ in 0..10 {
-            write_png(&path, 2, 2, &[c1; 4]);
-            if image_mtime_ns(&path_str) != mtime0 {
-                changed = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(changed, "filesystem mtime must advance after rewrite");
+        // Same path, new bytes with a DIFFERENT FILE SIZE -> new cache key even
+        // when the filesystem mtime is too coarse to advance. This is the
+        // signal the old (mtime-only) key missed.
+        let old_len = image_file_sig(&path_str).unwrap().1;
+        write_png(&path, 3, 3, &[c1; 9]);
+        let new_len = image_file_sig(&path_str).unwrap().1;
+        assert_ne!(old_len, new_len, "rewrite must change the file size");
         let third = render(&list, size);
         assert_eq!(
             image_cache_stats().decodes,
             base + 2,
-            "mtime change must force a re-decode"
+            "size change must force a re-decode"
         );
         assert_eq!(pixel(&third, 3, 3, 16), c1);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn file_url_and_plain_path_share_one_image_cache_entry() {
+        let _guard = IMAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir();
+        let path = dir.join("sig.png");
+        write_png(&path, 2, 2, &[[12, 34, 56, 255]; 4]);
+        let plain = path.to_string_lossy().replace('\\', "/");
+        // Windows: `file:///C:/...` leaves a leading slash after the prefix.
+        // Unix: the absolute path already starts with '/'.
+        let file_url = if plain.starts_with('/') {
+            format!("file://{plain}")
+        } else {
+            format!("file:///{plain}")
+        };
+        assert_eq!(image_local_path(&file_url), plain);
+        assert_eq!(image_file_sig(&file_url), image_file_sig(&plain));
+        assert!(image_file_sig(&file_url).is_some());
+
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 8.0,
+            h: 8.0,
+        };
+        assert!(
+            image_key(&file_url, &rect) == image_key(&plain, &rect),
+            "the file:// URL and plain path must produce one cache key"
+        );
+
+        // Store under one spelling, hit with the other.
+        image_cache_put(
+            image_key(&plain, &rect),
+            Arc::new(ScaledImage {
+                w: 2,
+                h: 2,
+                rgba: vec![0; 16],
+                last_used: AtomicU64::new(0),
+            }),
+        );
+        assert!(image_cache_get(&image_key(&file_url, &rect)).is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn non_file_image_sources_bypass_the_decode_cache() {
+        let _guard = IMAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 8.0,
+            h: 8.0,
+        };
+        let remote = image_key("https://example.test/a.png", &rect);
+        let data = image_key("data:image/png;base64,AAAA", &rect);
+        assert!(
+            remote.file_sig.is_none(),
+            "http URLs have no content signal"
+        );
+        assert!(data.file_sig.is_none(), "data URLs have no content signal");
+
+        let dir = temp_dir();
+        let path = dir.join("local.png");
+        write_png(&path, 2, 2, &[[9, 8, 7, 255]; 4]);
+        let local = image_key(&path.to_string_lossy(), &rect);
+        let (mtime, len) = local.file_sig.expect("local file has a signature");
+        assert!(mtime > 0, "local file carries an mtime");
+        assert_eq!(len, std::fs::metadata(&path).unwrap().len(), "and a size");
+        // A file:// URL resolves to the same local bytes and is cacheable.
+        let file_url = image_key(&format!("file://{}", path.to_string_lossy()), &rect);
+        assert_eq!(
+            file_url.file_sig, local.file_sig,
+            "file:// keys like a file"
+        );
+
+        let fake = Arc::new(ScaledImage {
+            w: 1,
+            h: 1,
+            rgba: vec![1, 2, 3, 4],
+            last_used: AtomicU64::new(1),
+        });
+        // Stores under URL keys are refused; lookups always miss.
+        image_cache_put(remote.clone(), Arc::clone(&fake));
+        assert!(
+            image_cache_get(&remote).is_none(),
+            "http source must never be cached"
+        );
+        image_cache_put(data.clone(), Arc::clone(&fake));
+        assert!(
+            image_cache_get(&data).is_none(),
+            "data source must never be cached"
+        );
+        // The local key does cache.
+        image_cache_put(local.clone(), Arc::clone(&fake));
+        assert!(image_cache_get(&local).is_some(), "local file must cache");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn decode_gate_caps_concurrent_scratch_and_reports_peak() {
+        let _guard = IMAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir();
+        let mut sources = Vec::new();
+        for i in 0..4 {
+            let path = dir.join(format!("gate{i}.png"));
+            let pixels: Vec<[u8; 4]> = vec![[10 + i, 20, 30, 255]; 1024 * 1024];
+            write_png(&path, 1024, 1024, &pixels);
+            let rect = Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 16.0,
+                h: 16.0,
+            };
+            let path_str = path.to_string_lossy().into_owned();
+            let key = image_key(&path_str, &rect);
+            sources.push((path_str, key));
+        }
+
+        // Barrier releases all four decodes at once; the gate must admit only
+        // MAX_CONCURRENT_DECODES of them and queue the rest.
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for (path, key) in &sources {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    let _ = load_scaled_image(path, key);
+                });
+            }
+        });
+
+        let stats = image_cache_stats();
+        assert_eq!(
+            stats.peak_in_flight, MAX_CONCURRENT_DECODES,
+            "in-flight decodes must cap at {}",
+            MAX_CONCURRENT_DECODES
+        );
+        assert!(
+            decode_scratch_peak() >= 1024 * 1024 * 4,
+            "full-res rgba scratch must be reported"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hot_latin_glyph_path_skips_cmap_lookup() {
+        let _guard = GLYPH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let font = font().expect("DejaVu font must parse");
+        let font_size: f32 = 43.0; // a size no other test uses
+        let ch = 'Q';
+        {
+            let mut atlas = glyph_atlas().write().unwrap_or_else(|e| e.into_inner());
+            for cjk in [false, true] {
+                atlas.map.remove(&GlyphKey {
+                    size_bits: font_size.to_bits(),
+                    ch,
+                    cjk,
+                });
+            }
+        }
+        TEST_HAS_GLYPH_PROBES.with(|c| c.set(0));
+        let _ = glyph_cached(font, ch, font_size);
+        assert_eq!(
+            TEST_HAS_GLYPH_PROBES.with(|c| c.get()),
+            1,
+            "a cold Latin glyph pays exactly one cmap lookup"
+        );
+
+        TEST_HAS_GLYPH_PROBES.with(|c| c.set(0));
+        for _ in 0..1000 {
+            let _ = glyph_cached(font, ch, font_size);
+        }
+        assert_eq!(
+            TEST_HAS_GLYPH_PROBES.with(|c| c.get()),
+            0,
+            "1000 hot Latin lookups must do zero cmap lookups"
+        );
+
+        // The global counter must also see probes made on a worker thread;
+        // a thread-local mirror would silently miss band workers.
+        let before_worker = glyph_atlas_stats().has_glyph_probes;
+        let worker = std::thread::spawn(move || {
+            let _ = glyph_cached(font, 'Z', 43.5);
+        });
+        worker.join().unwrap();
+        assert!(
+            glyph_atlas_stats().has_glyph_probes > before_worker,
+            "a cmap lookup on a worker thread must be counted globally"
+        );
     }
 
     #[test]
@@ -2400,7 +3249,7 @@ mod tests {
             cache.insert(
                 ImageKey {
                     path: format!("img{i}.png"),
-                    mtime_ns: 0,
+                    file_sig: None,
                     target_w: 1,
                     target_h: 1,
                 },
@@ -2422,7 +3271,7 @@ mod tests {
             cache.insert(
                 ImageKey {
                     path: format!("big{i}.png"),
-                    mtime_ns: 0,
+                    file_sig: None,
                     target_w: 1024,
                     target_h: 256,
                 },

@@ -70,7 +70,7 @@ fn is_row_group(ctx: &Ctx<'_>, id: NodeId) -> bool {
 
 fn visible_children(ctx: &Ctx<'_>, id: NodeId) -> Vec<NodeId> {
     ctx.dom
-        .children(id)
+        .render_children(id)
         .iter()
         .copied()
         .filter(|&c| {

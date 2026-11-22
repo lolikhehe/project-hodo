@@ -1,0 +1,1 @@
+function e(e){return e.slice(e.lastIndexOf(`/`)+1)}export{e as t};

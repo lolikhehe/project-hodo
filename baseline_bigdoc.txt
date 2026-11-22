@@ -1,12 +1,21 @@
 # Pinned LARGE-stage baselines (milliseconds) for the hodo-perf M5.3 gate.
-# Re-calibrated 2026-11-22 on the quiet wave-2 tree with `cargo run --release -p hodo-perf -- --big-doc`
-# (best of 3 runs, viewport 1200x800), over four calibration runs. Pins are the
-# slowest observed quiet-tree value per stage plus ~1% headroom, so the built-in
-# 1.10x gate tolerates normal run-to-run scheduling noise without going stale.
-# LARGE layout improved from ~62.8 ms (old pin) to ~35-42 ms on this tree.
+# Re-calibrated 2026-11-22 on the quiet wave-6 tree with
+# `cargo run --release -p hodo-perf -- --big-doc` (best of 3 runs, viewport 1200x800).
+#
+# Style-matching A/B pair, LARGE full-path best run (parse -> style -> layout -> render):
+#   indexed            : styles 5.498 ms, layout 38.316 ms, render 6.406 ms, total 50.22 ms
+#   brute (HODO_NO_RULE_INDEX=1): styles 20.215 ms, layout 36.540 ms, render 6.526 ms, total 63.28 ms
+#   rule index speedup on styles: ~3.7x. Yesterday's composite full-pipeline pin was 68 ms;
+#   today's indexed composite is 50.22 ms (~26% faster).
+#
+# The four functional pins below are set to the SLOWER (brute) observed delta plus
+# ~5% headroom, so the built-in 1.10x gate passes in BOTH style modes. The indexed
+# deltas are far inside the same pins.
+#   indexed deltas : restyle 5.091/37.019 ms, append 5.316/38.632 ms
+#   brute deltas   : restyle 20.957/36.436 ms, append 23.715/36.546 ms
 # Set HODO_PERF_NO_GATE=1 on machines more than 10x slower than the reference
 # (e.g. constrained CI runners) to print the numbers without failing the gate.
-restyle_styles_ms = 23.0
-restyle_layout_ms = 42.6
-append_styles_ms = 25.7
-append_layout_ms = 36.2
+restyle_styles_ms = 22.0
+restyle_layout_ms = 38.5
+append_styles_ms = 25.0
+append_layout_ms = 40.5

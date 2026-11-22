@@ -532,12 +532,14 @@ pub fn should_block_record(
         return BlockDecision::Allow;
     }
     let decision = guard.list.should_block(url, top_site, is_third_party);
-    if record
-        && matches!(
-            decision,
-            BlockDecision::Block { .. } | BlockDecision::Warn { .. }
-        )
-    {
+    record_block(&decision, url, record, &mut guard);
+    decision
+}
+
+/// Only a real `Block` moves the blocked counters and URL ring. `Warn` is an
+/// advisory hit counted separately by the caller's warning tracker.
+fn record_block(decision: &BlockDecision, url: &str, record: bool, guard: &mut Global) {
+    if record && matches!(decision, BlockDecision::Block { .. }) {
         BLOCKED_COUNT.fetch_add(1, Ordering::Relaxed);
         BLOCKED_BYTES.fetch_add(url.len() as u64, Ordering::Relaxed);
         if guard.blocked_urls.len() == BLOCKED_SAMPLE_LEN {
@@ -545,7 +547,6 @@ pub fn should_block_record(
         }
         guard.blocked_urls.push_back(url.to_string());
     }
-    decision
 }
 
 /// Runtime disable path for about:hodo/settings (also `HODO_NO_ADBLOCK=1`).
@@ -946,5 +947,35 @@ mod tests {
                 rule: "||warn.test^".into()
             }
         );
+    }
+
+    #[test]
+    fn warn_decision_does_not_touch_block_counters() {
+        let _guard = COUNTER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let url = "https://warn-only.test/ad";
+        let before = blocked_count();
+        let bytes_before = blocked_bytes();
+        let ring_before = blocked_urls();
+
+        let mut g = global().lock().unwrap_or_else(|e| e.into_inner());
+        let warn = BlockDecision::Warn {
+            rule: "||warn-only.test^".into(),
+        };
+        record_block(&warn, url, true, &mut g);
+        drop(g);
+
+        assert_eq!(blocked_count(), before);
+        assert_eq!(blocked_bytes(), bytes_before);
+        assert_eq!(blocked_urls(), ring_before);
+
+        // A real Block still moves all three, so the split is meaningful.
+        let mut g = global().lock().unwrap_or_else(|e| e.into_inner());
+        let block = BlockDecision::Block {
+            rule: "||warn-only.test^".into(),
+        };
+        record_block(&block, url, true, &mut g);
+        drop(g);
+        assert_eq!(blocked_count(), before + 1);
+        assert_eq!(blocked_bytes(), bytes_before + url.len() as u64);
     }
 }

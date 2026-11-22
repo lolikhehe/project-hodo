@@ -1,0 +1,1 @@
+import{p as e}from"./index-NFRVgqV2.js";function t(t){return new Intl.NumberFormat(e()).format(t)}export{t};

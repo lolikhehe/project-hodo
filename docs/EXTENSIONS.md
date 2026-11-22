@@ -19,6 +19,15 @@ either dialect so authors do not have to fork an extension per engine.
 >
 > The contracts below describe what the crates actually do; each wave fact is
 > tagged with the commit that landed it. See `ROADMAP.md` for milestone scope.
+>
+> **Truth-sync round 2 (current uncommitted tree, NOT a commit):** only the i18n
+> fixture below changed in this zone — `ru` messages were added to
+> `extensions/i18n-gecko/_locales/ru/messages.json:1-8` and are resolved by the
+> new test at `crates/hodo-ext-i18n/src/lib.rs:640-654`. No new extension API
+> namespace, permission or manifest field landed in this arc (the large uncommitted
+> work is page-JS/shell/render). The claimed ext P1×3 bug-cycle fixes have no
+> ledger or matching code read in these crates, so they are **not audited** and
+> nothing below was flipped for them.
 
 Crates involved:
 
@@ -251,6 +260,11 @@ message text supports `$name$` / `$1`–`$9` placeholders and `@@extension_id`,
 `@@ui_locale`, `@@bidi_*` predefines in a single non-recursive pass. Parsing
 keeps the raw token in `name` and stores the resolved value in `resolved_name`.
 CSS/HTML are not localized, and every locale currently gets LTR bidi values.
+Round 2 adds a real `ru` fixture: `extensions/i18n-gecko/_locales/ru/messages.json:1-8`
+(`appName` = "Демо i18n", `appDesc` = "Демо-расширение i18n в стиле Gecko для браузера hodo");
+`crates/hodo-ext-i18n/src/lib.rs:640-654` loads and resolves both `en` and `ru`
+from `extensions/i18n-gecko/`. This is still extension-message i18n, not a
+browser-chrome locale bundle.
 
 ## MV3 idle lifecycle and state persistence (`d63a90c`)
 
@@ -277,7 +291,7 @@ repo's `extensions/` folder. Ten examples ship with hodo:
 - `notify-chrome/` — MV3 notifications with the `notifications` permission.
 - `messages-gecko/` — MV2 `runtime.onMessage` style messaging.
 - `popup-chrome/` — MV3 `popup.html` with real 16/48px PNG icons.
-- `i18n-gecko/` — MV2 `_locales/en/messages.json` with `__MSG__` tokens (now resolved by `4aec263`).
+- `i18n-gecko/` — MV2 `_locales/{en,ru}/messages.json` with `__MSG__` tokens (en resolved by `4aec263`; `ru` fixture added in round 2 — `extensions/i18n-gecko/_locales/ru/messages.json:1-8`).
 - `async-chrome/` — MV3 service worker mixing `await chrome.storage.*` with MV2 callbacks and `chrome.alarms.onAlarm` (`d63a90c`).
 - `promises-gecko/` — MV2 `browser.*` Promise chains, async `onMessage` reply and a `runtime.connect` `Port` (`d63a90c`).
 
@@ -296,3 +310,6 @@ evaluates the extension's `bg.js` / service worker in a per-extension runtime;
 - Out-of-process sandboxing of the extension host is a later milestone (**M3**).
 - **Full CSP enforcement for arbitrary extension pages** — only manifest CSP
   validation and script-level `eval` blocking have landed (`d63a90c`).
+- **Claimed ext P1×3 bug-cycle fixes** — not audited in round 2: no bug ledger
+  and no matching change in `crates/hodo-ext-*` were found, so no "fixed" claim
+  is made here. Under-claiming is intentional; re-check when a ledger exists.

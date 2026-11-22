@@ -15,6 +15,14 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 const MAX_COOKIE_BYTES: usize = 4096;
 const MAX_PER_PARTITION: usize = 180;
+/// Partition keys include an attacker-influenced top site, so the number of
+/// buckets needs its own cap. LRU eviction keeps the buckets actually in use.
+const MAX_PARTITIONS: usize = 64;
+/// Honest RAM ceiling: 64 partitions x 180 cookies = 11,520 cookies. At the
+/// 4 KiB per-cookie name+value ceiling that is ~45 MiB of payload (~50 MiB
+/// with per-cookie struct overhead); real cookies are far smaller, so typical
+/// use is a few MiB. Bounded by MAX_PARTITIONS and MAX_PER_PARTITION.
+const MAX_TOTAL_COOKIES: usize = MAX_PARTITIONS * MAX_PER_PARTITION;
 /// RFC 6265bis §5.6: user agents should limit cookies to ~400 days.
 const MAX_LIFETIME_SECS: u64 = 400 * 24 * 60 * 60;
 
@@ -48,11 +56,33 @@ struct Cookie {
 pub struct CookieJar {
     /// `partition` -> cookies in insertion order (FIFO eviction).
     partitions: HashMap<String, Vec<Cookie>>,
+    /// Monotonic access ticks used for LRU partition eviction.
+    last_access: HashMap<String, u64>,
+    tick: u64,
 }
 
 impl CookieJar {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record an access so the partition is not the next LRU victim. Ticks,
+    /// not the caller's `now`, make LRU deterministic even when `now` is fixed.
+    fn touch(&mut self, partition: &str) {
+        self.tick = self.tick.wrapping_add(1);
+        self.last_access.insert(partition.to_string(), self.tick);
+    }
+
+    fn evict_lru_partition(&mut self) {
+        let victim = self
+            .last_access
+            .iter()
+            .min_by_key(|(_, stamp)| **stamp)
+            .map(|(name, _)| name.clone());
+        if let Some(victim) = victim {
+            self.partitions.remove(&victim);
+            self.last_access.remove(&victim);
+        }
     }
 
     /// Parse one `Set-Cookie` value and store it. Invalid or over-limit cookies
@@ -164,14 +194,22 @@ impl CookieJar {
             partitioned,
         };
 
-        let jar = self.partitions.entry(partition.to_string()).or_default();
-        // RFC 6265 §5.3: a new cookie with the same identity replaces the old,
-        // keeping its FIFO position. An expired cookie deletes that same
-        // identity (logout via Max-Age=0 / past Expires) before the early exit.
+        // RFC 6265 §5.3: an expired cookie deletes the same identity (logout
+        // via Max-Age=0 / past Expires) and must not create a partition.
         if expired {
-            jar.retain(|c| !same_identity(c, &cookie));
+            if let Some(jar) = self.partitions.get_mut(partition) {
+                jar.retain(|c| !same_identity(c, &cookie));
+            }
             return;
         }
+        // A brand-new partition at the cap evicts the least recently used one.
+        if !self.partitions.contains_key(partition) && self.partitions.len() >= MAX_PARTITIONS {
+            self.evict_lru_partition();
+        }
+        self.touch(partition);
+        let jar = self.partitions.entry(partition.to_string()).or_default();
+        // A new cookie with the same identity replaces the old, keeping its
+        // FIFO position.
         if let Some(pos) = jar.iter().position(|c| same_identity(c, &cookie)) {
             jar[pos] = cookie;
         } else {
@@ -180,6 +218,7 @@ impl CookieJar {
             }
             jar.push(cookie);
         }
+        debug_assert!(self.len() <= MAX_TOTAL_COOKIES);
     }
 
     /// Build a `Cookie:` header value for `url`. Empty string means no cookies.
@@ -193,13 +232,21 @@ impl CookieJar {
         now: u64,
     ) -> String {
         let (scheme, host, uri_path) = split_url(url);
-        let Some(jar) = self.partitions.get_mut(partition) else {
+        if !self.partitions.contains_key(partition) {
             return String::new();
-        };
+        }
+        // A read is an access: keep this partition alive in the LRU.
+        self.touch(partition);
+        let jar = self
+            .partitions
+            .get_mut(partition)
+            .expect("partition checked above");
         jar.retain(|c| c.expires_at.is_none_or(|exp| exp > now));
 
-        let site = registrable(&host);
-        let same_site = top_site.is_empty() || top_site.eq_ignore_ascii_case(site);
+        // Same canonicalization as `partition_key`: empty top_site means the
+        // request site itself, non-empty is reduced to its registrable domain.
+        let (site, top) = canonical_site_top(&host, top_site);
+        let same_site = top.eq_ignore_ascii_case(&site);
         let scheme = scheme.as_str();
 
         let mut pair = String::new();
@@ -234,6 +281,7 @@ impl CookieJar {
     /// Drop every cookie in `partition`, leaving other partitions untouched.
     pub fn clear_partition(&mut self, partition: &str) {
         self.partitions.remove(partition);
+        self.last_access.remove(partition);
     }
 
     /// Total cookies across all partitions.
@@ -355,22 +403,39 @@ fn path_matches(cookie_path: &str, request_path: &str) -> bool {
     cookie_path.ends_with('/') || request_path.as_bytes().get(cookie_path.len()) == Some(&b'/')
 }
 
-/// No PSL: last two labels, or the whole literal for an IP host.
-fn registrable(host: &str) -> &str {
+/// No PSL: last two labels, or the whole literal for an IP host. Empty labels
+/// (e.g. the trailing dot of `example.com.`) are ignored, matching the
+/// registrable used by the hodo-net privacy layer.
+fn registrable(host: &str) -> String {
     if is_ip_host(host) {
-        return host;
+        return host.to_string();
     }
-    let mut parts = host.rsplitn(3, '.');
-    let last = parts.next().unwrap_or(host);
-    match parts.next() {
-        Some(second) => {
-            // A single-label host has no second label; rsplitn gives the host
-            // itself in `last` and nothing else.
-            let len = second.len() + 1 + last.len();
-            &host[host.len() - len..]
-        }
-        None => last,
+    let labels: Vec<&str> = host.split('.').filter(|s| !s.is_empty()).collect();
+    if labels.len() <= 2 {
+        host.to_string()
+    } else {
+        format!("{}.{}", labels[labels.len() - 2], labels[labels.len() - 1])
     }
+}
+
+/// Canonical `(request site, top site)` pair. An empty `top_site` (top-level
+/// navigation) collapses to the request site; a non-empty one is reduced to its
+/// registrable domain so a subdomain spelling and the bare site share a bucket.
+fn canonical_site_top(host: &str, top_site: &str) -> (String, String) {
+    let site = registrable(host);
+    let top = if top_site.is_empty() {
+        site.clone()
+    } else {
+        registrable(top_site)
+    };
+    (site, top)
+}
+
+/// The double-key partition for a request. Shared with hodo-net's privacy layer
+/// so the key used to store a cookie is identical to the one used to read it.
+pub fn partition_key(scheme: &str, host: &str, top_site: &str) -> String {
+    let (site, top) = canonical_site_top(host, top_site);
+    format!("{}|{}|{}", scheme, site, top)
 }
 
 fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
@@ -663,5 +728,133 @@ mod tests {
             "",
             "Expires must honour the same 400-day cap as Max-Age"
         );
+    }
+
+    #[test]
+    fn registrable_ignores_trailing_dot() {
+        // Matches hodo-net's label-filtering registrable: no `com.` truncation.
+        assert_eq!(registrable("example.com."), "example.com.");
+        assert_eq!(registrable("sub.www.example.com."), "example.com");
+        assert_eq!(registrable("example.com"), "example.com");
+        assert_eq!(registrable("127.0.0.1"), "127.0.0.1");
+
+        let mut jar = jar_with("t=1", "https://example.com./", "p");
+        assert_eq!(
+            jar.cookie_header("https://example.com./", "p", "", NOW),
+            "t=1"
+        );
+        assert_eq!(
+            jar.cookie_header("https://example.com./", "p", "example.com.", NOW),
+            "t=1"
+        );
+    }
+
+    #[test]
+    fn empty_top_site_is_canonicalized_to_the_request_site() {
+        let mut jar = jar_with("nav=1; SameSite=Lax", "https://site.test/", "p");
+        // Top-level navigation (empty top_site) and a same-site subresource
+        // (explicit site, or a hostname on the same site) all see the cookie.
+        assert_eq!(
+            jar.cookie_header("https://site.test/", "p", "", NOW),
+            "nav=1"
+        );
+        assert_eq!(
+            jar.cookie_header("https://site.test/", "p", "site.test", NOW),
+            "nav=1"
+        );
+        assert_eq!(
+            jar.cookie_header("https://site.test/", "p", "www.site.test", NOW),
+            "nav=1"
+        );
+        // A different top site keeps cross-site cookies out.
+        assert_eq!(
+            jar.cookie_header("https://site.test/", "p", "other.test", NOW),
+            ""
+        );
+    }
+
+    #[test]
+    fn partition_key_canonicalizes_top_site_for_store_and_read() {
+        // Direct navigation (empty top_site) and the same host loaded under a
+        // 3-label top site must land in one partition.
+        let nav = partition_key("https", "site.test", "");
+        let sub = partition_key("https", "site.test", "www.site.test");
+        assert_eq!(nav, sub);
+        assert_eq!(nav, "https|site.test|site.test");
+
+        let mut jar = CookieJar::new();
+        jar.store(
+            "nav=1; SameSite=None; Secure",
+            "https://site.test/",
+            &nav,
+            NOW,
+        );
+        assert_eq!(
+            jar.cookie_header("https://site.test/page", &sub, "www.site.test", NOW),
+            "nav=1",
+            "a cookie stored on nav must replay under a multi-label top site"
+        );
+
+        // 4-label host, both directions: canonicalize host and top site.
+        let nav4 = partition_key("https", "a.b.site.test", "");
+        let sub4 = partition_key("https", "a.b.site.test", "c.d.site.test");
+        assert_eq!(nav4, sub4);
+        assert_eq!(nav4, "https|site.test|site.test");
+        let mut jar4 = CookieJar::new();
+        jar4.store(
+            "four=1; SameSite=None; Secure",
+            "https://a.b.site.test/",
+            &nav4,
+            NOW,
+        );
+        assert_eq!(
+            jar4.cookie_header("https://a.b.site.test/p", &sub4, "c.d.site.test", NOW),
+            "four=1"
+        );
+        assert_eq!(
+            partition_key("https", "www.site.test", "a.b.site.test"),
+            "https|site.test|site.test"
+        );
+    }
+
+    #[test]
+    fn partition_cap_is_enforced_and_lru_evicts_oldest_access() {
+        let mut jar = CookieJar::new();
+        for i in 0..MAX_PARTITIONS {
+            jar.store(
+                &format!("c{i}={i}"),
+                "https://example.com/",
+                &format!("p{i}"),
+                NOW,
+            );
+        }
+        assert_eq!(jar.partitions.len(), MAX_PARTITIONS);
+        assert_eq!(jar.len(), MAX_PARTITIONS);
+        assert!(jar.len() <= MAX_TOTAL_COOKIES);
+
+        // Refresh p0 via a read and p1 via a write; p2 is now the oldest.
+        assert_eq!(
+            jar.cookie_header("https://example.com/", "p0", "", NOW),
+            "c0=0"
+        );
+        jar.store("c1b=1b", "https://example.com/", "p1", NOW);
+
+        jar.store("new=1", "https://example.com/", "new", NOW);
+        assert_eq!(jar.partitions.len(), MAX_PARTITIONS);
+        assert_eq!(
+            jar.partition_len("p2"),
+            0,
+            "oldest-touched partition must be evicted first"
+        );
+        assert!(
+            jar.partition_len("p0") > 0,
+            "recently read partition survives"
+        );
+        assert!(
+            jar.partition_len("p1") > 0,
+            "recently written partition survives"
+        );
+        assert!(jar.partition_len("new") > 0);
+        assert!(jar.len() <= MAX_TOTAL_COOKIES);
     }
 }

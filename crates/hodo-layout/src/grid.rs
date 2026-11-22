@@ -91,14 +91,14 @@ fn metric_w(ctx: &Ctx<'_>, id: NodeId, fallback: &ComputedStyle) -> f32 {
             inset
                 + ctx
                     .dom
-                    .children(id)
+                    .render_children(id)
                     .iter()
                     .map(|&c| metric_w(ctx, c, st))
                     .fold(0.0_f32, f32::max)
         }
         NodeKind::Document => ctx
             .dom
-            .children(id)
+            .render_children(id)
             .iter()
             .map(|&c| metric_w(ctx, c, st))
             .sum(),
@@ -130,7 +130,7 @@ fn metric_h(ctx: &Ctx<'_>, id: NodeId, fallback: &ComputedStyle) -> f32 {
             }
             let child: f32 = ctx
                 .dom
-                .children(id)
+                .render_children(id)
                 .iter()
                 .map(|&c| metric_h(ctx, c, st))
                 .sum();
@@ -138,7 +138,7 @@ fn metric_h(ctx: &Ctx<'_>, id: NodeId, fallback: &ComputedStyle) -> f32 {
         }
         NodeKind::Document => ctx
             .dom
-            .children(id)
+            .render_children(id)
             .iter()
             .map(|&c| metric_h(ctx, c, st))
             .sum(),
@@ -321,7 +321,7 @@ pub(crate) fn layout_grid(
     let fallback = fallback_style();
     let items: Vec<NodeId> = ctx
         .dom
-        .children(id)
+        .render_children(id)
         .iter()
         .copied()
         .filter(|&c| {
@@ -447,7 +447,16 @@ pub(crate) fn layout_grid(
             // A bare text child is an anonymous grid item: feed it directly.
             let mut flow = Flow::new(avail.x, avail.x + avail.width, avail.y);
             let owner = ctx.dom.parent(child).unwrap_or(id);
-            feed_text(&mut flow, ctx.list, t, &child_style, child_link, &[], owner);
+            feed_text(
+                &mut flow,
+                ctx.list,
+                t,
+                &child_style,
+                child_link,
+                &[],
+                owner,
+                ctx.cache,
+            );
             flush_line(&mut flow, ctx.list);
         } else {
             dispatch_child(ctx, &child_style, child, avail, child_link);

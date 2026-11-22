@@ -75,6 +75,9 @@ const FINGERPRINT_ATTRS: &[&str] = &[
     "height",
     "colspan",
     "rowspan",
+    // Comment mutations live in this attribute (`#comment` elements); include
+    // it so the popup overlay repaints when Lit rewrites a marker comment.
+    "data",
 ];
 
 /// One toolbar action, captured at startup from the extension manifest.

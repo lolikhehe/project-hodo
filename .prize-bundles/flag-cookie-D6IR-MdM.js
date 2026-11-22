@@ -1,0 +1,1 @@
+import{i as e,n as t,r as n}from"./vendor-shared-62wh2Xkx.js";function r(e){return!!t(`hide_flag_${e}`)}function i(t,r){let i=`hide_flag_${t}`;r?e(i,`1`,{expires:180,path:`/`}):n(i)}export{i as n,r as t};

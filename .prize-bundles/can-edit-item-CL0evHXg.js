@@ -1,0 +1,1 @@
+import{g as e}from"./collapsible-metadata-list-BxO-lCT_.js";function t(t,n){return t?n?.part_of?.some(n=>e(t.privs,n))??!1:!1}function n(e,t){let n=t?.uploader_details?.useritem,r=e?.itemname;return!n||!r?!1:n.replace(/^@/,``).toLowerCase()===r.replace(/^@/,``).toLowerCase()}function r(r,i){return r?n(r,i)||e(r.privs,`/items`)||t(r,i):!1}export{t as n,r as t};

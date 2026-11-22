@@ -15,6 +15,7 @@ hodo-style.workspace = true
 hodo-layout.workspace = true
 hodo-render.workspace = true
 hodo-net.workspace = true
+hodo-cookie.workspace = true
 hodo-adblock.workspace = true
 hodo-cache = { path = "../hodo-cache", version = "0.1.0" }
 hodo-ext-host.workspace = true

@@ -488,6 +488,11 @@ fn run_full_path(doc: &BigDoc, sheet: &hodo_css::Stylesheet) {
     println!("\n=== best single run {best_run}/{RUNS} (lowest total) ===");
     println!("  total: {:.3} ms", best.total().as_secs_f64() * 1000.0);
     print_best_stages(&best);
+    println!(
+        "  styles ({}): {:.3} ms",
+        rule_index_mode(),
+        ms(best.styles)
+    );
     if let Some((nodes, items, bytes)) = counts {
         println!(
             "dom nodes: {nodes}, display items: {items}, rule count: {}, frame bytes: {bytes}",
@@ -595,6 +600,15 @@ fn ms(duration: Option<std::time::Duration>) -> f64 {
     duration.map_or(0.0, |d| d.as_secs_f64() * 1000.0)
 }
 
+/// Label the style-matching mode so the two re-baseline numbers are unambiguous.
+fn rule_index_mode() -> &'static str {
+    if std::env::var_os("HODO_NO_RULE_INDEX").is_some_and(|v| v == "1") {
+        "brute force (HODO_NO_RULE_INDEX=1)"
+    } else {
+        "indexed"
+    }
+}
+
 /// Entry point for `hodo-perf --big-doc`.
 pub(crate) fn run() {
     if std::env::var_os("HODO_SKIP_BIG_DOC").is_some_and(|value| value == "1") {
@@ -602,7 +616,10 @@ pub(crate) fn run() {
         return;
     }
 
-    println!("hodo big-document benchmark (best of {RUNS} runs, viewport 1200x800)");
+    println!(
+        "hodo big-document benchmark (best of {RUNS} runs, viewport 1200x800, {})",
+        rule_index_mode()
+    );
     let mut large_restyle = (0.0, 0.0);
     let mut large_append = (0.0, 0.0);
 
@@ -874,10 +891,10 @@ mod tests {
     fn checked_in_baseline_parses_all_four_large_stages() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../baseline_bigdoc.txt");
         let baseline = read_baseline(&path).expect("baseline_bigdoc.txt must be present");
-        assert_eq!(baseline.restyle_styles, 23.0);
-        assert_eq!(baseline.restyle_layout, 42.6);
-        assert_eq!(baseline.append_styles, 25.7);
-        assert_eq!(baseline.append_layout, 36.2);
+        assert_eq!(baseline.restyle_styles, 22.0);
+        assert_eq!(baseline.restyle_layout, 38.5);
+        assert_eq!(baseline.append_styles, 25.0);
+        assert_eq!(baseline.append_layout, 40.5);
     }
 
     #[test]

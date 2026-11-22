@@ -7,7 +7,7 @@
 //! longest allowed descendant selector completes in well under the 1 s budget
 //! asserted in tests. An invalid selector drops only its own rule.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use cssparser::{Delimiter, ParseError, Parser, ToCss, Token};
@@ -98,18 +98,32 @@ pub struct Declaration {
     pub value: String,
 }
 
-/// Synthetic declaration property carrying a rule's cascade-layer rank. Kept
-/// in `Declaration` so the public `StyleRule` shape stays stable for the other
-/// crates that build rules by hand; `hodo-style` reads it via [`cascade_layer`]
-/// and skips it when cascading.
+/// Synthetic declaration property carrying a rule's per-sheet cascade-layer
+/// rank. Kept in `Declaration` so the public `StyleRule` shape stays stable for
+/// the other crates that build rules by hand; `hodo-style` reads it via
+/// [`cascade_layer`] and skips it when cascading.
 pub const LAYER_MARKER: &str = "\0hodo-layer";
+/// Synthetic declaration carrying the layer's full dotted name. Paired with
+/// [`LAYER_MARKER`] so `hodo-style` can resolve one GLOBAL layer order across
+/// all sheets (same name in two sheets merges into the first-seen rank).
+pub const LAYER_NAME_MARKER: &str = "\0hodo-layer-name";
 
-/// Cascade-layer rank of a rule (`None` = unlayered), recorded at parse time.
+/// Per-sheet cascade-layer rank of a rule (`None` = unlayered), recorded at
+/// parse time. Use [`cascade_layer_name`] for cross-sheet resolution.
 pub fn cascade_layer(rule: &StyleRule) -> Option<u32> {
     rule.declarations
         .iter()
         .find(|decl| decl.property == LAYER_MARKER)
         .and_then(|decl| decl.value.parse().ok())
+}
+
+/// Full dotted layer name of a rule (`None` = unlayered). Nested layers are
+/// composed as `outer.inner`; comma lists duplicate the rule into each name.
+pub fn cascade_layer_name(rule: &StyleRule) -> Option<&str> {
+    rule.declarations
+        .iter()
+        .find(|decl| decl.property == LAYER_NAME_MARKER)
+        .map(|decl| decl.value.as_str())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,8 +164,9 @@ pub enum PseudoClass {
     Where(Vec<Compound>),
     /// `:is()` — matches any inner compound, specificity of the best one.
     Is(Vec<Compound>),
-    /// `:link` / `:visited` — both match `a[href]` this wave (no history).
+    /// `:link` — an `a[href]` whose href is not in `MatchContext::visited`.
     Link,
+    /// `:visited` — an `a[href]` whose href IS in `MatchContext::visited`.
     Visited,
     /// Interaction pseudos parse but never match in a static render.
     Hover,
@@ -239,12 +254,25 @@ impl WarnOnce {
 }
 
 /// First-seen `@layer` order for one stylesheet parse. Each name gets a stable
-/// rank; rules carry it in a synthetic declaration so the public rule shape
-/// stays unchanged. Ranks restart per sheet, so two sheets declaring the same
-/// layer name tie and fall back to source order this wave.
-#[derive(Default)]
+/// rank; rules carry both the rank and the full dotted name in synthetic
+/// declarations so `hodo-style` can resolve one GLOBAL order across all sheets
+/// (first-seen name wins ties, so `@layer a` in sheet 2 merges into sheet 1's
+/// `a` instead of restarting at rank 0).
 struct LayerOrder {
     names: Vec<String>,
+    /// Makes anonymous layer names unique per sheet so they cannot merge in
+    /// the style crate's global resolution (only same-NAMED layers merge).
+    sheet_id: u64,
+}
+
+impl Default for LayerOrder {
+    fn default() -> Self {
+        static NEXT_SHEET_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self {
+            names: Vec::new(),
+            sheet_id: NEXT_SHEET_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
 }
 
 impl LayerOrder {
@@ -266,6 +294,16 @@ fn layer_names(prelude: &str) -> Vec<String> {
         .filter(|name| !name.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// Compose a nested layer's dotted path. A parent path may itself hold several
+/// paths (from an outer comma list), in which case each gets the child suffix.
+fn compose_layer_paths(parent: &[String], name: &str) -> Vec<String> {
+    if parent.is_empty() {
+        vec![name.to_string()]
+    } else {
+        parent.iter().map(|path| format!("{path}.{name}")).collect()
+    }
 }
 
 /// Parse a stylesheet with the default viewport (1200x800, `screen`,
@@ -290,7 +328,7 @@ pub fn parse_stylesheet_with(viewport: Viewport, css: &str) -> Stylesheet {
         &mut warn,
         &mut rules,
         0,
-        None,
+        &[],
         &mut layers,
     );
     Stylesheet { rules }
@@ -302,7 +340,7 @@ fn parse_rules(
     warn: &mut WarnOnce,
     rules: &mut Vec<StyleRule>,
     depth: u8,
-    layer: Option<u32>,
+    layer: &[String],
     layers: &mut LayerOrder,
 ) {
     loop {
@@ -317,15 +355,28 @@ fn parse_rules(
             Ok(_) => {
                 parser.reset(&state);
                 if let Some(parsed) = parse_qualified_rule(parser, viewport, warn) {
-                    rules.extend(parsed.into_iter().map(|mut rule| {
-                        if let Some(rank) = layer {
-                            rule.declarations.push(Declaration {
-                                property: LAYER_MARKER.into(),
-                                value: rank.to_string(),
-                            });
+                    for rule in parsed {
+                        if layer.is_empty() {
+                            rules.push(rule);
+                        } else {
+                            // A comma list duplicates the rule into every
+                            // named layer (per CSS Cascade 5), each with its
+                            // own rank + full dotted name marker.
+                            for name in layer {
+                                let rank = layers.rank(name);
+                                let mut layered = rule.clone();
+                                layered.declarations.push(Declaration {
+                                    property: LAYER_MARKER.into(),
+                                    value: rank.to_string(),
+                                });
+                                layered.declarations.push(Declaration {
+                                    property: LAYER_NAME_MARKER.into(),
+                                    value: name.clone(),
+                                });
+                                rules.push(layered);
+                            }
                         }
-                        rule
-                    }));
+                    }
                 }
             }
             Err(_) => break,
@@ -345,7 +396,7 @@ fn parse_at_rule(
     warn: &mut WarnOnce,
     rules: &mut Vec<StyleRule>,
     depth: u8,
-    layer: Option<u32>,
+    layer: &[String],
     layers: &mut LayerOrder,
 ) {
     let prelude = parser
@@ -354,7 +405,7 @@ fn parse_at_rule(
         })
         .unwrap_or_default();
     let is_block = matches!(parser.next(), Ok(Token::CurlyBracketBlock));
-    let mut inner_layer = layer;
+    let mut inner_layer = layer.to_vec();
     let applies = match name.to_ascii_lowercase().as_str() {
         "media" => media_applies(&prelude, viewport, warn),
         "supports" => supports_applies(&prelude, warn),
@@ -363,18 +414,29 @@ fn parse_at_rule(
             false
         }
         "layer" => {
-            let names = layer_names(&prelude);
+            let mut names = layer_names(&prelude);
+            if names.is_empty() {
+                // Anonymous layer: unique per occurrence, composed with any
+                // enclosing layer path.
+                names.push(format!("\0anon:{}:{}", layers.sheet_id, layers.names.len()));
+            }
             if is_block {
-                // One layer per block this wave; comma lists use the first name.
-                let name = names
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| format!("\0anon:{}", layers.names.len()));
-                inner_layer = Some(layers.rank(&name));
+                // Comma lists create one layer per name; nested layers compose
+                // a dotted path (`outer.inner`) instead of replacing `outer`.
+                inner_layer = names
+                    .iter()
+                    .flat_map(|name| compose_layer_paths(layer, name))
+                    .collect();
+                // Establishes the names' order even before the first rule.
+                for path in &inner_layer {
+                    layers.rank(path);
+                }
                 true
             } else {
                 for name in names {
-                    layers.rank(&name);
+                    for path in compose_layer_paths(layer, &name) {
+                        layers.rank(&path);
+                    }
                 }
                 false
             }
@@ -388,7 +450,7 @@ fn parse_at_rule(
     // Consume the block whether or not it matches, so recovery stays intact.
     let _ = parser.parse_nested_block(|p| {
         if applies && depth < MAX_AT_RULE_DEPTH {
-            parse_rules(p, viewport, warn, rules, depth + 1, inner_layer, layers);
+            parse_rules(p, viewport, warn, rules, depth + 1, &inner_layer, layers);
         }
         Ok::<_, ParseError<()>>(())
     });
@@ -942,33 +1004,31 @@ fn selector_from_tokens(tokens: &[Token<'_>]) -> Result<Selector, ()> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CalcError {
-    /// `%` has no resolution basis in the parse-time length pipeline.
-    Percent,
     Invalid,
 }
 
-/// Resolve `calc()` expressions and viewport-relative lengths in a declaration
-/// value to `px` text using the stylesheet's `Viewport`. Invalid `calc()` and
-/// `calc()` containing `%` drop the whole declaration (the latter with one
-/// warning per sheet); quoted text is left verbatim.
+/// Resolve the `calc()` expressions that can be evaluated at parse time and
+/// viewport-relative lengths in a declaration value to `px` text using the
+/// stylesheet's `Viewport`. Two kinds of `calc()` are **deferred** and kept as
+/// raw text instead of being dropped:
+///
+/// * `var(...)` — `hodo-style` substitutes variables later, at cascade time,
+///   then calls [`resolve_calc_now`] on the substituted value.
+/// * `%` — only layout knows the containing-block basis; the raw expression is
+///   carried into `StyleMap` and resolved with [`resolve_calc_with_basis`].
+///
+/// Invalid `calc()` still drops its declaration; quoted text is left verbatim.
 ///
 /// NOTE(parse-time): like `px`, a viewport unit becomes a fixed number while
 /// parsing. A window resized mid-session does not re-resolve cached
 /// declarations — revisit by re-parsing with the new `Viewport` when resize
 /// support lands.
-fn resolve_lengths(value: &str, viewport: Viewport, warn: &mut WarnOnce) -> Option<String> {
+fn resolve_lengths(value: &str, viewport: Viewport, _warn: &mut WarnOnce) -> Option<String> {
     let (head, tail) = match value.split_once('!') {
         Some((head, tail)) => (head, Some(tail)),
         None => (value, None),
     };
-    let head = match resolve_calcs(head, viewport) {
-        Ok(head) => head,
-        Err(CalcError::Percent) => {
-            warn.note("calc() with % unsupported (safe default: declaration dropped)");
-            return None;
-        }
-        Err(CalcError::Invalid) => return None,
-    };
+    let head = resolve_calcs(head, viewport).ok()?;
     let mut out = resolve_viewport_lengths(&head, viewport);
     if let Some(tail) = tail {
         out.push('!');
@@ -977,7 +1037,32 @@ fn resolve_lengths(value: &str, viewport: Viewport, warn: &mut WarnOnce) -> Opti
     Some(out)
 }
 
-/// Rewrite every `calc(...)` in a value as a single `<number>px`.
+/// Resolve deferred `calc()` text at cascade time, after `var()` substitution.
+/// Still-deferred `%` expressions are left verbatim for layout. Returns `None`
+/// only for a genuinely invalid expression.
+pub fn resolve_calc_now(text: &str) -> Option<String> {
+    resolve_lengths(text, Viewport::default(), &mut WarnOnce::default())
+}
+
+/// Resolve a deferred percentage `calc()` against a known containing-block
+/// basis: each `%` operand becomes `basis / 100`. `var()` must already be
+/// substituted. This is the layout-time half of the `calc(100% - 32px)` path;
+/// `hodo-style` carries the raw text until `StyleMap::resolve_width_with_basis`
+/// calls this with the containing block's content width.
+pub fn resolve_calc_with_basis(text: &str, basis: f32) -> Option<f32> {
+    let text = text.trim();
+    let inner = text
+        .strip_prefix("calc(")
+        .and_then(|rest| rest.strip_suffix(')'))?;
+    let (value, _) = CalcParser::new_with_basis(inner, Viewport::default(), Some(f64::from(basis)))
+        .parse()
+        .ok()?;
+    value.is_finite().then_some(value as f32)
+}
+
+/// Rewrite every eager `calc(...)` in a value as `<number>px` (or a bare
+/// `<number>` when every operand is unitless). Calcs containing `var(` or `%`
+/// are copied verbatim for later resolution.
 fn resolve_calcs(value: &str, viewport: Viewport) -> Result<String, CalcError> {
     let lower = value.to_ascii_lowercase();
     let bytes = value.as_bytes();
@@ -1011,8 +1096,19 @@ fn resolve_calcs(value: &str, viewport: Viewport) -> Result<String, CalcError> {
                 }
             }
             let close = close.ok_or(CalcError::Invalid)?;
-            let number = CalcParser::new(&value[open + 1..close], viewport).parse()?;
-            out.push_str(&format!("{number}px"));
+            let inner = &value[open + 1..close];
+            let lower_inner = inner.to_ascii_lowercase();
+            if lower_inner.contains("var(") || inner.contains('%') {
+                // Deferred: keep the whole `calc(...)` text verbatim.
+                out.push_str(&value[pos..=close]);
+            } else {
+                let (number, has_unit) = CalcParser::new(inner, viewport).parse()?;
+                if has_unit {
+                    out.push_str(&format!("{number}px"));
+                } else {
+                    out.push_str(&format!("{number}"));
+                }
+            }
             pos = close + 1;
         } else {
             let ch = value[pos..].chars().next().ok_or(CalcError::Invalid)?;
@@ -1049,25 +1145,36 @@ struct CalcParser<'a> {
     pos: usize,
     depth: u8,
     viewport: Viewport,
+    /// `Some(basis)` enables `%` evaluation at layout time; `None` defers.
+    percent_basis: Option<f64>,
+    /// Whether any operand carried a unit (incl. `%`); drives px vs bare number.
+    has_unit: bool,
 }
 
 impl<'a> CalcParser<'a> {
     fn new(expr: &'a str, viewport: Viewport) -> Self {
+        Self::new_with_basis(expr, viewport, None)
+    }
+
+    fn new_with_basis(expr: &'a str, viewport: Viewport, percent_basis: Option<f64>) -> Self {
         Self {
             expr: expr.as_bytes(),
             pos: 0,
             depth: 0,
             viewport,
+            percent_basis,
+            has_unit: false,
         }
     }
 
-    fn parse(mut self) -> Result<f64, CalcError> {
+    /// Returns the value and whether any operand carried a unit.
+    fn parse(mut self) -> Result<(f64, bool), CalcError> {
         let value = self.expr()?;
         self.ws();
         if self.pos != self.expr.len() || !value.is_finite() {
             return Err(CalcError::Invalid);
         }
-        Ok(value)
+        Ok((value, self.has_unit))
     }
 
     fn ws(&mut self) {
@@ -1210,7 +1317,10 @@ impl<'a> CalcParser<'a> {
         } else if rest.starts_with(b"em") {
             (2, CALC_FALLBACK_FONT_PX)
         } else if rest.starts_with(b"%") {
-            return Err(CalcError::Percent);
+            let Some(basis) = self.percent_basis else {
+                return Err(CalcError::Invalid);
+            };
+            (1, basis / 100.0)
         } else {
             (0, 1.0)
         };
@@ -1220,6 +1330,9 @@ impl<'a> CalcParser<'a> {
             && unit_len == 0
         {
             return Err(CalcError::Invalid);
+        }
+        if unit_len > 0 {
+            self.has_unit = true;
         }
         self.pos += unit_len;
         let value = number * scale;
@@ -2177,7 +2290,7 @@ pub fn matches_selector_ref(sel: &Selector, dom: &Dom, id: NodeId, ctx: &mut Mat
     {
         matches_selector_with(sel, dom, id, ctx)
     } else {
-        matches_simple(sel, dom, id)
+        matches_plain(sel, dom, id)
     }
 }
 
@@ -2201,7 +2314,10 @@ pub fn specificity_ref(sel: &Selector) -> (u32, u32, u32) {
     }
 }
 
-fn matches_simple(sel: &Selector, dom: &Dom, id: NodeId) -> bool {
+/// Fast path for a plain compound (no chain, attributes or pseudo-classes).
+/// Allocation-free and independent of `MatchContext` — the caller needs no
+/// ancestor Bloom or sibling cache. Used by `hodo-style`'s candidate matcher.
+pub fn matches_plain(sel: &Selector, dom: &Dom, id: NodeId) -> bool {
     let Some(tag) = dom.tag(id) else {
         return false;
     };
@@ -2360,10 +2476,17 @@ fn matches_compound(compound: &Compound, dom: &Dom, id: NodeId, ctx: &mut MatchC
             PseudoClass::Where(args) | PseudoClass::Is(args) => {
                 args.iter().any(|arg| matches_compound(arg, dom, id, ctx))
             }
-            // No visited-history tracking this wave: both are plain `a[href]`.
             PseudoClass::Link | PseudoClass::Visited => {
-                dom.tag(id).is_some_and(|tag| tag.eq_ignore_ascii_case("a"))
-                    && attr_value(dom, id, "href").is_some()
+                let is_anchor = dom.tag(id).is_some_and(|tag| tag.eq_ignore_ascii_case("a"));
+                let href = attr_value(dom, id, "href");
+                let visited = href.map(|href| ctx.is_visited(href)).unwrap_or(false);
+                is_anchor
+                    && href.is_some()
+                    && match pseudo {
+                        PseudoClass::Link => !visited,
+                        PseudoClass::Visited => visited,
+                        _ => unreachable!(),
+                    }
             }
             // Static render has no pointer/focus state; never match.
             PseudoClass::Hover | PseudoClass::Focus | PseudoClass::Active => false,
@@ -2445,11 +2568,31 @@ fn attr_matches(attr: &AttributeSelector, actual: &str) -> bool {
 pub struct MatchContext {
     pub ancestors: AncestorBloom,
     pub siblings: SiblingCache,
+    /// Hrefs the browser has visited. Empty by default, so `:link` matches every
+    /// `a[href]` and `:visited` none. The shell should seed this from its
+    /// redirect-visited-set via `hodo_style::compute_styles_with_visited`.
+    pub visited: std::collections::HashSet<String>,
 }
 
 impl MatchContext {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Seed the visited-href set (typically the shell's history set).
+    pub fn with_visited<I, S>(visited: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            visited: visited.into_iter().map(Into::into).collect(),
+            ..Self::default()
+        }
+    }
+
+    fn is_visited(&self, href: &str) -> bool {
+        self.visited.contains(href)
     }
 }
 
@@ -2553,43 +2696,128 @@ impl SiblingCache {
     }
 }
 
-/// Rule index keyed by the rightmost compound: id, class, tag, universal.
+/// Cap on distinct attribute names kept as dedicated buckets. Beyond this the
+/// least frequent names fall back to `universal`, so collecting candidates is
+/// O(1) in the number of attribute names rather than O(distinct names).
+/// shortcut: 32 names; raise it if a sheet legitimately keys on more attributes.
+const MAX_ATTR_BUCKETS: usize = 32;
+
+/// A necessary condition on an element, read from a rule's rightmost compound.
+/// A rule is stored under exactly one of these (the rarest), so an element that
+/// fails the chosen condition can never match the rule and never sees it as a
+/// candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum RuleKey {
+    Id(String),
+    Class(String),
+    Tag(String),
+    Attr(String),
+}
+
+/// Rule index keyed by one necessary condition of each rule's rightmost
+/// compound. Collecting candidates is O(bucket sizes), never O(all rules), and
+/// every rule lives in exactly one bucket so there is no cross-bucket blow-up.
+///
+/// Bucket choice, in priority order:
+/// * an `#id` wins outright (an element with a different id cannot match);
+/// * otherwise the rarest of the rule's classes, tag and attribute names wins
+///   ("rarest" = fewest other rules carry the same key);
+/// * a rule with no such condition goes into `universal`.
+///
+/// Source order is preserved by sorting the collected rule indices: ties in
+/// specificity are decided by the original rule order in `hodo-style`.
 #[derive(Debug, Default)]
 pub struct RuleIndex {
-    by_id: HashMap<String, Vec<usize>>,
-    by_class: HashMap<String, Vec<usize>>,
-    by_tag: HashMap<String, Vec<usize>>,
-    universal: Vec<usize>,
+    by_id: HashMap<String, Vec<u32>>,
+    by_class: HashMap<String, Vec<u32>>,
+    by_tag: HashMap<String, Vec<u32>>,
+    by_attr: HashMap<String, Vec<u32>>,
+    universal: Vec<u32>,
+    /// Attribute names with a dedicated bucket, most frequent first. Bounded by
+    /// [`MAX_ATTR_BUCKETS`] so the per-element scan stays constant-time.
+    attr_names: Vec<String>,
+    /// Decoded chains for non-plain rules as `(rule index, chain, specificity)`,
+    /// sorted by index. Specificity is computed once here so the cascade never
+    /// decodes a chain per element. Plain compounds need no decode at match
+    /// time; keeping only the non-plain ones avoids a per-rule `Option` slot.
+    chains: Vec<(u32, ComplexSelector, (u32, u32, u32))>,
 }
 
 impl RuleIndex {
     pub fn new<'a>(rules: impl IntoIterator<Item = &'a StyleRule>) -> Self {
-        let mut index = Self::default();
-        for (i, rule) in rules.into_iter().enumerate() {
-            let sel = &rule.selector;
-            if let Some(id) = &sel.id {
-                index.by_id.entry(id.clone()).or_default().push(i);
-            }
-            for class in &sel.classes {
-                if !class.starts_with(CHAIN_PREFIX) {
-                    index.by_class.entry(class.clone()).or_default().push(i);
+        let rules: Vec<&StyleRule> = rules.into_iter().collect();
+        // Pass 1: collect every necessary key and count how many rules share
+        // it, so the rarest key can be picked in pass 2.
+        let mut all: HashMap<RuleKey, Vec<u32>> = HashMap::new();
+        let mut keys_per_rule: Vec<Vec<RuleKey>> = Vec::with_capacity(rules.len());
+        let mut chains: Vec<(u32, ComplexSelector, (u32, u32, u32))> = Vec::new();
+        for (i, rule) in rules.iter().enumerate() {
+            let chain = complex(&rule.selector);
+            let mut keys = Vec::new();
+            if let Some(last) = chain.compounds.last() {
+                if let Some(id) = &last.id {
+                    keys.push(RuleKey::Id(id.clone()));
+                } else {
+                    for class in &last.classes {
+                        keys.push(RuleKey::Class(class.clone()));
+                    }
+                    if let Some(tag) = &last.tag {
+                        keys.push(RuleKey::Tag(tag.to_ascii_lowercase()));
+                    }
+                    for attr in &last.attrs {
+                        keys.push(RuleKey::Attr(attr.name.to_ascii_lowercase()));
+                    }
                 }
             }
-            match &sel.tag {
-                Some(tag) => index
-                    .by_tag
-                    .entry(tag.to_ascii_lowercase())
+            for key in &keys {
+                all.entry(key.clone()).or_default().push(i as u32);
+            }
+            if !is_compound(&rule.selector) {
+                let specificity = specificity_of(&chain);
+                chains.push((i as u32, chain, specificity));
+            }
+            keys_per_rule.push(keys);
+        }
+
+        // Keep only the most frequent attribute names as dedicated buckets.
+        let mut attr_freq: Vec<(String, usize)> = all
+            .iter()
+            .filter_map(|(key, list)| match key {
+                RuleKey::Attr(name) => Some((name.clone(), list.len())),
+                _ => None,
+            })
+            .collect();
+        attr_freq.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        attr_freq.truncate(MAX_ATTR_BUCKETS);
+        let attr_allowed: HashSet<String> = attr_freq.iter().map(|(n, _)| n.clone()).collect();
+
+        let mut index = Self {
+            attr_names: attr_freq.into_iter().map(|(n, _)| n).collect(),
+            chains,
+            ..Self::default()
+        };
+        for (i, keys) in keys_per_rule.iter().enumerate() {
+            // `Id` uses weight 0, always beating any real frequency (>= 1).
+            let chosen = keys.iter().min_by_key(|key| match key {
+                RuleKey::Id(_) => 0,
+                _ => all.get(*key).map_or(usize::MAX, Vec::len),
+            });
+            match chosen {
+                Some(RuleKey::Id(id)) => index.by_id.entry(id.clone()).or_default().push(i as u32),
+                Some(RuleKey::Class(class)) => index
+                    .by_class
+                    .entry(class.clone())
                     .or_default()
-                    .push(i),
-                None if sel.id.is_none()
-                    && sel
-                        .classes
-                        .iter()
-                        .all(|class| class.starts_with(CHAIN_PREFIX)) =>
-                {
-                    index.universal.push(i)
+                    .push(i as u32),
+                Some(RuleKey::Tag(tag)) => {
+                    index.by_tag.entry(tag.clone()).or_default().push(i as u32)
                 }
-                None => {}
+                Some(RuleKey::Attr(name)) if attr_allowed.contains(name.as_str()) => index
+                    .by_attr
+                    .entry(name.clone())
+                    .or_default()
+                    .push(i as u32),
+                _ => index.universal.push(i as u32),
             }
         }
         index
@@ -2598,28 +2826,91 @@ impl RuleIndex {
     /// Fill `out` with sorted, deduplicated candidate rule indices for one
     /// element. Callers reuse the buffer across elements.
     pub fn candidates(&self, dom: &Dom, id: NodeId, out: &mut Vec<usize>) {
-        let candidates = out;
-        candidates.clear();
-        if let Some(value) = dom.attr(id, "id") {
+        out.clear();
+        if let Some(value) = attr_value(dom, id, "id") {
             if let Some(indices) = self.by_id.get(value) {
-                candidates.extend_from_slice(indices);
+                out.extend(indices.iter().map(|&i| i as usize));
             }
         }
-        if let Some(classes) = dom.attr(id, "class") {
+        if let Some(classes) = attr_value(dom, id, "class") {
             for class in classes.split_whitespace() {
                 if let Some(indices) = self.by_class.get(class) {
-                    candidates.extend_from_slice(indices);
+                    out.extend(indices.iter().map(|&i| i as usize));
                 }
             }
         }
         if let Some(tag) = dom.tag(id) {
             if let Some(indices) = self.by_tag.get(&tag.to_ascii_lowercase()) {
-                candidates.extend_from_slice(indices);
+                out.extend(indices.iter().map(|&i| i as usize));
             }
         }
-        candidates.extend_from_slice(&self.universal);
-        candidates.sort_unstable();
-        candidates.dedup();
+        for name in &self.attr_names {
+            if attr_value(dom, id, name).is_some() {
+                if let Some(indices) = self.by_attr.get(name) {
+                    out.extend(indices.iter().map(|&i| i as usize));
+                }
+            }
+        }
+        out.extend(self.universal.iter().map(|&i| i as usize));
+        out.sort_unstable();
+        out.dedup();
+    }
+
+    /// Pre-decoded chain for a non-plain rule, or `None` for a plain compound.
+    /// Lets callers skip the `CHAIN_PREFIX` scan and `complex()` decode on every
+    /// match, while keeping the generic chain matcher for everything else.
+    pub fn chain(&self, rule_index: usize) -> Option<&ComplexSelector> {
+        self.chains
+            .binary_search_by_key(&(rule_index as u32), |(i, _, _)| *i)
+            .ok()
+            .map(|position| &self.chains[position].1)
+    }
+
+    /// Specificity of a rule without decoding its chain: cached from the
+    /// one-shot build decode for non-plain rules, compound-only for plain ones.
+    pub fn specificity(&self, rule_index: usize, sel: &Selector) -> (u32, u32, u32) {
+        match self
+            .chains
+            .binary_search_by_key(&(rule_index as u32), |(i, _, _)| *i)
+        {
+            Ok(position) => self.chains[position].2,
+            Err(_) => specificity(sel),
+        }
+    }
+
+    /// Approximate bytes held by the final index (rule lists + key strings +
+    /// table slots). Used by the RAM report in the tests; excludes the
+    /// one-shot build scratch maps, which are freed when `new` returns.
+    pub fn heap_bytes(&self) -> usize {
+        let mut bytes = self.universal.capacity() * std::mem::size_of::<u32>();
+        for (_, chain, _) in &self.chains {
+            bytes += std::mem::size_of_val(chain);
+            for compound in &chain.compounds {
+                bytes += compound.tag.as_ref().map_or(0, String::len)
+                    + compound.id.as_ref().map_or(0, String::len)
+                    + compound.classes.iter().map(String::len).sum::<usize>()
+                    + compound
+                        .attrs
+                        .iter()
+                        .map(|a| a.name.len() + a.value.len())
+                        .sum::<usize>();
+            }
+        }
+        bytes +=
+            self.chains.capacity() * std::mem::size_of::<(u32, ComplexSelector, (u32, u32, u32))>();
+        for map in [&self.by_id, &self.by_class, &self.by_tag, &self.by_attr] {
+            bytes += map.capacity()
+                * (std::mem::size_of::<String>()
+                    + std::mem::size_of::<Vec<u32>>()
+                    + std::mem::size_of::<usize>());
+            for (key, list) in map {
+                bytes += key.len() + list.capacity() * std::mem::size_of::<u32>();
+            }
+        }
+        for name in &self.attr_names {
+            bytes += name.len();
+        }
+        bytes + std::mem::size_of::<Self>()
     }
 }
 
@@ -3008,34 +3299,56 @@ mod tests {
     }
 
     #[test]
-    fn link_and_visited_match_anchors_with_href() {
+    fn link_and_visited_split_on_the_visited_set() {
         let mut dom = Dom::new();
         let root = dom.root();
         let link = elem(&mut dom, root, "a", &[("href", "https://example.com")]);
         let bare = elem(&mut dom, root, "a", &[]);
         let other = elem(&mut dom, root, "div", &[("href", "#")]);
-        for text in ["a:link", "a:visited", ":link", ":visited"] {
+        let href = "https://example.com";
+
+        for (text, expected_unvisited, expected_visited) in [
+            ("a:link", true, false),
+            ("a:visited", false, true),
+            (":link", true, false),
+            (":visited", false, true),
+        ] {
             let sel = selector(text);
-            assert!(
-                matches_selector(&sel, &dom, link),
-                "{text} must match a[href]"
+            let mut ctx = MatchContext::new();
+            assert_eq!(
+                matches_selector_with(&sel, &dom, link, &mut ctx),
+                expected_unvisited,
+                "{text} on an unvisited link"
             );
-            assert!(
-                !matches_selector(&sel, &dom, bare),
-                "{text} must skip bare a"
+            let mut ctx = MatchContext::with_visited([href]);
+            assert_eq!(
+                matches_selector_with(&sel, &dom, link, &mut ctx),
+                expected_visited,
+                "{text} on a visited link"
             );
-            assert!(
-                !matches_selector(&sel, &dom, other),
-                "{text} must skip non-anchor"
-            );
+            let mut ctx = MatchContext::new();
+            assert!(!matches_selector_with(&sel, &dom, bare, &mut ctx));
+            assert!(!matches_selector_with(&sel, &dom, other, &mut ctx));
         }
-        // HN-shaped selector lists survive parsing; only the link arms apply.
+        // HN-shaped selector lists survive parsing; one arm always applies.
         let sheet = parse_stylesheet("a:link, a:visited { color: blue } p { color: red }");
         assert_eq!(sheet.rules.len(), 3);
         assert_eq!(sheet.rules[0].declarations[0].value, "blue");
         assert_eq!(sheet.rules[1].declarations[0].value, "blue");
-        assert!(matches_selector(&sheet.rules[0].selector, &dom, link));
-        assert!(matches_selector(&sheet.rules[1].selector, &dom, link));
+        let mut ctx = MatchContext::new();
+        assert!(matches_selector_with(
+            &sheet.rules[0].selector,
+            &dom,
+            link,
+            &mut ctx
+        ));
+        let mut ctx = MatchContext::with_visited([href]);
+        assert!(matches_selector_with(
+            &sheet.rules[1].selector,
+            &dom,
+            link,
+            &mut ctx
+        ));
     }
 
     #[test]
@@ -3303,6 +3616,326 @@ mod tests {
     }
 
     #[test]
+    fn rule_index_id_first_wins_and_uses_rarest_class() {
+        // 20 `.common` rules and one `.rare`: a `.rare.common` rule must be
+        // indexed under `.rare`, not the crowded `.common` bucket.
+        let mut css = String::from(".rare.common { color: red }\n");
+        for _ in 0..20 {
+            css.push_str(".common { color: blue }\n");
+        }
+        let sheet = parse_stylesheet(&css);
+        let index = RuleIndex::new(sheet.rules.iter());
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let both = elem(&mut dom, root, "div", &[("class", "rare common")]);
+        let mut out = Vec::new();
+        index.candidates(&dom, both, &mut out);
+        assert_eq!(out, (0..21).collect::<Vec<_>>());
+        let common_only = elem(&mut dom, root, "div", &[("class", "common")]);
+        index.candidates(&dom, common_only, &mut out);
+        assert_eq!(
+            out,
+            (1..21).collect::<Vec<_>>(),
+            "rarest-class rule gated out"
+        );
+
+        // An id rule is never reachable from a class bucket: an element with
+        // the class but a different id cannot match `#main.card`.
+        let sheet = parse_stylesheet("#main.card { color: red } .card { color: blue }");
+        let index = RuleIndex::new(sheet.rules.iter());
+        let wrong_id = elem(&mut dom, root, "div", &[("id", "other"), ("class", "card")]);
+        index.candidates(&dom, wrong_id, &mut out);
+        assert_eq!(out, vec![1]);
+        let right_id = elem(&mut dom, root, "div", &[("id", "main"), ("class", "card")]);
+        index.candidates(&dom, right_id, &mut out);
+        assert_eq!(out, vec![0, 1]);
+    }
+
+    #[test]
+    fn rule_index_preserves_source_order_within_and_across_buckets() {
+        // Same specificity, different buckets: collected candidates must stay
+        // in ascending rule order so `hodo-style` cascades by source order.
+        let sheet = parse_stylesheet(
+            "[data-kind=\"mixed\"] { color: #010101 }\n\
+             .b { color: #020202 }\n\
+             div { color: #030303 }\n\
+             #i { color: #040404 }\n\
+             * { color: #050505 }\n\
+             .a { color: #060606 }\n",
+        );
+        let index = RuleIndex::new(sheet.rules.iter());
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let node = elem(
+            &mut dom,
+            root,
+            "div",
+            &[("id", "i"), ("class", "b a"), ("data-kind", "mixed")],
+        );
+        let mut out = Vec::new();
+        index.candidates(&dom, node, &mut out);
+        assert_eq!(out, vec![0, 1, 2, 3, 4, 5], "source order must survive");
+    }
+
+    /// Fixed-seed synthetic elements over the demo stylesheet shapes. The LCG
+    /// is the same one used by `hodo-perf`, so the corpus is reproducible with
+    /// no `rand` dependency.
+    fn ab_corpus() -> (Dom, Vec<NodeId>, Vec<Stylesheet>) {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let body = elem(&mut dom, root, "body", &[]);
+        let tags = ["div", "p", "span", "li", "a", "section", "ul"];
+        let ids = ["blk0", "blk1", "main", "footer"];
+        let class_pool = [
+            "s0", "s1", "s2", "s3", "s4", "s5", "foo", "bar", "card", "sp0", "sp1", "sp2",
+        ];
+        let mut rng = 0x5eed_1234_5678_9abcu64;
+        let mut next = || {
+            rng = rng
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            rng
+        };
+        let mut class_text: Vec<String> = Vec::new();
+        let mut nodes = Vec::new();
+        let mut parent = body;
+        for i in 0..420 {
+            if i % 13 == 0 {
+                parent = body;
+            }
+            let tag = tags[(next() >> 33) as usize % tags.len()];
+            let id = if i % 9 == 0 {
+                Some(ids[(next() >> 33) as usize % ids.len()])
+            } else {
+                None
+            };
+            let a = class_pool[(next() >> 33) as usize % class_pool.len()];
+            let b = class_pool[(next() >> 33) as usize % class_pool.len()];
+            let text = if i % 4 == 0 {
+                format!("{a} {b}")
+            } else {
+                a.to_string()
+            };
+            let mut attrs: Vec<(&str, &str)> = Vec::new();
+            if let Some(id) = id {
+                attrs.push(("id", id));
+            }
+            class_text.push(text);
+            attrs.push(("class", class_text.last().unwrap()));
+            if i % 7 == 0 {
+                attrs.push(("data-kind", "mixed"));
+            }
+            if i % 11 == 0 {
+                attrs.push(("data-idx", "3"));
+            }
+            if i % 5 == 0 {
+                attrs.push(("href", "https://example.com"));
+            }
+            let node = elem(&mut dom, parent, tag, &attrs);
+            nodes.push(node);
+            if i % 3 == 0 {
+                parent = node;
+            }
+        }
+        // Two demo-shaped sheets: LARGE-like class/id/attr rules plus a
+        // chained/positional sheet exercising the rightmost-compound decode.
+        let mut large_css = String::from("* { margin: 0 }\n");
+        for c in class_pool.iter().take(6) {
+            large_css.push_str(&format!(".{c} {{ color: red; padding: 1px }}\n"));
+        }
+        for id in ids {
+            large_css.push_str(&format!("#{id} {{ border-width: 1px; margin: 2px }}\n"));
+        }
+        for i in 0..12 {
+            large_css.push_str(&format!(
+                "[data-idx=\"{}\"] {{ font-size: {}px }}\n",
+                i % 5,
+                12 + i
+            ));
+        }
+        large_css.push_str("[data-kind=\"mixed\"] { background: blue }\n");
+        for tag in tags {
+            large_css.push_str(&format!("{tag} {{ display: block }}\n"));
+        }
+        let chain_css = "div p { color: green }\n\
+                         span + li { text-indent: 2px }\n\
+                         ul > li { font-weight: bold }\n\
+                         .card:first-child { color: teal }\n\
+                         a:link { color: navy }\n\
+                         a:visited { color: purple }\n\
+                         :not(.foo) { line-height: 1.4 }\n\
+                         :is(.bar, .card) { letter-spacing: 1px }\n";
+        (
+            dom,
+            nodes,
+            vec![parse_stylesheet(&large_css), parse_stylesheet(chain_css)],
+        )
+    }
+
+    #[test]
+    fn rule_index_equals_brute_force_on_fixed_seed_corpus() {
+        let (dom, nodes, sheets) = ab_corpus();
+        let rules: Vec<&StyleRule> = sheets.iter().flat_map(|s| s.rules.iter()).collect();
+        let index = RuleIndex::new(rules.iter().copied());
+        let mut blooms = vec![AncestorBloom::default(); dom.len()];
+        dom.walk(|id, _| {
+            if let Some(parent) = dom.parent(id) {
+                blooms[id.slot() as usize] =
+                    AncestorBloom::child_of(blooms[parent.slot() as usize], &dom, parent);
+            }
+        });
+
+        let mut out = Vec::new();
+        let mut compared = 0usize;
+        for &id in &nodes {
+            let bloom = blooms[id.slot() as usize];
+            index.candidates(&dom, id, &mut out);
+            let mut bucketed_ctx = MatchContext::new();
+            bucketed_ctx.ancestors = bloom;
+            let mut brute_ctx = MatchContext::new();
+            brute_ctx.ancestors = bloom;
+            let bucketed: Vec<usize> = out
+                .iter()
+                .copied()
+                .filter(|&i| matches_selector_ref(&rules[i].selector, &dom, id, &mut bucketed_ctx))
+                .collect();
+            let brute: Vec<usize> = (0..rules.len())
+                .filter(|&i| matches_selector_ref(&rules[i].selector, &dom, id, &mut brute_ctx))
+                .collect();
+            assert_eq!(
+                bucketed,
+                brute,
+                "slot {} ({:?}) diverged",
+                id.slot(),
+                dom.tag(id)
+            );
+            compared += 1;
+        }
+        assert!(compared >= 400, "corpus too small: {compared}");
+        eprintln!(
+            "A/B equality: {compared} elements x {} rules x 2 sheets — EXACT",
+            rules.len()
+        );
+    }
+
+    /// The hot path reads cached specificity; this pins the cached value to
+    /// the old per-element `specificity_ref` result for both plain and chained
+    /// rules, and proves every non-plain rule has a pre-decoded chain.
+    #[test]
+    fn rule_index_caches_chain_specificity_without_per_element_decode() {
+        let sheet = parse_stylesheet(
+            "#main.card { color: red }\n\
+             div p span { color: blue }\n\
+             .card:first-child { color: green }\n\
+             :is(.a, #b) > li { color: teal }\n\
+             .plain { color: black }\n",
+        );
+        let index = RuleIndex::new(sheet.rules.iter());
+        let mut chained = 0;
+        for (i, rule) in sheet.rules.iter().enumerate() {
+            assert_eq!(
+                index.specificity(i, &rule.selector),
+                specificity_ref(&rule.selector),
+                "rule {i}: cached specificity must equal the one-shot decode"
+            );
+            if !is_compound(&rule.selector) {
+                chained += 1;
+                assert!(index.chain(i).is_some(), "rule {i}: chain not cached");
+            }
+        }
+        assert!(chained >= 3, "test must exercise cached chains: {chained}");
+    }
+
+    /// 33rd distinct attribute name (all frequency 1) lands in `universal`
+    /// because only `MAX_ATTR_BUCKETS` names get dedicated buckets. The
+    /// rule still arrives in source order and matches exactly like brute force.
+    #[test]
+    fn rule_index_33rd_attribute_uses_universal_bucket_in_source_order() {
+        let mut css = String::new();
+        for i in 0..=MAX_ATTR_BUCKETS {
+            css.push_str(&format!("[data-k{i:02}] {{ color: #{i:06x} }}\n"));
+        }
+        // Two competitors that also match the element, placed after the 33rd
+        // attribute rule so source order is observable in the candidate list.
+        css.push_str(".target { border-width: 1px }\n");
+        css.push_str("#t32 { margin: 2px }\n");
+        let sheet = parse_stylesheet(&css);
+        let index = RuleIndex::new(sheet.rules.iter());
+        assert_eq!(sheet.rules.len(), MAX_ATTR_BUCKETS + 3);
+
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let node = elem(
+            &mut dom,
+            root,
+            "div",
+            &[("id", "t32"), ("class", "target"), ("data-k32", "x")],
+        );
+        let mut out = Vec::new();
+        index.candidates(&dom, node, &mut out);
+
+        let mut bucketed_ctx = MatchContext::new();
+        let bucketed: Vec<usize> = out
+            .iter()
+            .copied()
+            .filter(|&i| {
+                matches_selector_ref(&sheet.rules[i].selector, &dom, node, &mut bucketed_ctx)
+            })
+            .collect();
+        let mut brute_ctx = MatchContext::new();
+        let brute: Vec<usize> = (0..sheet.rules.len())
+            .filter(|&i| matches_selector_ref(&sheet.rules[i].selector, &dom, node, &mut brute_ctx))
+            .collect();
+        assert_eq!(out, brute, "candidate order must match brute force");
+        assert_eq!(bucketed, brute, "matches must match brute force");
+        assert_eq!(
+            brute,
+            vec![MAX_ATTR_BUCKETS, MAX_ATTR_BUCKETS + 1, MAX_ATTR_BUCKETS + 2],
+            "33rd attribute rule plus both competitors, in source order"
+        );
+    }
+
+    #[test]
+    fn rule_index_ram_report_100k_rules() {
+        let template = parse_stylesheet(".c0 { color: red }").rules[0].clone();
+        // Realistic distribution: 100 000 rules over 500 shared classes.
+        let realistic: Vec<StyleRule> = (0..100_000)
+            .map(|i| {
+                let mut rule = template.clone();
+                rule.selector.classes = vec![format!("c{}", i % 500)];
+                rule
+            })
+            .collect();
+        let realistic_bytes = RuleIndex::new(realistic.iter()).heap_bytes();
+        eprintln!(
+            "RuleIndex RAM (100k rules / 500 classes): {} bytes ({:.2} MiB)",
+            realistic_bytes,
+            realistic_bytes as f64 / (1024.0 * 1024.0)
+        );
+        assert!(
+            realistic_bytes < 1024 * 1024,
+            "index must stay under 1 MiB: {realistic_bytes}"
+        );
+        // Worst case (every rule a unique key) is reported, not gated: the
+        // HashMap's per-key slot — not the u32 rule lists — dominates there.
+        let unique: Vec<StyleRule> = (0..100_000)
+            .map(|i| {
+                let mut rule = template.clone();
+                rule.selector.classes = vec![format!("c{i}")];
+                rule
+            })
+            .collect();
+        let unique_index = RuleIndex::new(unique.iter());
+        let unique_bytes = unique_index.heap_bytes();
+        eprintln!(
+            "RuleIndex RAM (100k unique classes): {} bytes ({:.2} MiB); rule-list payload alone = {} bytes",
+            unique_bytes,
+            unique_bytes as f64 / (1024.0 * 1024.0),
+            100_000 * std::mem::size_of::<u32>()
+        );
+    }
+
+    #[test]
     fn inline_declarations_and_important_flag() {
         let decls = parse_style_attribute("color: red !important; margin: 0; font-size: 12px");
         assert_eq!(decls.len(), 3);
@@ -3374,12 +4007,11 @@ mod tests {
     }
 
     #[test]
-    fn calc_invalid_and_percent_drop_only_the_declaration() {
+    fn calc_invalid_drops_only_the_declaration() {
         for value in [
             "calc(10px / 0)",
             "calc(10px +)",
             "calc(((((1px))))))",
-            "calc(100% - 32px)",
             "calc(1px + 10deg)",
         ] {
             let css = format!("div {{ width: {value}; height: 5px }} p {{ color: blue }}");
@@ -3559,6 +4191,75 @@ mod tests {
         );
         let layers: Vec<Option<u32>> = sheet.rules.iter().map(cascade_layer).collect();
         assert_eq!(layers, [Some(1), Some(0)]);
+    }
+
+    #[test]
+    fn nested_layer_composes_a_dotted_path() {
+        let sheet = parse_stylesheet(
+            "@layer outer { @layer inner { .a { color: red } } .b { color: blue } }",
+        );
+        let layers: Vec<(Option<u32>, Option<&str>)> = sheet
+            .rules
+            .iter()
+            .map(|r| (cascade_layer(r), cascade_layer_name(r)))
+            .collect();
+        // `outer` is rank 0; the nested `outer.inner` is a distinct rank 1.
+        assert_eq!(
+            layers,
+            [(Some(1), Some("outer.inner")), (Some(0), Some("outer"))]
+        );
+    }
+
+    #[test]
+    fn anonymous_layers_stay_distinct_across_sheets() {
+        let first = parse_stylesheet("@layer { .a { color: red } }");
+        let second = parse_stylesheet("@layer { .b { color: blue } }");
+        assert_ne!(
+            cascade_layer_name(&first.rules[0]),
+            cascade_layer_name(&second.rules[0])
+        );
+    }
+
+    #[test]
+    fn comma_layer_list_applies_to_every_name() {
+        let sheet = parse_stylesheet("@layer a, b { .x { color: red } }");
+        let layers: Vec<(Option<u32>, Option<&str>)> = sheet
+            .rules
+            .iter()
+            .map(|r| (cascade_layer(r), cascade_layer_name(r)))
+            .collect();
+        assert_eq!(layers, [(Some(0), Some("a")), (Some(1), Some("b"))]);
+        assert!(sheet.rules.iter().all(|r| r.declarations[0].value == "red"));
+    }
+
+    #[test]
+    fn var_calc_is_deferred_until_cascade_substitution() {
+        let sheet = parse_stylesheet("div { --w: 50px; width: calc(var(--w) + 5px) }");
+        let width = &sheet.rules[0].declarations[1];
+        assert_eq!(width.value, "calc(var(--w) + 5px)");
+        let resolved = BTreeMap::from([("--w".to_string(), "50px".to_string())]);
+        let substituted = substitute_vars(&width.value, &resolved).unwrap();
+        assert_eq!(resolve_calc_now(&substituted).unwrap(), "55px");
+    }
+
+    #[test]
+    fn percent_calc_defers_to_a_layout_basis() {
+        let sheet = parse_stylesheet("div { width: calc(100% - 32px) }");
+        let width = &sheet.rules[0].declarations[0];
+        assert_eq!(width.value, "calc(100% - 32px)");
+        assert_eq!(resolve_calc_with_basis(&width.value, 1000.0), Some(968.0));
+        assert_eq!(resolve_calc_with_basis(&width.value, 500.0), Some(468.0));
+    }
+
+    #[test]
+    fn unitless_calc_emits_a_bare_number() {
+        let sheet = parse_stylesheet("div { line-height: calc(2); opacity: calc(1 / 2) }");
+        let values: Vec<&str> = sheet.rules[0]
+            .declarations
+            .iter()
+            .map(|d| d.value.as_str())
+            .collect();
+        assert_eq!(values, ["2", "0.5"]);
     }
 
     #[test]

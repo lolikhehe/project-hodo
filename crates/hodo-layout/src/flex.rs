@@ -162,7 +162,12 @@ pub(crate) fn layout_flex(
     let bw = style.border_width.max(0.0);
     let box_x = avail.x + m.left;
     let box_y = avail.y + m.top;
-    let box_w = (avail.width - m.left - m.right).max(0.0);
+    // An explicit/deferred-calc width bounds the flex container just as it
+    // bounds a block; without this the container always filled `avail.width`.
+    let basis = (avail.width - m.left - m.right).max(0.0);
+    let box_w = crate::resolve_width(ctx.styles, id, style, basis)
+        .unwrap_or(avail.width - m.left - m.right)
+        .max(0.0);
     let inner_left = box_x + bw + p.left;
     let inner_right = box_x + box_w - bw - p.right;
     let top = box_y + bw + p.top;
@@ -171,7 +176,7 @@ pub(crate) fn layout_flex(
     // order-modified document order: (order, dom index).
     let mut children: Vec<(usize, NodeId)> = ctx
         .dom
-        .children(id)
+        .render_children(id)
         .iter()
         .copied()
         .enumerate()
@@ -293,8 +298,11 @@ pub(crate) fn layout_flex(
     let mut items: Vec<Item> = Vec::with_capacity(n);
     for (_, node) in children {
         let s = ctx.styles.get(node).cloned().unwrap_or_else(fallback_style);
-        let explicit_main = if column { s.height } else { s.width };
-        let explicit_cross = if column { s.width } else { s.height };
+        // A deferred `%` calc has no value in `ComputedStyle`; resolve it
+        // against the flex container's content width just as block flow does.
+        let calc_w = ctx.styles.resolve_width_with_basis(node, inner_w);
+        let explicit_main = if column { s.height } else { calc_w.or(s.width) };
+        let explicit_cross = if column { calc_w.or(s.width) } else { s.height };
         let explicit_main = explicit_main.map(nonneg);
         let explicit_cross = explicit_cross.map(nonneg);
 
@@ -321,6 +329,7 @@ pub(crate) fn layout_flex(
                 dom: ctx.dom,
                 styles: ctx.styles,
                 list: &mut scratch,
+                cache: &mut *ctx.cache,
             };
             layout_child(&mut mctx, &mut measure_flow, &fallback, node, link.clone());
         }
@@ -473,7 +482,15 @@ pub(crate) fn layout_flex(
         let (fl, fr, fy) = if column {
             (cpos, cpos + cross_extent, lo)
         } else {
-            (lo, hi, cpos)
+            // A deferred `%` calc was already resolved against the container's
+            // content width when the flex basis was computed. Give the item's
+            // block flow that same basis so it does not resolve `%` twice.
+            let basis = if ctx.styles.deferred_width(item.node).is_some() {
+                lo + inner_w
+            } else {
+                hi
+            };
+            (lo, basis, cpos)
         };
 
         let mut scratch = DisplayList::default();
@@ -483,6 +500,7 @@ pub(crate) fn layout_flex(
                 dom: ctx.dom,
                 styles: ctx.styles,
                 list: &mut scratch,
+                cache: &mut *ctx.cache,
             };
             layout_child(&mut rctx, &mut flow, &fallback, item.node, link.clone());
         }
@@ -508,6 +526,7 @@ pub(crate) fn layout_flex(
                 dom: ctx.dom,
                 styles: ctx.styles,
                 list: &mut scratch,
+                cache: &mut *ctx.cache,
             };
             layout_child(&mut rctx, &mut flow, &fallback, node, link.clone());
         }

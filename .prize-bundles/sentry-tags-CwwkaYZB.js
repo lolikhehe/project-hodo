@@ -1,0 +1,2 @@
+const __vite__mapDeps=(i,m=__vite__mapDeps,d=(m.f||(m.f=["offshoot_assets/esm-CWeBglMZ.js","offshoot_assets/rolldown-runtime-QTnfLwEv.js"])))=>i.map(i=>d[i]);
+import{h as e}from"./index-NFRVgqV2.js";async function t(t,n){(await e(()=>import(`./esm-CWeBglMZ.js`).then(e=>e.t),__vite__mapDeps([0,1]))).setTag(t,n)}export{t};

@@ -1,7 +1,9 @@
-//! Spawn end-to-end tests. Ignored by default: they need the worker binaries
-//! built first (`cargo build -p hodo-ext-worker -p hodo-ext-host`), and they
-//! really create OS processes. Run with `cargo test -p hodo-ext-host --test
-//! broker_e2e -- --ignored --nocapture`.
+//! Spawn end-to-end tests that really create OS processes.
+//!
+//! The fake-worker tests run in the standing gate (`cargo test -p hodo-ext-host
+//! ...`): Cargo builds `hodo-ext-fake-worker` automatically for this target.
+//! Tests that need the real `hodo-ext-worker` binary built alongside the browser
+//! stay `#[ignore]` and are run with `--ignored` after that build.
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -243,9 +245,11 @@ fn spawn_failure_exhausts_backoff_and_disables() {
 
 /// P1: an event arriving inside the shutdown grace window must reach the
 /// worker (the `Shutdown` frame is queued only after grace) and cancel the
-/// pending shutdown. Driven entirely by the injected clock.
+/// pending shutdown. Broker deadlines use the injected clock; the worker is a
+/// real process. Stability: the 5 s waits absorb slow Windows process startup
+/// (verified on Windows CI); if a loaded runner ever flakes, raise the waits —
+/// do not re-ignore this regression.
 #[test]
-#[ignore]
 fn event_in_shutdown_grace_is_delivered_and_cancels_shutdown() {
     let clock = Rc::new(FakeClock::new(0));
     let mut host = HostBuilder::new()
@@ -294,9 +298,9 @@ fn event_in_shutdown_grace_is_delivered_and_cancels_shutdown() {
 
 /// P1: a crash starts a backoff; an event sent during it must be retained and
 /// replayed when `poll` restarts the worker. The fake worker crashes once
-/// (marker file), then survives to log the replayed event.
+/// (marker file), then survives to log the replayed event. Standing gate: the
+/// marker uses a per-process temp path so parallel test binaries cannot collide.
 #[test]
-#[ignore]
 fn event_during_backoff_is_replayed_after_clock_driven_restart() {
     let marker = std::env::temp_dir().join(format!(
         "hodo-fake-crash-once-{}.marker",
@@ -350,8 +354,9 @@ fn event_during_backoff_is_replayed_after_clock_driven_restart() {
 }
 
 /// P2: repeated RSS observability reads must not seed or trip the watchdog.
+/// Standing gate: the getter now reports a fresh current sample each call but
+/// never calls `RssWatchdog::observe`.
 #[test]
-#[ignore]
 fn repeated_rss_diagnostic_reads_do_not_kill_the_worker() {
     let clock = Rc::new(FakeClock::new(0));
     let mut host = HostBuilder::new()
@@ -404,7 +409,7 @@ fn worker_rss_baseline() {
     thread::sleep(Duration::from_millis(500));
     let bytes = host.worker_rss_bytes(0).expect("rss sample");
     eprintln!(
-        "one-worker RSS baseline: {} bytes ({:.1} MiB); 16-context budget {:.1} MiB",
+        "one-worker RSS (current sample): {} bytes ({:.1} MiB); 16-context budget {:.1} MiB",
         bytes,
         bytes as f64 / (1024.0 * 1024.0),
         bytes as f64 * 16.0 / (1024.0 * 1024.0)
