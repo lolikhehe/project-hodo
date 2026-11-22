@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use cssparser::{Delimiter, ParseError, Parser, ToCss, Token};
-use hodo_dom::{Dom, NodeId, NodeKind};
+use hodo_dom::{Dom, NodeId};
 
 /// Maximum number of compounds in one selector (spec starting proposal).
 pub const MAX_COMPOUNDS: usize = 64;
@@ -202,7 +202,7 @@ fn parse_qualified_rule(parser: &mut Parser<'_>) -> Option<Vec<StyleRule>> {
     let prelude = parser
         .parse_until_before(Delimiter::CurlyBracketBlock, |p| {
             let mut tokens = Vec::new();
-            while let Ok(token) = p.next() {
+            while let Ok(token) = p.next_including_whitespace() {
                 tokens.push(token.clone());
             }
             Ok::<_, ParseError<()>>(tokens)
@@ -242,8 +242,10 @@ fn parse_qualified_rule(parser: &mut Parser<'_>) -> Option<Vec<StyleRule>> {
                         });
                     }
                 }
-                group_index += 1;
             }
+            // Advance once per group, including empty ones: the streaming
+            // parser emits a `None` slot for every comma-separated group.
+            group_index += 1;
             current.clear();
         } else {
             current.push(token);
@@ -319,8 +321,9 @@ fn parse_selector_list_streaming(parser: &mut Parser<'_>) -> Vec<Option<Selector
 
 /// Parse a plain compound selector from already-tokenized prelude tokens.
 /// `Err` means the group needs the streaming parser (nested blocks, pseudos or
-/// combinators). Whitespace is already discarded, so multiple bare idents mean
-/// a descendant combinator.
+/// combinators). Whitespace is preserved in the token stream, so any whitespace
+/// (including between two simple selectors) delegates to the streaming parser,
+/// which is the only place descendant combinators are built.
 fn selector_from_tokens(tokens: &[Token<'_>]) -> Result<Selector, ()> {
     let mut selector = Selector {
         tag: None,
@@ -332,7 +335,8 @@ fn selector_from_tokens(tokens: &[Token<'_>]) -> Result<Selector, ()> {
     let mut i = 0;
     while i < tokens.len() {
         match &tokens[i] {
-            Token::Function(_)
+            Token::WhiteSpace(_)
+            | Token::Function(_)
             | Token::SquareBracketBlock
             | Token::Colon
             | Token::Delim('>' | '+' | '~') => return Err(()),
@@ -527,7 +531,9 @@ fn parse_selector_stream<'i>(parser: &mut Parser<'i>) -> Result<Selector, ParseE
                         Token::Ident(_)
                         | Token::Hash(_)
                         | Token::IDHash(_)
-                        | Token::Delim('.' | '*' | ':')
+                        | Token::Function(_)
+                        | Token::Colon
+                        | Token::Delim('.' | '*')
                         | Token::SquareBracketBlock,
                     ) => {
                         parser.reset(&after_space);
@@ -563,7 +569,12 @@ fn parse_selector_stream<'i>(parser: &mut Parser<'i>) -> Result<Selector, ParseE
     }
 
     if compounds.is_empty() && first.is_empty() {
-        return Err(parser.new_error_for_next_token());
+        // `new_error_for_next_token` advances past the offending token; keep
+        // the comma so the selector-list recovery loop can find the next group.
+        let state = parser.state();
+        let error = parser.new_error_for_next_token();
+        parser.reset(&state);
+        return Err(error);
     }
     if compounds.is_empty() {
         if first.attrs.is_empty() && first.pseudos.is_empty() {
@@ -586,7 +597,7 @@ fn parse_compound<'i>(parser: &mut Parser<'i>, not_depth: u8) -> Result<Compound
     let mut compound = Compound::default();
     loop {
         let state = parser.state();
-        let token = match parser.next() {
+        let token = match parser.next_including_whitespace() {
             Ok(token) => token.clone(),
             Err(_) => {
                 parser.reset(&state);
@@ -594,6 +605,15 @@ fn parse_compound<'i>(parser: &mut Parser<'i>, not_depth: u8) -> Result<Compound
             }
         };
         match token {
+            // Leading whitespace is insignificant; internal whitespace ends
+            // this compound and leaves a descendant combinator for the caller.
+            // Inside `:not()` the leftover makes `parse_nested_block` fail, so
+            // nested combinators are rejected instead of silently folded.
+            Token::WhiteSpace(_) if compound.is_empty() => continue,
+            Token::WhiteSpace(_) => {
+                parser.reset(&state);
+                break;
+            }
             Token::Ident(name) if compound.tag.is_none() => {
                 compound.tag = Some(name.to_string());
             }
@@ -633,6 +653,9 @@ fn parse_compound<'i>(parser: &mut Parser<'i>, not_depth: u8) -> Result<Compound
                         PseudoClass::NthChild(nth.0, nth.1)
                     }
                     "not" => {
+                        // One compound only: a nested combinator leaves tokens
+                        // unconsumed in the nested block, which makes
+                        // `parse_nested_block` fail and drops the whole rule.
                         if not_depth >= MAX_NOT_DEPTH {
                             return Err(parser.new_error_for_next_token());
                         }
@@ -1238,15 +1261,27 @@ fn nth_matches(a: i32, b: i32, index: usize) -> bool {
     }
 }
 
-/// HTML attribute names are ASCII case-insensitive.
+/// HTML attribute names are ASCII case-insensitive, but `Dom::attr` (and the
+/// interner behind it) looks names up exactly. The HTML parser stores names in
+/// lower case, so retry the other common spelling on a miss; this keeps
+/// selectors like `[HREF]` and mixed-case DOM attributes working in both
+/// `Dom::new()` and `Dom::with_interning()` modes.
+///
+/// TODO(fast path): once selector names are normalised at parse time, replace
+/// this with a single `dom.attr_interned(id, name)` and compare its u32 id in
+/// `attr_matches` — no per-candidate byte walking.
 fn attr_value<'a>(dom: &'a Dom, id: NodeId, name: &str) -> Option<&'a str> {
-    match &dom.get(id).kind {
-        NodeKind::Element { attrs, .. } => attrs
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.as_str()),
-        _ => None,
+    if let Some(value) = dom.attr(id, name) {
+        return Some(value);
     }
+    // Matches (the hot case) stay allocation-free; only misses allocate.
+    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        return dom.attr(id, &name.to_ascii_lowercase());
+    }
+    if name.bytes().any(|b| b.is_ascii_lowercase()) {
+        return dom.attr(id, &name.to_ascii_uppercase());
+    }
+    None
 }
 
 fn attr_matches(attr: &AttributeSelector, actual: &str) -> bool {
@@ -1460,6 +1495,7 @@ impl RuleIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hodo_dom::NodeKind;
     use std::time::{Duration, Instant};
 
     fn selector(s: &str) -> Selector {
@@ -1725,6 +1761,122 @@ mod tests {
     }
 
     #[test]
+    fn descendant_selectors_are_not_folded_into_one_compound() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let outer = elem(&mut dom, root, "div", &[("class", "a")]);
+        let nested = elem(
+            &mut dom,
+            outer,
+            "span",
+            &[("class", "b"), ("id", "b"), ("data-x", "1")],
+        );
+        let second = elem(&mut dom, outer, "span", &[("class", "c")]);
+        // A single node carrying both classes/id/attr must not satisfy a
+        // descendant selector: `.a .b` needs two nodes in an ancestor chain.
+        let both = elem(
+            &mut dom,
+            root,
+            "div",
+            &[("class", "a b"), ("id", "b"), ("data-x", "1")],
+        );
+
+        for text in [".a .b", ".a #b", ".a *", ".a [data-x]", ".a :first-child"] {
+            let sel = selector(text);
+            assert!(
+                !matches_selector(&sel, &dom, both),
+                "{text} must not match a single compound node"
+            );
+            assert!(
+                matches_selector(&sel, &dom, nested),
+                "{text} must match the nested node"
+            );
+        }
+        assert!(!matches_selector(&selector(".a .b"), &dom, second));
+        // The sibling (2nd child of root) has class `a` but is not itself a
+        // descendant of another `.a`, so it cannot match `.a :nth-child(2)`.
+        assert!(!matches_selector(&selector(".a :nth-child(2)"), &dom, both));
+        assert!(matches_selector(
+            &selector(".a :nth-child(2)"),
+            &dom,
+            second
+        ));
+    }
+
+    #[test]
+    fn nth_child_after_whitespace_is_a_descendant() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let outer = elem(&mut dom, root, "div", &[("class", "a")]);
+        let first = elem(&mut dom, outer, "li", &[]);
+        let second = elem(&mut dom, outer, "li", &[]);
+        assert!(matches_selector(
+            &selector(".a :nth-child(2)"),
+            &dom,
+            second
+        ));
+        assert!(!matches_selector(
+            &selector(".a :nth-child(2)"),
+            &dom,
+            first
+        ));
+        assert!(!matches_selector(
+            &selector(".a :nth-child(2)"),
+            &dom,
+            outer
+        ));
+    }
+
+    #[test]
+    fn empty_comma_groups_do_not_misalign_streamed_selectors() {
+        let sheet = parse_stylesheet(", :not(.x) { color: red } p { color: blue }");
+        let values: Vec<&str> = sheet
+            .rules
+            .iter()
+            .map(|r| r.declarations[0].value.as_str())
+            .collect();
+        assert_eq!(values, ["red", "blue"]);
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let x = elem(&mut dom, root, "div", &[("class", "x")]);
+        let plain = elem(&mut dom, root, "div", &[]);
+        assert!(!matches_selector(&sheet.rules[0].selector, &dom, x));
+        assert!(matches_selector(&sheet.rules[0].selector, &dom, plain));
+
+        let sheet = parse_stylesheet(":not(.a), , :not(.b) { color: red } p { color: blue }");
+        let values: Vec<&str> = sheet
+            .rules
+            .iter()
+            .map(|r| r.declarations[0].value.as_str())
+            .collect();
+        assert_eq!(values, ["red", "red", "blue"]);
+        let a = elem(&mut dom, root, "div", &[("class", "a")]);
+        let b = elem(&mut dom, root, "div", &[("class", "b")]);
+        assert!(!matches_selector(&sheet.rules[0].selector, &dom, a));
+        assert!(matches_selector(&sheet.rules[0].selector, &dom, b));
+        assert!(matches_selector(&sheet.rules[1].selector, &dom, a));
+        assert!(!matches_selector(&sheet.rules[1].selector, &dom, b));
+    }
+
+    #[test]
+    fn not_rejects_nested_combinators_without_affecting_siblings() {
+        let sheet = parse_stylesheet(":not(.a .b) { color: red } p { color: blue }");
+        let values: Vec<&str> = sheet
+            .rules
+            .iter()
+            .map(|r| r.declarations[0].value.as_str())
+            .collect();
+        assert_eq!(values, ["blue"]);
+        let sheet = parse_stylesheet("a:not(.x .y) { color: red } p { color: blue }");
+        let values: Vec<&str> = sheet
+            .rules
+            .iter()
+            .map(|r| r.declarations[0].value.as_str())
+            .collect();
+        assert_eq!(values, ["blue"]);
+    }
+
+    #[test]
     fn child_pseudo_classes_and_empty() {
         let (mut dom, _, first, target, last) = sample_tree();
         assert!(matches_selector(&selector("li:first-child"), &dom, first));
@@ -1814,6 +1966,34 @@ mod tests {
                 matches_selector(&selector(text), &dom, link),
                 expected,
                 "attribute selector {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn attribute_selectors_match_with_interning() {
+        // Mirror of the attribute-selector path with per-node strings stripped:
+        // the pool must serve tag/attr reads identically to Dom::new() mode.
+        let mut dom = Dom::with_interning();
+        let root = dom.root();
+        let link = elem(
+            &mut dom,
+            root,
+            "a",
+            &[("href", "https://example.com"), ("LANG", "en-US")],
+        );
+        for &(text, expected) in &[
+            ("a[href]", true),
+            ("a[href$='com']", true),
+            ("a[lang]", true),
+            ("a[lang|='en']", true),
+            ("a[HREF^='https' i]", true),
+            ("a[missing]", false),
+        ] {
+            assert_eq!(
+                matches_selector(&selector(text), &dom, link),
+                expected,
+                "interned DOM: attribute selector {text}"
             );
         }
     }
