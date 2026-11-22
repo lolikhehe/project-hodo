@@ -144,6 +144,13 @@ pub(crate) struct Avail {
     pub(crate) width: f32,
 }
 
+/// Resolve a length-or-percent pair against a containing-block width. CSS
+/// resolves width, margin and padding percentages against that one basis, so
+/// floats and in-flow blocks share this helper.
+pub(crate) fn resolve_span(abs: f32, pct: Option<f32>, basis: f32) -> f32 {
+    pct.map_or(abs, |p| (p / 100.0) * basis)
+}
+
 /// Style used for text nodes that have no computed style of their own.
 pub(crate) fn fallback_style() -> ComputedStyle {
     ComputedStyle {
@@ -194,6 +201,9 @@ pub(crate) fn fallback_style() -> ComputedStyle {
         overflow: Overflow::Visible,
         offsets: Edges::zero(),
         width: None,
+        width_percent: None,
+        margin_percent: Edges::zero(),
+        padding_percent: Edges::zero(),
         height: None,
         min_size: Size { w: 0.0, h: 0.0 },
         max_size: Size {

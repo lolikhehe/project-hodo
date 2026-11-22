@@ -109,6 +109,11 @@ pub(crate) fn layout_inline_run(
     }
     flush_line(&mut sub, ctx.list);
     flow.y = sub.y;
+    // Floats raised inside the anonymous run must reach the parent flow or its
+    // auto height (and later siblings' `clear`) cannot see them.
+    flow.float_l = sub.float_l;
+    flow.float_r = sub.float_r;
+    flow.float_bottoms = sub.float_bottoms;
 }
 
 /// Shift display items emitted by one element for `position: relative`.
@@ -380,12 +385,26 @@ fn layout_child_inner(
                     Clear::None => flow.y,
                 }
             };
-            let fm = &st.margin;
+            // CSS resolves width/margin/padding percentages against the
+            // containing block's content width. Floats used the raw `Option`
+            // fields, so `width:31%` was dropped and every column took the
+            // full band (then all stacked at x=flow.left).
+            let cb_width = (flow.right - flow.left).max(0.0);
+            let fm = Edges {
+                top: resolve_span(st.margin.top, st.margin_percent.top, cb_width),
+                right: resolve_span(st.margin.right, st.margin_percent.right, cb_width),
+                bottom: resolve_span(st.margin.bottom, st.margin_percent.bottom, cb_width),
+                left: resolve_span(st.margin.left, st.margin_percent.left, cb_width),
+            };
             // shortcut: floats without an explicit width take the full content
             // width (no shrink-to-fit pass yet); upgrade with intrinsic sizing.
+            let specified_w = st
+                .width_percent
+                .map(|pct| resolve_span(0.0, Some(pct), cb_width))
+                .or(st.width);
             let float_w = if is_float {
-                st.width
-                    .unwrap_or((flow.right - flow.left - fm.left - fm.right).max(0.0))
+                specified_w
+                    .unwrap_or((cb_width - fm.left - fm.right).max(0.0))
                     .max(st.min_size.w.max(0.0))
                     .min(st.max_size.w.max(0.0))
                     .max(0.0)
@@ -404,11 +423,11 @@ fn layout_child_inner(
             };
             // shortcut: wave 1 containing block is the parent's content box;
             // right/bottom offsets are still ignored for absolute and fixed.
-            // `top` is measured from that box's origin, not the current cursor:
-            // without it, an absolute banner label lands on the next sibling's
-            // line and paints over it (EFF's red featured banner).
+            // A specified `top`/`left` is measured from that box's origin, not
+            // the current cursor: without it an absolute banner label lands on
+            // the next sibling's line (EFF's red featured banner). An omitted
+            // offset is `auto` and means the box's static position in flow.
             let left = st.offsets.left.unwrap_or(0.0);
-            let top = st.offsets.top.unwrap_or(0.0);
             // Inline-level atomics take a slot in the line box, so they start
             // at the float-free edge (and after any atoms already on the line)
             // instead of the bare content edge.
@@ -422,17 +441,29 @@ fn layout_child_inner(
             let float_band = crate::inline::float_bounds(flow);
             let avail = Avail {
                 x: if is_float && float_kind == Float::Right {
-                    // Right floats hug the content edge minus their margins.
-                    flow.right - float_w - fm.left - fm.right
+                    // Right floats hug the content edge minus their margins,
+                    // then stack left of any earlier right float's margin box.
+                    let edge = flow.float_r.map_or(flow.right, |r| r.x);
+                    edge - float_w - fm.left - fm.right
+                } else if is_float {
+                    // Left floats advance past the earlier left floats' margin
+                    // box; without this all same-side floats paint at flow.left
+                    // and the columns overlap (EFF's featured articles).
+                    flow.float_l.map_or(flow.left, |r| r.x + r.w)
                 } else if absolute {
-                    flow.abs_origin.0 + left
+                    // `left: auto` pins to the static x, not the containing
+                    // block's left edge (which would stack sibling absolutes).
+                    st.offsets.left.map_or(flow.left, |l| flow.abs_origin.0 + l)
                 } else if inline_atomic {
                     float_band.0 + flow.line_w
                 } else {
                     flow.left
                 },
                 y: if absolute {
-                    flow.abs_origin.1 + top
+                    // `top: auto` is the static y: where the box would have
+                    // sat in flow. Pinning it to abs_origin.1 stacks every
+                    // no-offset absolute at the same origin (Wikipedia header).
+                    st.offsets.top.map_or(clear_y, |t| flow.abs_origin.1 + t)
                 } else {
                     clear_y
                 },
@@ -650,16 +681,32 @@ fn layout_block_inner(
     link: Option<String>,
     inherited: &Flow,
 ) -> f32 {
-    let m = &style.margin;
-    let p = &style.padding;
+    // Percentages on width/margin/padding resolve against this containing
+    // block's content width — the same basis the float path uses.
+    let basis = avail.width.max(0.0);
+    let m = Edges {
+        top: resolve_span(style.margin.top, style.margin_percent.top, basis),
+        right: resolve_span(style.margin.right, style.margin_percent.right, basis),
+        bottom: resolve_span(style.margin.bottom, style.margin_percent.bottom, basis),
+        left: resolve_span(style.margin.left, style.margin_percent.left, basis),
+    };
+    let p = Edges {
+        top: resolve_span(style.padding.top, style.padding_percent.top, basis),
+        right: resolve_span(style.padding.right, style.padding_percent.right, basis),
+        bottom: resolve_span(style.padding.bottom, style.padding_percent.bottom, basis),
+        left: resolve_span(style.padding.left, style.padding_percent.left, basis),
+    };
     let bw = style.border_width.max(0.0);
 
     let box_x = avail.x + m.left;
     let box_y = avail.y + m.top;
     // shortcut: explicit width/min/max clamp the border box (no box-sizing
     // support); max-size wins when the two constraints cross over.
-    let mut box_w = style
-        .width
+    let specified_w = style
+        .width_percent
+        .map(|pct| resolve_span(0.0, Some(pct), basis))
+        .or(style.width);
+    let mut box_w = specified_w
         .unwrap_or(avail.width - m.left - m.right)
         .max(0.0);
     box_w = box_w.max(style.min_size.w.max(0.0));
@@ -749,6 +796,7 @@ fn layout_block_inner(
     flow.float_l = inherited.float_l;
     flow.float_r = inherited.float_r;
     flow.float_bottoms = inherited.float_bottoms;
+    let inherited_float_bottom = flow.float_bottoms.0.max(flow.float_bottoms.1);
     if ctx
         .dom
         .tag(id)
@@ -760,7 +808,15 @@ fn layout_block_inner(
     flush_line(&mut flow, ctx.list);
 
     // Cyclic clamp: width is resolved before children lay out, height after.
+    // A block's auto height also contains the floats it raised (the BFC /
+    // clearfix rule). Floats do not advance `flow.y`, so without this a run of
+    // floated cards consumes zero height and every later sibling paints on top
+    // of them — EFF's front-page panes and footer collapse into one band.
+    let own_float_bottom = flow.float_bottoms.0.max(flow.float_bottoms.1);
     let mut content_h = (flow.y - top).max(0.0);
+    if own_float_bottom > inherited_float_bottom {
+        content_h = content_h.max(own_float_bottom - top);
+    }
     if clip_enabled {
         // A vertical-align shift can paint a line box below the flow cursor;
         // the clip box must still contain it (HN's overflow:hidden story cells).
@@ -1535,6 +1591,247 @@ mod tests {
         assert_eq!(
             plain[1].1, cleared[1].1,
             "clear with no floats must not move the block"
+        );
+    }
+
+    #[test]
+    fn percent_floats_form_side_by_side_columns() {
+        // EFF's featured articles: three `float:left` columns whose width and
+        // margin are percentages of the containing block, not the viewport and
+        // not the full band. A 31.6% box + 2% right margin steps by 33.6%.
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let pane = elem(
+            &mut dom,
+            root,
+            "div",
+            &[("style", "width:1000px; background:#99ccff")],
+        );
+        for (color, h) in [
+            ("#ff0000", "60px"),
+            ("#00ff00", "40px"),
+            ("#0000ff", "50px"),
+        ] {
+            elem(
+                &mut dom,
+                pane,
+                "div",
+                &[(
+                    "style",
+                    &format!(
+                        "float:left; width:31.6%; margin-right:2%; height:{h}; background:{color}"
+                    ),
+                )],
+            );
+        }
+        let list = layout(&dom, &compute_styles(&dom, &[]), viewport(1000.0));
+        let red = colored_rects(&list, Color::rgb(255, 0, 0));
+        let green = colored_rects(&list, Color::rgb(0, 255, 0));
+        let blue = colored_rects(&list, Color::rgb(0, 0, 255));
+        let pane_bg = colored_rects(&list, Color::rgb(0x99, 0xcc, 0xff));
+        assert_eq!((red.len(), green.len(), blue.len()), (1, 1, 1));
+        for (got, want) in [(red[0].x, 0.0), (green[0].x, 336.0), (blue[0].x, 672.0)] {
+            assert!((got - want).abs() < 0.5, "column x: got {got}, want {want}");
+        }
+        for c in [&red[0], &green[0], &blue[0]] {
+            assert!((c.w - 316.0).abs() < 0.5, "31.6% of 1000px: {c:?}");
+        }
+        assert!(
+            red[0].x + red[0].w <= green[0].x && green[0].x + green[0].w <= blue[0].x,
+            "columns must not overlap horizontally: {red:?} {green:?} {blue:?}"
+        );
+        assert_eq!(pane_bg.len(), 1);
+        assert!(
+            pane_bg[0].h >= 60.0 && pane_bg[0].h < 61.0,
+            "container height must equal the tallest column: {:?}",
+            pane_bg[0]
+        );
+    }
+
+    #[test]
+    fn percent_margin_on_float_advances_the_next_float() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let pane = elem(&mut dom, root, "div", &[("style", "width:1000px")]);
+        for color in ["#ff0000", "#00ff00"] {
+            elem(
+                &mut dom,
+                pane,
+                "div",
+                &[(
+                    "style",
+                    &format!(
+                        "float:left; width:20%; margin-left:10%; height:20px; background:{color}"
+                    ),
+                )],
+            );
+        }
+        let list = layout(&dom, &compute_styles(&dom, &[]), viewport(1000.0));
+        let red = colored_rects(&list, Color::rgb(255, 0, 0));
+        let green = colored_rects(&list, Color::rgb(0, 255, 0));
+        assert_eq!((red.len(), green.len()), (1, 1));
+        assert!((red[0].x - 100.0).abs() < 0.5, "10% margin: {red:?}");
+        assert!(
+            (green[0].x - 400.0).abs() < 0.5,
+            "next float starts past the first's margin box: {green:?} {red:?}"
+        );
+    }
+
+    #[test]
+    fn full_width_float_monopolizes_the_band() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let pane = elem(&mut dom, root, "div", &[("style", "width:1000px")]);
+        for color in ["#ff0000", "#00ff00"] {
+            elem(
+                &mut dom,
+                pane,
+                "div",
+                &[(
+                    "style",
+                    &format!("float:left; width:100%; height:20px; background:{color}"),
+                )],
+            );
+        }
+        let list = layout(&dom, &compute_styles(&dom, &[]), viewport(1000.0));
+        let green = colored_rects(&list, Color::rgb(0, 255, 0));
+        assert_eq!(green.len(), 1);
+        assert!(
+            green[0].x >= 1000.0,
+            "a 100% float leaves no room for the next one: {green:?}"
+        );
+    }
+
+    #[test]
+    fn percent_padding_on_float_uses_the_containing_block_width() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let pane = elem(&mut dom, root, "div", &[("style", "width:1000px")]);
+        let card = elem(
+            &mut dom,
+            pane,
+            "div",
+            &[(
+                "style",
+                "float:left; width:20%; padding-left:5%; background:#ffcc99",
+            )],
+        );
+        text_node(&mut dom, card, "x");
+        let list = layout(&dom, &compute_styles(&dom, &[]), viewport(1000.0));
+        let t = texts(&list);
+        assert_eq!(t.len(), 1, "float text survives: {t:?}");
+        assert!(
+            (t[0].1.x - 50.0).abs() < 0.5,
+            "5% padding of 1000px shifts text to x=50: {:?}",
+            t[0]
+        );
+    }
+
+    #[test]
+    fn floated_children_raise_their_parents_auto_height() {
+        // EFF front page: a pane whose only in-flow children are floats must
+        // still consume the floats' height, or every later pane/footer paints
+        // on the same line as the first one.
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let pane = elem(
+            &mut dom,
+            root,
+            "div",
+            &[("style", "width:200px; background:#99ccff")],
+        );
+        elem(
+            &mut dom,
+            pane,
+            "div",
+            &[(
+                "style",
+                "float:left; width:80px; height:60px; background:#ffcc99",
+            )],
+        );
+        let after = elem(
+            &mut dom,
+            root,
+            "div",
+            &[("style", "width:200px; height:10px; background:#ddd0e8")],
+        );
+        let _ = after;
+        let list = layout(&dom, &compute_styles(&dom, &[]), viewport(200.0));
+        let blue = colored_rects(&list, Color::rgb(0x99, 0xcc, 0xff));
+        let orange = colored_rects(&list, Color::rgb(0xff, 0xcc, 0x99));
+        let purple = colored_rects(&list, Color::rgb(0xdd, 0xd0, 0xe8));
+        assert_eq!((blue.len(), orange.len(), purple.len()), (1, 1, 1));
+        assert!(
+            blue[0].h >= 60.0,
+            "the parent box must grow around its float: {blue:?}"
+        );
+        assert!(
+            purple[0].y >= orange[0].y + orange[0].h,
+            "the next sibling must start below the float, not on top of it: {purple:?} {orange:?}"
+        );
+    }
+
+    #[test]
+    fn float_inside_anonymous_inline_run_reaches_parent_height() {
+        // The inline run gets its own scratch Flow; a float raised inside it
+        // must be copied back or the parent still collapses to zero height.
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let pane = elem(&mut dom, root, "div", &[("style", "width:200px")]);
+        text_node(&mut dom, pane, "lead-in");
+        let span = elem(&mut dom, pane, "span", &[]);
+        elem(
+            &mut dom,
+            span,
+            "div",
+            &[(
+                "style",
+                "float:left; width:60px; height:50px; background:#ffcc99",
+            )],
+        );
+        let after = elem(
+            &mut dom,
+            root,
+            "div",
+            &[("style", "width:200px; height:10px; background:#ddd0e8")],
+        );
+        let _ = after;
+        let list = layout(&dom, &compute_styles(&dom, &[]), viewport(200.0));
+        let orange = colored_rects(&list, Color::rgb(0xff, 0xcc, 0x99));
+        let purple = colored_rects(&list, Color::rgb(0xdd, 0xd0, 0xe8));
+        assert_eq!((orange.len(), purple.len()), (1, 1));
+        assert!(
+            purple[0].y >= orange[0].y + orange[0].h,
+            "float state must survive the inline-run scratch flow: {purple:?} {orange:?}"
+        );
+    }
+
+    #[test]
+    fn absolute_with_auto_offset_uses_static_flow_position() {
+        // Wikipedia portal: the language links are absolute with percentage
+        // offsets we drop; with `auto` semantics they must still sit at their
+        // static position instead of all stacking on the containing-block top.
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let before = elem(&mut dom, root, "div", &[("style", "height:40px")]);
+        text_node(&mut dom, before, "before");
+        let abs = elem(
+            &mut dom,
+            root,
+            "div",
+            &[("style", "position:absolute; left:10px; background:#ff0000")],
+        );
+        text_node(&mut dom, abs, "absolute");
+        let list = layout(&dom, &compute_styles(&dom, &[]), viewport(200.0));
+        let red = colored_rects(&list, Color::rgb(255, 0, 0));
+        assert_eq!(red.len(), 1, "absolute box still paints: {red:?}");
+        assert!(
+            red[0].y >= 40.0,
+            "`top:auto` must use the static y, not the containing block top: {red:?}"
+        );
+        assert!(
+            (red[0].x - 10.0).abs() < 0.01,
+            "a specified left is still honoured: {red:?}"
         );
     }
 
