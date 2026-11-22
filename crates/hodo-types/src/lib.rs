@@ -2,6 +2,9 @@
 
 pub mod limits;
 
+/// Re-export of the central resource cap so callers can use the short path.
+pub use limits::MAX_RESOURCE_BYTES;
+
 /// Axis-aligned rectangle in CSS pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rect {

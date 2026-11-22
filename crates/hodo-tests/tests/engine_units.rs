@@ -14,14 +14,28 @@ fn demo_dir() -> PathBuf {
 
 fn find_tag(dom: &Dom, tag: &str) -> NodeId {
     let mut found = None;
-    dom.walk(|id, node| {
-        if found.is_none()
-            && matches!(&node.kind, NodeKind::Element { tag: name, .. } if name == tag)
-        {
+    dom.walk(|id, _| {
+        if found.is_none() && dom.tag(id) == Some(tag) {
             found = Some(id);
         }
     });
     found.unwrap_or_else(|| panic!("element <{tag}> not found"))
+}
+
+#[test]
+fn interned_dom_find_tag_reads_pool_backed_strings() {
+    // Mirror of find_tag with per-node strings stripped by Dom::with_interning().
+    let mut dom = Dom::with_interning();
+    let root = dom.root();
+    let p = dom.create(NodeKind::Element {
+        tag: "p".into(),
+        attrs: vec![("id".into(), "greet".into())],
+    });
+    dom.append(root, p);
+
+    assert_eq!(find_tag(&dom, "p"), p);
+    assert_eq!(dom.tag(p), Some("p"));
+    assert_eq!(dom.attr(p, "id"), Some("greet"));
 }
 
 #[test]
@@ -111,7 +125,8 @@ fn oversized_local_file_is_rejected_as_too_large() {
         "hodo-e2e-too-large-{}-{nanos}.bin",
         std::process::id()
     ));
-    fs::write(&path, vec![0u8; hodo_net::MAX_BYTES + 1]).expect("write oversized temp file");
+    fs::write(&path, vec![0u8; hodo_types::MAX_RESOURCE_BYTES + 1])
+        .expect("write oversized temp file");
 
     let result = hodo_net::load(&path.to_string_lossy());
     let _ = fs::remove_file(&path);

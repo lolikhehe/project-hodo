@@ -11,16 +11,35 @@
 //!   hard-broken in linear work (one bounded scan per emitted chunk).
 //! - One Text item per line (first-atom color/font/href wins) so link clicks
 //!   map to the line fragment that was clicked, not a whole-element box.
-//! - Deferred to the property-plumbing sweep (ComputedStyle is owned by the
-//!   hodo-style/selectors wave): `vertical-align`, `line-height`, `text-align`,
-//!   `text-indent`, `letter-spacing`, `word-spacing`, `overflow-wrap`,
-//!   non-normal `white-space`, `display: inline-block`, font fallback/synthesis,
-//!   text-decoration rasterization and bidi/complex scripts.
 //! - Vertical margins sum, never collapse. Unknown nodes are transparent
 //!   containers.
+//!
+//! Implementation lives in `block` (block flow) and `inline` (inline
+//! formatting); `table`, `flex`, `grid` and `forms` are reserved stubs.
+
+mod block;
+mod flex;
+mod forms;
+mod grid;
+mod inline;
+mod table;
+
+pub use block::layout;
+
+pub(crate) use flex::layout_flex;
+pub(crate) use grid::layout_grid;
+pub(crate) use inline::{
+    feed_text, flush_line, has_content, inline_block_atom, left_inset, push_atom, right_inset,
+    Atom, Flow, InlineBox,
+};
+pub(crate) use table::layout_table;
 
 use hodo_dom::{Dom, NodeId, NodeKind};
-use hodo_style::{ComputedStyle, Display, StyleMap};
+use hodo_style::{
+    AlignItems, AlignSelf, BorderCollapse, Clear, ComputedStyle, Display, FlexBasis, FlexDirection,
+    FlexWrap, Float, GridLine, JustifyContent, LineHeight, Overflow, OverflowWrap, Position,
+    StyleMap, TableLayout, TextAlign, VerticalAlign, WhiteSpace,
+};
 use hodo_types::{Color, Edges, Rect, Size};
 
 #[derive(Debug, Clone)]
@@ -38,120 +57,95 @@ pub enum DisplayItem {
         font_size: f32,
         weight: u16,
         href: Option<String>,
+        underline: bool,
+        line_through: bool,
     },
     Image {
         rect: Rect,
         path: String,
     },
+    Control {
+        rect: Rect,
+        kind: ControlKind,
+        text: String,
+        name: String,
+        masked: bool,
+        disabled: bool,
+        readonly: bool,
+    },
+}
+
+/// Semantic form control kinds emitted by form layout and drawn by the renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlKind {
+    TextInput,
+    Checkbox,
+    Radio,
+    Button,
+    Select,
+    Textarea,
+    Option,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct DisplayList {
     pub items: Vec<DisplayItem>,
+    /// Owning element of each display item: `node_map[i]` owns `items[i]`.
+    /// Text items point at the text node's parent element (events target
+    /// elements, not text nodes). Kept index-parallel to `items` so a shell
+    /// can hit-test an item back to its DOM element.
+    pub node_map: Vec<NodeId>,
+
+    /// Fixed-position items, painted in a separate channel from the scrolled
+    /// page items. `fixed_node_map[i]` owns `fixed_items[i]` by the same
+    /// index-parallel rule as `items`/`node_map`.
+    ///
+    /// Frozen channel contract: the shell draws `items` first (scrolled), then
+    /// `fixed_items` unshifted by scroll, then chrome/popup on top.
+    pub fixed_items: Vec<DisplayItem>,
+    pub fixed_node_map: Vec<NodeId>,
 }
 
-/// Lay out `dom` into a flat display list for a viewport of `size`.
-pub fn layout(dom: &Dom, styles: &StyleMap, viewport: Size) -> DisplayList {
-    let mut list = Vec::new();
-    {
-        let mut ctx = Ctx {
-            dom,
-            styles,
-            list: &mut list,
-        };
-        let fallback = fallback_style();
-        let mut flow = Flow::new(0.0, viewport.w, 0.0);
-        layout_children(&mut ctx, &mut flow, &fallback, dom.root(), None);
-        flush_line(&mut flow, &mut *ctx.list);
+impl DisplayList {
+    /// The single emission seam: every display item is pushed with its owner.
+    pub(crate) fn push(&mut self, owner: NodeId, item: DisplayItem) {
+        self.items.push(item);
+        self.node_map.push(owner);
     }
-    DisplayList { items: list }
+
+    /// Emission seam for the fixed channel: index-parallel to `fixed_items`.
+    pub(crate) fn push_fixed(&mut self, owner: NodeId, item: DisplayItem) {
+        self.fixed_items.push(item);
+        self.fixed_node_map.push(owner);
+    }
+
+    /// Append a scratch list, keeping both item/owner pairs index-parallel.
+    /// Merging the fixed channel here lets fixed elements nested inside
+    /// flex/grid/table scratch lists reach the root list.
+    pub(crate) fn append(&mut self, mut other: DisplayList) {
+        self.items.append(&mut other.items);
+        self.node_map.append(&mut other.node_map);
+        self.fixed_items.append(&mut other.fixed_items);
+        self.fixed_node_map.append(&mut other.fixed_node_map);
+    }
 }
 
 /// Borrowed inputs shared by the recursive layout walk.
-struct Ctx<'a> {
-    dom: &'a Dom,
-    styles: &'a StyleMap,
-    list: &'a mut Vec<DisplayItem>,
+pub(crate) struct Ctx<'a> {
+    pub(crate) dom: &'a Dom,
+    pub(crate) styles: &'a StyleMap,
+    pub(crate) list: &'a mut DisplayList,
 }
 
 /// The available box handed to a block: left edge, top edge and usable width.
-struct Avail {
-    x: f32,
-    y: f32,
-    width: f32,
-}
-
-/// One rendered word, collapsed space, or inline-box inset spacer waiting to
-/// be placed on a line. `spacer` atoms carry geometry but no glyphs.
-struct Atom {
-    text: String,
-    font_size: f32,
-    color: Color,
-    weight: u16,
-    href: Option<String>,
-    /// Absolute x where this atom starts.
-    x: f32,
-    /// Advance width contributed to the line.
-    w: f32,
-    /// Inline boxes containing this atom, outermost first (indices into
-    /// `Flow::boxes`). Empty for ordinary text.
-    boxes: Vec<usize>,
-    spacer: bool,
-}
-
-/// Paint state of one inline element inside a block's flow.
-struct InlineBox {
-    bg: Color,
-    border_color: Color,
-    border: Edges<f32>,
-    margin: Edges<f32>,
-    padding: Edges<f32>,
-    /// Already painted a fragment on an earlier line: suppress left border.
-    seen: bool,
-    /// Element is still open: suppress right border on this fragment.
-    active: bool,
-}
-
-/// Mutable inline-flow state for a single block's content area.
-struct Flow {
-    left: f32,
-    right: f32,
-    y: f32,
-    line: Vec<Atom>,
-    line_w: f32,
-    pending_space: Option<f32>,
-    /// One bullet is emitted on this flow's first text line (list item).
-    bullet: bool,
-    /// Every paintable inline element encountered in this flow.
-    boxes: Vec<InlineBox>,
-    /// Indices of boxes currently open, outermost first.
-    stack: Vec<usize>,
-}
-
-impl Flow {
-    fn new(left: f32, right: f32, y: f32) -> Self {
-        Self {
-            left,
-            right,
-            y,
-            line: Vec::new(),
-            line_w: 0.0,
-            pending_space: None,
-            bullet: false,
-            boxes: Vec::new(),
-            stack: Vec::new(),
-        }
-    }
-}
-
-/// True when the current line has at least one glyph-bearing atom. Spacer-only
-/// lines are not a wrap boundary and never produce a Text item.
-fn has_content(flow: &Flow) -> bool {
-    flow.line.iter().any(|a| !a.spacer)
+pub(crate) struct Avail {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) width: f32,
 }
 
 /// Style used for text nodes that have no computed style of their own.
-fn fallback_style() -> ComputedStyle {
+pub(crate) fn fallback_style() -> ComputedStyle {
     ComputedStyle {
         display: Display::Inline,
         color: Color::BLACK,
@@ -165,649 +159,108 @@ fn fallback_style() -> ComputedStyle {
         border_width: 0.0,
         border_widths: Edges::zero(),
         border_color: Color::BLACK,
+        flex_direction: FlexDirection::Row,
+        flex_wrap: FlexWrap::NoWrap,
+        justify_content: JustifyContent::FlexStart,
+        align_items: AlignItems::Stretch,
+        align_self: AlignSelf::Auto,
+        gap: 0.0,
+        flex_grow: 0.0,
+        flex_shrink: 1.0,
+        flex_basis: FlexBasis::Auto,
+        order: 0,
+        grid_template_columns: vec![],
+        grid_template_rows: vec![],
+        grid_column: (GridLine::Auto, GridLine::Auto),
+        grid_row: (GridLine::Auto, GridLine::Auto),
+        column_gap: 0.0,
+        row_gap: 0.0,
+        table_layout: TableLayout::Auto,
+        border_collapse: BorderCollapse::Separate,
+        border_spacing: (2.0, 2.0),
+        line_height: LineHeight::Normal,
+        vertical_align: VerticalAlign::Baseline,
+        text_align: TextAlign::Left,
+        text_indent: 0.0,
+        letter_spacing: 0.0,
+        word_spacing: 0.0,
+        white_space: WhiteSpace::Normal,
+        overflow_wrap: OverflowWrap::Normal,
+        line_through: false,
+        position: Position::Static,
+        float: Float::None,
+        clear: Clear::None,
+        overflow: Overflow::Visible,
+        offsets: Edges::zero(),
+        width: None,
+        height: None,
+        min_size: Size { w: 0.0, h: 0.0 },
+        max_size: Size {
+            w: f32::INFINITY,
+            h: f32::INFINITY,
+        },
     }
 }
 
-fn push_rect(list: &mut Vec<DisplayItem>, rect: Rect, color: Color) -> usize {
-    let idx = list.len();
-    list.push(DisplayItem::Rect {
-        rect,
-        color,
-        border_color: None,
-        radius: 0.0,
-    });
+pub(crate) fn push_rect(list: &mut DisplayList, owner: NodeId, rect: Rect, color: Color) -> usize {
+    let idx = list.items.len();
+    list.push(
+        owner,
+        DisplayItem::Rect {
+            rect,
+            color,
+            border_color: None,
+            radius: 0.0,
+        },
+    );
     idx
 }
 
-fn patch_rect(list: &mut [DisplayItem], idx: usize, f: impl FnOnce(&mut Rect)) {
-    if let DisplayItem::Rect { rect, .. } = &mut list[idx] {
+pub(crate) fn patch_rect(list: &mut DisplayList, idx: usize, f: impl FnOnce(&mut Rect)) {
+    if let DisplayItem::Rect { rect, .. } = &mut list.items[idx] {
         f(rect);
     }
 }
 
-fn push_atom(flow: &mut Flow, atom: Atom) {
-    flow.line.push(atom);
-}
-
-/// Whether a child participates as a block-level sibling for anonymous-block
-/// splitting. `<img>` is an atomic replaced element in this engine.
-fn is_block_level(ctx: &Ctx<'_>, id: NodeId) -> bool {
-    // Text nodes inherit their parent's computed `display`, so only elements
-    // may be classified as block-level siblings here.
-    matches!(ctx.dom.get(id).kind, NodeKind::Element { .. })
-        && (ctx
-            .styles
-            .get(id)
-            .is_some_and(|s| s.display == Display::Block)
-            || ctx
-                .dom
-                .tag(id)
-                .is_some_and(|tag| tag.eq_ignore_ascii_case("img")))
-}
-
-/// Walk a node's children in order. Mixed inline/block child lists are split
-/// into anonymous block boxes: each consecutive inline run gets its own flow,
-/// so it cannot share a line box across a block sibling. Pure lists keep the
-/// original single-flow behaviour.
-fn layout_children(
-    ctx: &mut Ctx<'_>,
-    flow: &mut Flow,
-    fallback: &ComputedStyle,
-    parent: NodeId,
-    link: Option<String>,
-) {
-    let live: Vec<NodeId> = ctx
-        .dom
-        .children(parent)
-        .iter()
-        .copied()
-        .filter(|&child| {
-            !ctx.styles
-                .get(child)
-                .is_some_and(|s| s.display == Display::None)
-        })
-        .collect();
-
-    let has_block = live.iter().any(|&c| is_block_level(ctx, c));
-    let has_inline = live.iter().any(|&c| !is_block_level(ctx, c));
-
-    if has_block && has_inline {
-        // Anonymous block boxes: wrap consecutive inline runs.
-        let mut run: Vec<NodeId> = Vec::new();
-        let mut run_y = flow.y;
-        for &child in &live {
-            if is_block_level(ctx, child) {
-                if !run.is_empty() {
-                    layout_inline_run(ctx, flow, fallback, &run, link.clone(), run_y);
-                    run.clear();
-                }
-                layout_child(ctx, flow, fallback, child, link.clone());
-                run_y = flow.y;
-            } else {
-                run.push(child);
-            }
-        }
-        if !run.is_empty() {
-            layout_inline_run(ctx, flow, fallback, &run, link, run_y);
-        }
-    } else {
-        for child in live {
-            layout_child(ctx, flow, fallback, child, link.clone());
-        }
-    }
-}
-
-/// Lay out one anonymous block box made from a consecutive inline run.
-fn layout_inline_run(
-    ctx: &mut Ctx<'_>,
-    flow: &mut Flow,
-    fallback: &ComputedStyle,
-    run: &[NodeId],
-    link: Option<String>,
-    y: f32,
-) {
-    let mut sub = Flow::new(flow.left, flow.right, y);
-    if flow.bullet {
-        sub.bullet = true;
-        flow.bullet = false;
-    }
-    for &child in run {
-        layout_child(ctx, &mut sub, fallback, child, link.clone());
-    }
-    flush_line(&mut sub, ctx.list);
-    flow.y = sub.y;
-}
-
-/// Lay out a single child into `flow`.
-fn layout_child(
-    ctx: &mut Ctx<'_>,
-    flow: &mut Flow,
-    fallback: &ComputedStyle,
-    child: NodeId,
-    link: Option<String>,
-) {
-    let s = ctx.styles.get(child).cloned();
-    if s.as_ref().is_some_and(|st| st.display == Display::None) {
-        return;
-    }
-    let tag = ctx.dom.tag(child).unwrap_or("");
-    // An <a> without href does not replace an outer link already in scope.
-    let link = if tag.eq_ignore_ascii_case("a") {
-        ctx.dom
-            .attr(child, "href")
-            .map(str::to_string)
-            .or_else(|| link.clone())
-    } else {
-        link
-    };
-
-    match &ctx.dom.get(child).kind {
-        NodeKind::Text(t) => {
-            let st = s.as_ref().unwrap_or(fallback);
-            let boxes = flow.stack.clone();
-            feed_text(flow, ctx.list, t, st, link, &boxes);
-        }
-        NodeKind::Element { .. } => {
-            if tag.eq_ignore_ascii_case("img") {
-                flush_line(flow, ctx.list);
-                // shortcut: relative src resolution needs a base URL; the shell passes
-                // absolute paths/URLs until layout grows a base-url parameter.
-                if let Some(src) = ctx.dom.attr(child, "src") {
-                    let w = ctx
-                        .dom
-                        .attr(child, "width")
-                        .and_then(|v| v.parse::<f32>().ok())
-                        .unwrap_or(64.0);
-                    let h = ctx
-                        .dom
-                        .attr(child, "height")
-                        .and_then(|v| v.parse::<f32>().ok())
-                        .unwrap_or(64.0);
-                    ctx.list.push(DisplayItem::Image {
-                        rect: Rect {
-                            x: flow.left,
-                            y: flow.y,
-                            w,
-                            h,
-                        },
-                        path: src.to_string(),
-                    });
-                    flow.y += h;
-                }
-            } else if tag.eq_ignore_ascii_case("br") {
-                // Hard line break. An empty line still occupies one line box.
-                if has_content(flow) {
-                    flush_line(flow, ctx.list);
-                } else {
-                    flow.y += 1.2 * s.as_ref().unwrap_or(fallback).font_size;
-                }
-            } else if s.as_ref().is_some_and(|st| st.display == Display::Block) {
-                flush_line(flow, ctx.list);
-                let avail = Avail {
-                    x: flow.left,
-                    y: flow.y,
-                    width: flow.right - flow.left,
-                };
-                let consumed = layout_block(ctx, s.as_ref().unwrap(), child, avail, link);
-                // shortcut: vertical margins sum, no collapsing (MVP); upgrade when
-                // CSS margin collapsing is required for spec fidelity.
-                flow.y += consumed;
-            } else {
-                let st = s.as_ref().unwrap_or(fallback);
-                let paintable =
-                    st.background.a > 0 || (st.border_color.a > 0 && st.border_width > 0.0);
-                if paintable {
-                    let bi = flow.boxes.len();
-                    flow.boxes.push(InlineBox {
-                        bg: st.background,
-                        border_color: st.border_color,
-                        border: st.border_widths,
-                        margin: st.margin,
-                        padding: st.padding,
-                        seen: false,
-                        active: true,
-                    });
-                    let mut boxes = flow.stack.clone();
-                    boxes.push(bi);
-                    let left = left_inset(&flow.boxes[bi]);
-                    if left > 0.0 {
-                        push_atom(
-                            flow,
-                            Atom {
-                                text: String::new(),
-                                font_size: st.font_size,
-                                color: st.color,
-                                weight: st.font_weight,
-                                href: None,
-                                x: flow.left + flow.line_w,
-                                w: left,
-                                boxes: boxes.clone(),
-                                spacer: true,
-                            },
-                        );
-                        flow.line_w += left;
-                    }
-                    flow.stack.push(bi);
-                }
-
-                layout_children(ctx, flow, fallback, child, link);
-
-                if paintable {
-                    // The right spacer still belongs to the box being closed.
-                    let boxes = flow.stack.clone();
-                    let bi = flow
-                        .stack
-                        .pop()
-                        .expect("paintable inline box must be on the stack");
-                    flow.boxes[bi].active = false;
-                    let right = right_inset(&flow.boxes[bi]);
-                    if right > 0.0 {
-                        push_atom(
-                            flow,
-                            Atom {
-                                text: String::new(),
-                                font_size: st.font_size,
-                                color: st.color,
-                                weight: st.font_weight,
-                                href: None,
-                                x: flow.left + flow.line_w,
-                                w: right,
-                                boxes,
-                                spacer: true,
-                            },
-                        );
-                        flow.line_w += right;
-                    }
-                }
-            }
-        }
-        NodeKind::Document => layout_children(ctx, flow, fallback, child, link),
-    }
-}
-
-fn left_inset(b: &InlineBox) -> f32 {
-    b.margin.left + b.border.left + b.padding.left
-}
-
-fn right_inset(b: &InlineBox) -> f32 {
-    b.padding.right + b.border.right + b.margin.right
-}
-
-/// Lay out one block box and return the total vertical space it consumes,
-/// including its own top and bottom margins.
-fn layout_block(
+/// Route one non-fixed child to its display engine, returning the vertical
+/// space it consumes. Mirrors the display match in `block::layout_child_inner`
+/// so flex/grid/table item sites agree on which engine paints a child.
+/// Callers handle line flushing, floats and relative offsets themselves.
+pub(crate) fn dispatch_child(
     ctx: &mut Ctx<'_>,
     style: &ComputedStyle,
     id: NodeId,
     avail: Avail,
     link: Option<String>,
 ) -> f32 {
-    let m = &style.margin;
-    let p = &style.padding;
-    let bw = style.border_width.max(0.0);
-
-    let box_x = avail.x + m.left;
-    let box_y = avail.y + m.top;
-    let box_w = (avail.width - m.left - m.right).max(0.0);
-    let inner_left = box_x + bw + p.left;
-    let inner_right = box_x + box_w - bw - p.right;
-    let top = box_y + bw + p.top;
-
-    // Reserve the background and border rects now so they paint behind the
-    // children; their heights are patched once the content height is known.
-    let mut bg_idx = None;
-    if style.background != Color::TRANSPARENT {
-        bg_idx = Some(push_rect(
-            ctx.list,
-            Rect {
-                x: box_x,
-                y: box_y,
-                w: box_w,
-                h: 0.0,
-            },
-            style.background,
-        ));
+    let tag = ctx.dom.tag(id).unwrap_or("");
+    if forms::is_form_control(tag) {
+        return forms::layout_control_atom(ctx, style, id, avail, link);
     }
-
-    let mut bottom_idx = None;
-    let mut left_idx = None;
-    let mut right_idx = None;
-    if bw > 0.0 && style.border_color.a > 0 {
-        push_rect(
-            ctx.list,
-            Rect {
-                x: box_x,
-                y: box_y,
-                w: box_w,
-                h: bw,
-            },
-            style.border_color,
-        ); // top edge: already complete
-        bottom_idx = Some(push_rect(
-            ctx.list,
-            Rect {
-                x: box_x,
-                y: box_y,
-                w: box_w,
-                h: bw,
-            },
-            style.border_color,
-        ));
-        left_idx = Some(push_rect(
-            ctx.list,
-            Rect {
-                x: box_x,
-                y: box_y,
-                w: bw,
-                h: 0.0,
-            },
-            style.border_color,
-        ));
-        right_idx = Some(push_rect(
-            ctx.list,
-            Rect {
-                x: box_x + box_w - bw,
-                y: box_y,
-                w: bw,
-                h: 0.0,
-            },
-            style.border_color,
-        ));
-    }
-
-    let mut flow = Flow::new(inner_left, inner_right, top);
-    if ctx
-        .dom
-        .tag(id)
-        .is_some_and(|tag| tag.eq_ignore_ascii_case("li"))
-    {
-        flow.bullet = true;
-    }
-    layout_children(ctx, &mut flow, style, id, link);
-    flush_line(&mut flow, ctx.list);
-
-    let content_h = (flow.y - top).max(0.0);
-    let box_h = content_h + p.top + p.bottom + 2.0 * bw;
-
-    if let Some(i) = bg_idx {
-        patch_rect(ctx.list, i, |r| r.h = box_h);
-    }
-    if let Some(i) = bottom_idx {
-        patch_rect(ctx.list, i, |r| r.y = box_y + box_h - bw);
-    }
-    if let Some(i) = left_idx {
-        patch_rect(ctx.list, i, |r| r.h = box_h);
-    }
-    if let Some(i) = right_idx {
-        patch_rect(ctx.list, i, |r| r.h = box_h);
-    }
-
-    m.top + box_h + m.bottom
-}
-
-/// Paint the per-line fragments of every inline box that contributed to the
-/// current line. A fragment's extent is the union of all atoms carrying that
-/// box (including its inset spacers), so nested boxes compose correctly.
-fn emit_fragments(flow: &mut Flow, list: &mut Vec<DisplayItem>, h: f32) {
-    let mut extents: Vec<(usize, f32, f32)> = Vec::new();
-    for atom in &flow.line {
-        for &bi in &atom.boxes {
-            if let Some(e) = extents.iter_mut().find(|e| e.0 == bi) {
-                e.1 = e.1.min(atom.x);
-                e.2 = e.2.max(atom.x + atom.w);
-            } else {
-                extents.push((bi, atom.x, atom.x + atom.w));
-            }
-        }
-    }
-
-    for (bi, x0, x1) in extents {
-        let (bg, border_color, border, seen, active) = {
-            let b = &flow.boxes[bi];
-            (b.bg, b.border_color, b.border, b.seen, b.active)
-        };
-        let first = !seen;
-        let last = !active;
-        let w = (x1 - x0).max(0.0);
-        let y = flow.y;
-        if bg.a > 0 {
-            push_rect(list, Rect { x: x0, y, w, h }, bg);
-        }
-        if border_color.a > 0 {
-            let bt = border.top;
-            let bb = border.bottom;
-            if bt > 0.0 {
-                push_rect(list, Rect { x: x0, y, w, h: bt }, border_color);
-            }
-            if bb > 0.0 {
-                push_rect(
-                    list,
-                    Rect {
-                        x: x0,
-                        y: y + h - bb,
-                        w,
-                        h: bb,
-                    },
-                    border_color,
-                );
-            }
-            // Left/right borders belong only to the first/last fragment.
-            if first && border.left > 0.0 {
-                push_rect(
-                    list,
-                    Rect {
-                        x: x0,
-                        y,
-                        w: border.left,
-                        h,
-                    },
-                    border_color,
-                );
-            }
-            if last && border.right > 0.0 {
-                push_rect(
-                    list,
-                    Rect {
-                        x: x0 + w - border.right,
-                        y,
-                        w: border.right,
-                        h,
-                    },
-                    border_color,
-                );
-            }
-        }
-        flow.boxes[bi].seen = true;
+    match style.display {
+        Display::Flex | Display::InlineFlex => layout_flex(ctx, style, id, avail, link),
+        Display::Grid | Display::InlineGrid => layout_grid(ctx, style, id, avail, link),
+        Display::Table | Display::InlineTable => layout_table(ctx, style, id, avail, link),
+        Display::InlineBlock => inline_block_atom(ctx, style, id, avail, link),
+        _ => block::layout_block(ctx, style, id, avail, link),
     }
 }
 
-/// Commit the current visual line as Text (fragments first) and advance y.
-fn flush_line(flow: &mut Flow, list: &mut Vec<DisplayItem>) {
-    if flow.line.is_empty() {
-        return;
-    }
-    let line_h = flow
-        .line
-        .iter()
-        .map(|a| 1.2 * a.font_size)
-        .fold(0.0_f32, f32::max);
-    emit_fragments(flow, list, line_h);
-
-    let mut text = String::new();
-    let mut first: Option<&Atom> = None;
-    for atom in &flow.line {
-        if atom.spacer {
-            continue;
-        }
-        if first.is_none() {
-            first = Some(atom);
-        }
-        text.push_str(&atom.text);
-    }
-    // shortcut: a line mixing linked and plain atoms takes its link from the first
-    // atom, matching the first-atom-wins style rule; upgrade for per-run hit boxes.
-    if let Some(f) = first {
-        if flow.bullet {
-            // shortcut: UA ::marker emulation, real markers when list-style engine lands
-            text.insert_str(0, "• ");
-            flow.bullet = false;
-        }
-        list.push(DisplayItem::Text {
-            rect: Rect {
-                // Start at the first glyph, past any leading inline-box inset.
-                x: f.x,
-                y: flow.y,
-                w: flow.line_w - (f.x - flow.left),
-                h: line_h,
-            },
-            text,
-            color: f.color,
-            font_size: f.font_size,
-            weight: f.weight,
-            href: f.href.clone(),
-        });
-    }
-    flow.y += line_h;
-    flow.line.clear();
-    flow.line_w = 0.0;
-    flow.pending_space = None;
-}
-
-/// Byte index just after the `n`-th character of `s` (or `s.len()` if shorter).
-fn char_boundary(s: &str, n: usize) -> usize {
-    s.char_indices().nth(n).map(|(i, _)| i).unwrap_or(s.len())
-}
-
-/// Place a word into the flow, wrapping at the content width. Words longer
-/// than a whole line are hard-broken. Each chunk scan is bounded by the chars
-/// actually emitted on that line, so total work is linear in the text length.
-fn place_word(flow: &mut Flow, list: &mut Vec<DisplayItem>, atom: Atom) {
-    let cw = 0.6 * atom.font_size;
-    let max_w = (flow.right - flow.left).max(0.0);
-    let total = atom.text.chars().count();
-    let mut remaining = total;
-    let mut word = atom.text.as_str();
-    let mut guard = 0usize;
-    while remaining > 0 {
-        guard += 1;
-        debug_assert!(
-            guard <= total.saturating_add(1),
-            "hard-break loop must stay linear in text length"
-        );
-        let word_w = remaining as f32 * cw;
-        let space_w = flow.pending_space.unwrap_or(0.0);
-        if has_content(flow) && flow.line_w + space_w + word_w > max_w {
-            flush_line(flow, list);
-            flow.pending_space = None;
-            continue;
-        }
-        if word_w > max_w {
-            // n >= 1 guarantees progress even when max_w < one character.
-            let n = ((max_w / cw).floor() as usize).clamp(1, remaining);
-            let end = char_boundary(word, n);
-            let (chunk, rest) = word.split_at(end);
-            let chunk_w = n as f32 * cw;
-            push_atom(
-                flow,
-                Atom {
-                    text: chunk.to_string(),
-                    font_size: atom.font_size,
-                    color: atom.color,
-                    weight: atom.weight,
-                    href: atom.href.clone(),
-                    x: flow.left + flow.line_w,
-                    w: chunk_w,
-                    boxes: atom.boxes.clone(),
-                    spacer: false,
-                },
-            );
-            flow.line_w += chunk_w;
-            flush_line(flow, list);
-            flow.pending_space = None;
-            remaining -= n;
-            word = rest;
-            continue;
-        }
-        if let Some(sw) = flow.pending_space {
-            if has_content(flow) {
-                push_atom(
-                    flow,
-                    Atom {
-                        text: " ".to_string(),
-                        font_size: atom.font_size,
-                        color: atom.color,
-                        weight: atom.weight,
-                        href: atom.href.clone(),
-                        x: flow.left + flow.line_w,
-                        w: sw,
-                        boxes: atom.boxes.clone(),
-                        spacer: false,
-                    },
-                );
-                flow.line_w += sw;
-            }
-        }
-        flow.pending_space = None;
-        push_atom(
-            flow,
-            Atom {
-                text: word.to_string(),
-                font_size: atom.font_size,
-                color: atom.color,
-                weight: atom.weight,
-                href: atom.href,
-                x: flow.left + flow.line_w,
-                w: word_w,
-                boxes: atom.boxes.clone(),
-                spacer: false,
-            },
-        );
-        flow.line_w += word_w;
-        break;
-    }
-}
-
-/// Feed a text node into the inline flow: whitespace runs collapse to a
-/// single space, pure-whitespace nodes are skipped.
-fn feed_text(
-    flow: &mut Flow,
-    list: &mut Vec<DisplayItem>,
-    text: &str,
-    style: &ComputedStyle,
-    href: Option<String>,
-    boxes: &[usize],
-) {
-    if text.chars().all(char::is_whitespace) {
-        return;
-    }
-    let fs = style.font_size;
-    let color = style.color;
-    let weight = style.font_weight;
-    if has_content(flow) && text.chars().next().is_some_and(char::is_whitespace) {
-        flow.pending_space = Some(0.6 * fs);
-    }
-    let mut first = true;
-    for word in text.split_whitespace() {
-        if !first && has_content(flow) {
-            flow.pending_space = Some(0.6 * fs);
-        }
-        place_word(
-            flow,
-            list,
-            Atom {
-                text: word.to_string(),
-                font_size: fs,
-                color,
-                weight,
-                href: href.clone(),
-                x: 0.0,
-                w: 0.0,
-                boxes: boxes.to_vec(),
-                spacer: false,
-            },
-        );
-        first = false;
-    }
+/// Whether a child participates as a block-level sibling for anonymous-block
+/// splitting. `<img>` is an atomic replaced element in this engine.
+pub(crate) fn is_block_level(ctx: &Ctx<'_>, id: NodeId) -> bool {
+    // Text nodes inherit their parent's computed `display`, so only elements
+    // may be classified as block-level siblings here.
+    matches!(ctx.dom.get(id).kind, NodeKind::Element { .. })
+        && (ctx.styles.get(id).is_some_and(|s| {
+            matches!(
+                s.display,
+                Display::Block | Display::Flex | Display::Grid | Display::Table
+            )
+        }) || ctx
+            .dom
+            .tag(id)
+            .is_some_and(|tag| tag.eq_ignore_ascii_case("img")))
 }
 
 #[cfg(test)]
@@ -1435,5 +888,394 @@ mod tests {
         let list = layout(&dom, &styles, Size { w: 60.0, h: 600.0 });
         assert_eq!(colored_rects(&list, Color::rgb(0, 0, 255)).len(), 2);
         assert_eq!(colored_rects(&list, Color::rgb(0, 255, 0)).len(), 2);
+    }
+
+    #[test]
+    fn flex_grid_table_stubs_render_without_panic() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let f = elem(&mut dom, root, "flexbox");
+        text(&mut dom, f, "flex content");
+        let g = elem(&mut dom, root, "gridbox");
+        text(&mut dom, g, "grid content");
+        let t = elem(&mut dom, root, "tablebox");
+        text(&mut dom, t, "table content");
+
+        let styles = styled(
+            &dom,
+            vec![
+                tag_rule("flexbox", &[("display", "flex")]),
+                tag_rule("gridbox", &[("display", "grid")]),
+                tag_rule("tablebox", &[("display", "table")]),
+            ],
+        );
+        let list = layout(&dom, &styles, Size { w: 800.0, h: 600.0 });
+        // M7 engines landed: flex/grid/table are real now — render without panic
+        // and paint actual content.
+        assert!(
+            !list.items.is_empty(),
+            "flex/grid/table containers must paint their content"
+        );
+    }
+
+    // ---- node_map: display item -> owning element -------------------------
+
+    fn owners_for(list: &DisplayList, pick: impl Fn(&DisplayItem) -> bool) -> Vec<NodeId> {
+        list.items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| pick(item))
+            .map(|(i, _)| list.node_map[i])
+            .collect()
+    }
+
+    #[test]
+    fn node_map_text_item_maps_to_parent_element() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let d = elem(&mut dom, root, "div");
+        text(&mut dom, d, "hello");
+        let styles = compute_styles(&dom, &[]);
+        let list = layout(&dom, &styles, Size { w: 800.0, h: 600.0 });
+
+        let owners = owners_for(&list, |it| matches!(it, DisplayItem::Text { .. }));
+        assert_eq!(
+            owners,
+            vec![d],
+            "text item must be owned by its parent element"
+        );
+        assert_eq!(list.items.len(), list.node_map.len());
+    }
+
+    #[test]
+    fn node_map_nested_inline_spans_map_each_to_their_own_element() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let d = elem(&mut dom, root, "div");
+        let outer = elem_with_attrs(&mut dom, d, "span", &[("style", "background:#0000ff")]);
+        let inner = elem_with_attrs(&mut dom, outer, "span", &[("style", "background:#00ff00")]);
+        text(&mut dom, inner, "inner");
+        let styles = compute_styles(&dom, &[]);
+        let list = layout(&dom, &styles, Size { w: 800.0, h: 600.0 });
+
+        // Text inside a span is owned by the span (its parent element), not by
+        // the text node nor by the outer inline box.
+        assert_eq!(
+            owners_for(&list, |it| matches!(it, DisplayItem::Text { .. })),
+            vec![inner]
+        );
+
+        // Each span's painted fragment is owned by that span.
+        let blue = Color::rgb(0, 0, 255);
+        let green = Color::rgb(0, 255, 0);
+        let outer_bg = owners_for(
+            &list,
+            |it| matches!(it, DisplayItem::Rect { color, .. } if *color == blue),
+        );
+        let inner_bg = owners_for(
+            &list,
+            |it| matches!(it, DisplayItem::Rect { color, .. } if *color == green),
+        );
+        assert!(!outer_bg.is_empty() && outer_bg.iter().all(|&o| o == outer));
+        assert!(!inner_bg.is_empty() && inner_bg.iter().all(|&o| o == inner));
+        assert_eq!(list.items.len(), list.node_map.len());
+    }
+
+    #[test]
+    fn node_map_flex_children_map_to_their_own_elements() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let f = elem(&mut dom, root, "div");
+        let a = elem(&mut dom, f, "item");
+        text(&mut dom, a, "A");
+        let b = elem(&mut dom, f, "item");
+        text(&mut dom, b, "B");
+        let styles = styled(
+            &dom,
+            vec![
+                tag_rule("div", &[("display", "flex")]),
+                tag_rule("item", &[("display", "block"), ("background", "#ff0000")]),
+            ],
+        );
+        let list = layout(&dom, &styles, Size { w: 800.0, h: 600.0 });
+        let red = Color::rgb(255, 0, 0);
+        assert_eq!(
+            owners_for(&list, |it| {
+                matches!(it, DisplayItem::Rect { color, .. } if *color == red)
+            }),
+            vec![a, b],
+            "each flex item's box is owned by that item"
+        );
+        assert_eq!(
+            owners_for(&list, |it| matches!(it, DisplayItem::Text { .. })),
+            vec![a, b]
+        );
+    }
+
+    #[test]
+    fn node_map_grid_children_map_to_their_own_elements() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let g = elem(&mut dom, root, "div");
+        let a = elem(&mut dom, g, "item");
+        text(&mut dom, a, "A");
+        let b = elem(&mut dom, g, "item");
+        text(&mut dom, b, "B");
+        let styles = styled(
+            &dom,
+            vec![
+                tag_rule(
+                    "div",
+                    &[
+                        ("display", "grid"),
+                        ("grid-template-columns", "100px 100px"),
+                    ],
+                ),
+                tag_rule("item", &[("display", "block"), ("background", "#ff0000")]),
+            ],
+        );
+        let list = layout(&dom, &styles, Size { w: 800.0, h: 600.0 });
+        let red = Color::rgb(255, 0, 0);
+        assert_eq!(
+            owners_for(&list, |it| {
+                matches!(it, DisplayItem::Rect { color, .. } if *color == red)
+            }),
+            vec![a, b],
+            "each grid item's box is owned by that item"
+        );
+    }
+
+    #[test]
+    fn node_map_table_cells_map_to_their_own_elements() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let t = elem(&mut dom, root, "table");
+        let tr = elem(&mut dom, t, "tr");
+        let a = elem(&mut dom, tr, "td");
+        text(&mut dom, a, "A");
+        let b = elem(&mut dom, tr, "td");
+        text(&mut dom, b, "B");
+        let styles = styled(&dom, vec![tag_rule("td", &[("background", "#ff0000")])]);
+        let list = layout(&dom, &styles, Size { w: 800.0, h: 600.0 });
+        let red = Color::rgb(255, 0, 0);
+        assert_eq!(
+            owners_for(&list, |it| {
+                matches!(it, DisplayItem::Rect { color, .. } if *color == red)
+            }),
+            vec![a, b],
+            "each table cell's box is owned by that cell"
+        );
+        assert_eq!(
+            owners_for(&list, |it| matches!(it, DisplayItem::Text { .. })),
+            vec![a, b]
+        );
+    }
+
+    #[test]
+    fn node_map_form_controls_map_to_their_own_elements() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let a = elem_with_attrs(&mut dom, root, "input", &[("name", "a")]);
+        let b = elem_with_attrs(&mut dom, root, "button", &[("name", "b")]);
+        let styles = compute_styles(&dom, &[]);
+        let list = layout(&dom, &styles, Size { w: 800.0, h: 600.0 });
+        assert_eq!(
+            owners_for(&list, |it| matches!(it, DisplayItem::Control { .. })),
+            vec![a, b],
+            "each control is owned by its own element"
+        );
+    }
+
+    #[test]
+    fn node_map_image_maps_to_img_element() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let img = elem_with_attrs(&mut dom, root, "img", &[("src", "/p.png")]);
+        let styles = compute_styles(&dom, &[]);
+        let list = layout(&dom, &styles, Size { w: 800.0, h: 600.0 });
+        assert_eq!(
+            owners_for(&list, |it| matches!(it, DisplayItem::Image { .. })),
+            vec![img]
+        );
+        assert_eq!(list.items.len(), list.node_map.len());
+    }
+
+    #[test]
+    fn node_map_parity_holds_at_200_levels_of_nesting() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let mut ids = Vec::new();
+        let mut cur = root;
+        for _ in 0..200 {
+            cur = elem(&mut dom, cur, "div");
+            ids.push(cur);
+        }
+        text(&mut dom, cur, "deep");
+        let styles = styled(&dom, vec![tag_rule("div", &[("background", "#ff0000")])]);
+        let list = layout(&dom, &styles, Size { w: 800.0, h: 600.0 });
+
+        assert_eq!(list.items.len(), list.node_map.len());
+        assert!(
+            list.node_map.iter().all(|owner| ids.contains(owner)),
+            "every owner must be one of the created elements"
+        );
+    }
+
+    #[test]
+    fn node_map_styled_fixture_asserts_concrete_ids_at_known_indices() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let outer = elem(&mut dom, root, "div");
+        let a = elem(&mut dom, outer, "span");
+        text(&mut dom, a, "A");
+        let b = elem(&mut dom, outer, "span");
+        text(&mut dom, b, "B");
+        let styles = styled(
+            &dom,
+            vec![
+                tag_rule("div", &[("background", "#ff0000")]),
+                tag_rule("span", &[("background", "#0000ff")]),
+            ],
+        );
+        let list = layout(&dom, &styles, Size { w: 800.0, h: 600.0 });
+
+        assert_eq!(list.node_map.len(), 4);
+        assert_eq!(list.node_map[0], outer, "div background");
+        assert_eq!(list.node_map[1], a, "first span background");
+        assert_eq!(list.node_map[2], b, "second span background");
+        assert_eq!(
+            list.node_map[3], a,
+            "line Text owned by first glyph's element"
+        );
+    }
+
+    // ---- fixed channel: position:fixed never rides the scrolled item flow ---
+
+    fn fixed_texts(list: &DisplayList) -> Vec<&str> {
+        list.fixed_items
+            .iter()
+            .filter_map(|it| match it {
+                DisplayItem::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fixed_element_items_land_in_fixed_channel_not_page_items() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let fixed = elem_with_attrs(
+            &mut dom,
+            root,
+            "div",
+            &[(
+                "style",
+                "position:fixed; left:10px; top:5px; background:#ff0000",
+            )],
+        );
+        text(&mut dom, fixed, "pinned");
+        let styles = compute_styles(&dom, &[]);
+        let list = layout(&dom, &styles, Size { w: 800.0, h: 600.0 });
+
+        assert!(
+            list.items.is_empty(),
+            "fixed element must not emit into scrolled page items: {:?}",
+            list.items
+        );
+        assert!(
+            !list.fixed_items.is_empty(),
+            "fixed element must emit into fixed_items"
+        );
+        assert_eq!(fixed_texts(&list), ["pinned"]);
+        assert_eq!(list.fixed_items.len(), list.fixed_node_map.len());
+        assert!(
+            list.fixed_node_map.iter().all(|&o| o == fixed),
+            "every fixed item must be owned by the fixed element"
+        );
+    }
+
+    #[test]
+    fn fixed_nested_in_blocks_and_flex_bubbles_to_root_fixed_channel() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let outer = elem_with_attrs(&mut dom, root, "div", &[("style", "display:block")]);
+        let mid = elem_with_attrs(&mut dom, outer, "div", &[("style", "display:block")]);
+        let deep = elem_with_attrs(
+            &mut dom,
+            mid,
+            "div",
+            &[("style", "position:fixed; left:7px; background:#ff0000")],
+        );
+        text(&mut dom, deep, "deep-fixed");
+
+        let flex = elem_with_attrs(&mut dom, root, "div", &[("style", "display:flex")]);
+        let flex_fixed = elem_with_attrs(
+            &mut dom,
+            flex,
+            "div",
+            &[(
+                "style",
+                "position:fixed; left:9px; width:100px; background:#00ff00",
+            )],
+        );
+        text(&mut dom, flex_fixed, "flex-fixed");
+
+        let styles = compute_styles(&dom, &[]);
+        let list = layout(&dom, &styles, Size { w: 800.0, h: 600.0 });
+
+        assert!(
+            list.items.is_empty(),
+            "only fixed content exists; page items must stay empty: {:?}",
+            list.items
+        );
+        assert_eq!(
+            fixed_texts(&list),
+            ["deep-fixed", "flex-fixed"],
+            "fixed nested two blocks deep and in a flex item must reach the root fixed channel"
+        );
+        assert_eq!(list.fixed_items.len(), list.fixed_node_map.len());
+    }
+
+    #[test]
+    fn mixed_static_fixed_absolute_channels_are_separate() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let stat = elem_with_attrs(&mut dom, root, "div", &[("style", "background:#0000ff")]);
+        text(&mut dom, stat, "static");
+        let abs = elem_with_attrs(
+            &mut dom,
+            root,
+            "div",
+            &[("style", "position:absolute; left:40px; background:#ff0000")],
+        );
+        text(&mut dom, abs, "absolute");
+        let fix = elem_with_attrs(
+            &mut dom,
+            root,
+            "div",
+            &[("style", "position:fixed; left:70px; background:#00ff00")],
+        );
+        text(&mut dom, fix, "fixed");
+
+        let styles = compute_styles(&dom, &[]);
+        let list = layout(&dom, &styles, Size { w: 800.0, h: 600.0 });
+
+        assert_eq!(
+            texts(&list),
+            ["static", "absolute"],
+            "page items keep static + absolute content only"
+        );
+        assert_eq!(
+            fixed_texts(&list),
+            ["fixed"],
+            "fixed channel holds only fixed content"
+        );
+        assert_eq!(list.items.len(), list.node_map.len());
+        assert_eq!(list.fixed_items.len(), list.fixed_node_map.len());
+        assert!(
+            list.fixed_node_map.iter().all(|&o| o == fix),
+            "fixed items must be owned by the fixed element"
+        );
     }
 }

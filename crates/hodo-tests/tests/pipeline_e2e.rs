@@ -26,11 +26,10 @@ fn demo_dir() -> PathBuf {
 
 fn text_content(dom: &Dom, id: NodeId) -> String {
     fn collect(dom: &Dom, id: NodeId, out: &mut String) {
-        let node = dom.get(id);
-        if let NodeKind::Text(text) = &node.kind {
+        if let Some(text) = dom.text(id) {
             out.push_str(text);
         }
-        for &child in &node.children {
+        for &child in dom.children(id) {
             collect(dom, child, out);
         }
     }
@@ -92,6 +91,22 @@ fn collect_css(dom: &Dom, html_path: &Path) -> String {
         css.push('\n');
     }
     css
+}
+
+#[test]
+fn interned_dom_text_content_reads_pool_backed_strings() {
+    // Mirror of text_content with per-node strings stripped by Dom::with_interning().
+    let mut dom = Dom::with_interning();
+    let root = dom.root();
+    let p = dom.create(NodeKind::Element {
+        tag: "p".into(),
+        attrs: Vec::new(),
+    });
+    let text = dom.create(NodeKind::Text("hello".into()));
+    dom.append(root, p);
+    dom.append(p, text);
+
+    assert_eq!(text_content(&dom, p), "hello");
 }
 
 /// Run the complete pipeline from the on-disk demo fixture.
