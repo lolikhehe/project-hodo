@@ -490,7 +490,7 @@ pub fn build_prelude(config: &RuntimeConfig) -> String {
 /// Prelude for a *page* (popup) context. Deliberately shares nothing with the
 /// extension prelude: no `chrome`, `browser`, `fetch`, `i18n` or `action` is
 /// ever installed here — only console, timers, promise plumbing, the DOM
-/// wrappers and the internal `__hodoFetch` helper.
+/// wrappers, the minimal `window` alias and the internal `__hodoFetch` helper.
 const PAGE_HELPERS: &str = r#"
 var console = {
   log: function () { __hodo_log(__hodoJoin(arguments)); },
@@ -603,7 +603,31 @@ function setInterval(fn, delay) {
 }
 function clearTimeout(id) { __hodo_clear_timer(id); }
 function clearInterval(id) { __hodo_clear_timer(id); }
-function __hodoDomWrap(node, extra) {
+// Minimal honest attribute view, rebuilt on every access from the real attr
+// native. shortcut: only common HTML attribute names are enumerated; arbitrary
+// custom names stay invisible until Dom exposes a real attrs() iterator.
+var __hodoDomAttributeNames = [
+  'id', 'class', 'name', 'src', 'href', 'alt', 'title', 'type', 'value',
+  'placeholder', 'role', 'style', 'width', 'height', 'rel', 'target',
+  'action', 'method', 'for', 'content', 'charset', 'lang', 'dir',
+  'checked', 'selected', 'disabled', 'readonly', 'required', 'hidden'
+];
+function __hodoDomAttributes(node) {
+  var out = [];
+  for (var i = 0; i < __hodoDomAttributeNames.length; i++) {
+    var name = __hodoDomAttributeNames[i];
+    var value = __hodo_dom_get_attribute(node, name);
+    if (value !== null) out.push({ name: name, value: value });
+  }
+  out.getNamedItem = function (name) {
+    for (var j = 0; j < out.length; j++) {
+      if (out[j].name === String(name)) return out[j];
+    }
+    return null;
+  };
+  return out;
+}
+function __hodoDomWrap(node, extra, accessors, proto) {
   if (node === null || node === undefined) return null;
   var api = {
     __hodoNode: node,
@@ -627,33 +651,190 @@ function __hodoDomWrap(node, extra) {
     get: function () { return __hodo_dom_text(node); },
     set: function (v) { __hodo_dom_set_text(node, String(v)); }
   });
+  // URL reflection: resolved against the page URL by the native; writes route
+  // through setAttribute so DOM + wrapper stay in sync (real sites assign .src/.href).
+  Object.defineProperty(api, 'src', {
+    get: function () { return __hodo_dom_src(node); },
+    set: function (v) { __hodo_dom_set_attribute(node, 'src', String(v)); },
+    enumerable: true
+  });
+  Object.defineProperty(api, 'href', {
+    get: function () { return __hodo_dom_href(node); },
+    set: function (v) { __hodo_dom_set_attribute(node, 'href', String(v)); },
+    enumerable: true
+  });
   if (extra) {
     var keys = Object.keys(extra);
     for (var i = 0; i < keys.length; i++) api[keys[i]] = extra[keys[i]];
   }
+  if (accessors) {
+    var names = Object.keys(accessors);
+    for (var j = 0; j < names.length; j++) {
+      Object.defineProperty(api, names[j], accessors[names[j]]);
+    }
+  }
+  var tag = __hodo_dom_tag(node);
+  var isDoc = tag === null || tag === undefined;
+  api.nodeType = isDoc ? 9 : 1;
+  api.nodeName = isDoc ? '#document' : String(tag).toUpperCase();
+  api.tagName = isDoc ? null : api.nodeName;
+  // Per-access builds from the real natives: no caching, no invalidation risk.
+  Object.defineProperty(api, 'children', {
+    get: function () {
+      var handles = __hodo_dom_children(node);
+      var out = [];
+      for (var i = 0; i < handles.length; i++) {
+        out.push(__hodoDomWrap(handles[i], null, null, HTMLElement.prototype));
+      }
+      return out;
+    }
+  });
+  Object.defineProperty(api, 'attributes', {
+    get: function () { return __hodoDomAttributes(node); }
+  });
+  Object.defineProperty(api, 'parentNode', {
+    get: function () {
+      var handle = __hodo_dom_parent(node);
+      if (handle === null) return null;
+      var parentProto = __hodo_dom_tag(handle) === null
+        ? Document.prototype : HTMLElement.prototype;
+      return __hodoDomWrap(handle, null, null, parentProto);
+    }
+  });
+  Object.defineProperty(api, 'parentElement', {
+    get: function () {
+      var handle = __hodo_dom_parent(node);
+      if (handle === null || __hodo_dom_tag(handle) === null) return null;
+      return __hodoDomWrap(handle, null, null, HTMLElement.prototype);
+    }
+  });
+  if (proto) Object.setPrototypeOf(api, proto);
   return Object.freeze(api);
 }
+
+// Minimal DOM class surface. Constructors are illegal to invoke directly
+// (a bare `new Element()` has no backing node); only the wrappers above are
+// real instances. Plain functions give boa a normal prototype chain so
+// `instanceof` and `class Foo extends HTMLElement` both work.
+function Node() {
+  if (this.constructor === Node) throw new TypeError('Illegal constructor: Node');
+}
+function Element() {
+  if (this.constructor === Element) throw new TypeError('Illegal constructor: Element');
+}
+function HTMLElement() {
+  if (this.constructor === HTMLElement) throw new TypeError('Illegal constructor: HTMLElement');
+}
+function Document() {
+  if (this.constructor === Document) throw new TypeError('Illegal constructor: Document');
+}
+Element.prototype = Object.create(Node.prototype);
+Element.prototype.constructor = Element;
+HTMLElement.prototype = Object.create(Element.prototype);
+HTMLElement.prototype.constructor = HTMLElement;
+Document.prototype = Object.create(Node.prototype);
+Document.prototype.constructor = Document;
+Node.ELEMENT_NODE = 1;
+Node.ATTRIBUTE_NODE = 2;
+Node.TEXT_NODE = 3;
+Node.CDATA_SECTION_NODE = 4;
+Node.ENTITY_REFERENCE_NODE = 5;
+Node.ENTITY_NODE = 6;
+Node.PROCESSING_INSTRUCTION_NODE = 7;
+Node.COMMENT_NODE = 8;
+Node.DOCUMENT_NODE = 9;
+Node.DOCUMENT_TYPE_NODE = 10;
+Node.DOCUMENT_FRAGMENT_NODE = 11;
+Node.NOTATION_NODE = 12;
+
 var __hodoRoot = __hodo_dom_root();
 var document = __hodoDomWrap(__hodoRoot, {
   getElementById: function (id) {
-    return __hodoDomWrap(__hodo_dom_get_element_by_id(__hodoRoot, String(id)));
+    return __hodoDomWrap(__hodo_dom_get_element_by_id(__hodoRoot, String(id)), null, null, HTMLElement.prototype);
   },
   querySelector: function (selector) {
-    return __hodoDomWrap(__hodo_dom_query(__hodoRoot, String(selector)));
+    return __hodoDomWrap(__hodo_dom_query(__hodoRoot, String(selector)), null, null, HTMLElement.prototype);
   },
   querySelectorAll: function (selector) {
     var handles = __hodo_dom_query_all(__hodoRoot, String(selector));
     var out = [];
     for (var i = 0; i < handles.length; i++) {
-      var wrapped = __hodoDomWrap(handles[i]);
+      var wrapped = __hodoDomWrap(handles[i], null, null, HTMLElement.prototype);
       if (wrapped !== null) out.push(wrapped);
     }
     return out;
   },
   createElement: function (tag) {
-    return __hodoDomWrap(__hodo_dom_create_element(String(tag)));
+    return __hodoDomWrap(__hodo_dom_create_element(String(tag)), null, null, HTMLElement.prototype);
   }
+}, {
+  // Kept in RuntimeState so the shell integrator can mirror it into the tab
+  // title. hodo-js has no shell dependency and cannot do that itself.
+  title: {
+    get: function () { return __hodo_get_title(); },
+    set: function (value) { __hodo_set_title(String(value)); },
+    enumerable: true
+  },
+  head: {
+    get: function () {
+      return __hodoDomWrap(__hodo_dom_find_tag(__hodoRoot, 'head'), null, null, HTMLElement.prototype);
+    },
+    enumerable: true
+  },
+  body: {
+    get: function () {
+      return __hodoDomWrap(__hodo_dom_find_tag(__hodoRoot, 'body'), null, null, HTMLElement.prototype);
+    },
+    enumerable: true
+  },
+  // TODO(hodo-js): no script-execution position is tracked yet; honest null.
+  currentScript: {
+    get: function () { return null; },
+    enumerable: true
+  }
+}, Document.prototype);
+
+// `window` is the global object itself: globals a script declares are visible
+// through it, and the properties below are the only web-isms this wave adds.
+var window = globalThis;
+var self = globalThis;
+Object.defineProperty(window, 'location', {
+  value: Object.freeze({ href: __hodo_page_url() }),
+  writable: false,
+  configurable: false,
+  enumerable: true
 });
+window.addEventListener = function (type, fn) {
+  if (typeof fn !== 'function') throw new TypeError('addEventListener expects a function');
+  __hodo_dom_add_listener(__hodoRoot, String(type), fn);
+};
+window.setTimeout = setTimeout;
+window.setInterval = setInterval;
+window.clearTimeout = clearTimeout;
+window.clearInterval = clearInterval;
+// Explicit throwing getters instead of a Proxy: a script can catch these and
+// sees exactly which global is missing. No fake objects are handed out.
+function __hodoUnsupportedGlobal(name) {
+  Object.defineProperty(window, name, {
+    configurable: false,
+    get: function () {
+      throw new ReferenceError(name + ' is not supported in hodo page scripts');
+    }
+  });
+}
+// Capability-detection surface, not a lie farm: only properties a page can
+// honestly observe here are present; every other read yields undefined so
+// feature detection (`if (navigator.xyz)`) stays safe instead of throwing.
+// Language is a fixed en-US default: no sys-locale hook reaches the prelude.
+var navigator = Object.freeze({
+  userAgent: 'Mozilla/5.0 (hodo/0.1; +https://github.com/lolikhehe/project-hodo)',
+  language: 'en-US',
+  languages: Object.freeze(['en-US']),
+  platform: 'Win32',
+  vendor: ''
+});
+__hodoUnsupportedGlobal('screen');
+__hodoUnsupportedGlobal('history');
 "#;
 
 /// Build the page (popup) prelude for one runtime. Injection is intentionally

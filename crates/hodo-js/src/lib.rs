@@ -8,6 +8,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
+use std::time::Duration;
 
 #[cfg(feature = "js")]
 use hodo_dom::NodeId;
@@ -55,6 +56,36 @@ const RECURSION_LIMIT: usize = 256;
 /// Boa 0.22 parses deeply nested literals recursively; guard the parser before
 /// handing it extension-controlled source (runtime limits apply only after parse).
 const MAX_SOURCE_BRACKET_DEPTH: usize = 24;
+
+/// Default wall budget for a *series* of page-script evals. The host owns the
+/// loop that eval's scripts; hodo-js owns the value so the limit cannot drift.
+const DEFAULT_PAGE_SCRIPT_BUDGET_MS: u64 = 50;
+
+fn budget_ms(raw: Option<String>, default_ms: u64) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(default_ms.max(1))
+}
+
+/// Wall budget for a series of page-script evals, overridden by
+/// `HODO_JS_BUDGET_MS` (milliseconds; invalid or zero values are ignored).
+/// The shell integrator may pass a larger headless default here.
+///
+/// hodo-js does not depend on the shell: this wave only exposes the value, it
+/// does not change the shell's own hard-coded 50 ms cap.
+#[must_use]
+pub fn page_script_budget_or(default_ms: u64) -> Duration {
+    Duration::from_millis(budget_ms(
+        std::env::var("HODO_JS_BUDGET_MS").ok(),
+        default_ms,
+    ))
+}
+
+/// Same as [`page_script_budget_or`] with the default 50 ms cap.
+#[must_use]
+pub fn page_script_budget() -> Duration {
+    page_script_budget_or(DEFAULT_PAGE_SCRIPT_BUDGET_MS)
+}
 
 /// Read-only methods eligible for the per-tick memo.
 ///
@@ -144,6 +175,10 @@ pub(crate) struct RuntimeState {
     dispatch_hook: RefCell<Option<DispatchHook>>,
     /// `Some` only for page (popup) contexts.
     pub(crate) page: Option<dom::PageState>,
+    /// Last value assigned to `document.title` by page scripts. The shell
+    /// integrator should forward this to the tab title; hodo-js has no shell
+    /// dependency and cannot do that itself.
+    pub(crate) title: RefCell<String>,
     /// Replies produced by `runtime.onMessage` listeners' `sendResponse`.
     message_replies: RefCell<Vec<(Value, Value)>>,
     reply_hook: RefCell<Option<ReplyHook>>,
@@ -173,6 +208,7 @@ impl RuntimeState {
             fetch_hook: RefCell::new(None),
             dispatch_hook: RefCell::new(None),
             page: None,
+            title: RefCell::new(String::new()),
             message_replies: RefCell::new(Vec::new()),
             reply_hook: RefCell::new(None),
             next_id: Cell::new(1),
@@ -348,15 +384,30 @@ impl ExtScriptRuntime {
 
     /// Create a *page* (popup) context over `dom`. This is the only constructor
     /// that installs the page prelude; no extension API global is ever created.
+    ///
+    /// `window.location.href` falls back to the document's `<base href>` (or an
+    /// empty string) here.
     #[cfg(feature = "js")]
     #[must_use]
     pub fn new_page(dom: Rc<RefCell<hodo_dom::Dom>>) -> Self {
+        // TODO(hodo-shell): thread the final, post-redirect page URL through
+        // `new_page_with_url` so `window.location.href` is the navigated URL,
+        // not just a `<base>` hint. hodo-js has no notion of navigation.
+        let url = base_href(&dom.borrow());
+        Self::new_page_with_url(dom, url)
+    }
+
+    /// Additive seam for the shell integrator: create a page context with the
+    /// URL that `window.location.href` should report.
+    #[cfg(feature = "js")]
+    #[must_use]
+    pub fn new_page_with_url(dom: Rc<RefCell<hodo_dom::Dom>>, url: impl Into<String>) -> Self {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let config = RuntimeConfig::default();
         let registry = Rc::new(RefCell::new(ApiRegistry::new()));
         let mut state_inner =
             RuntimeState::new(Rc::clone(&registry), Rc::new(SystemClock), config.clone());
-        state_inner.page = Some(dom::PageState::new(dom));
+        state_inner.page = Some(dom::PageState::new(dom, url.into()));
         let state = Rc::new(state_inner);
         HANDLES.with(|handles| {
             handles.borrow_mut().insert(id, Rc::clone(&state));
@@ -557,6 +608,22 @@ impl ExtScriptRuntime {
         {
             0
         }
+    }
+
+    /// Last value assigned to `document.title` by a page script. The shell
+    /// integrator should forward this to the tab title; hodo-js deliberately
+    /// has no shell dependency.
+    #[cfg(feature = "js")]
+    #[must_use]
+    pub fn document_title(&self) -> String {
+        self.state.title.borrow().clone()
+    }
+
+    /// Non-JS builds have no page scripts, hence no title.
+    #[cfg(not(feature = "js"))]
+    #[must_use]
+    pub fn document_title(&self) -> String {
+        String::new()
     }
 
     /// Number of queued tasks (used by tests).
@@ -950,6 +1017,23 @@ fn error_message(err: &JsError) -> String {
         .strip_prefix("Uncaught ")
         .unwrap_or(&message)
         .to_string()
+}
+
+/// Cheap fallback for `window.location.href` until the host threads the real
+/// page URL: the first `<base href>` in document order, or an empty string.
+#[cfg(feature = "js")]
+fn base_href(dom: &hodo_dom::Dom) -> String {
+    let mut found = String::new();
+    dom.walk(|id, _| {
+        if found.is_empty()
+            && dom
+                .tag(id)
+                .is_some_and(|tag| tag.eq_ignore_ascii_case("base"))
+        {
+            found = dom.attr(id, "href").unwrap_or("").to_string();
+        }
+    });
+    found
 }
 
 #[cfg(feature = "js")]
@@ -2275,5 +2359,15 @@ mod tests {
             "no-op tick={tick:.3} us, epoch bump={epoch:.3} us, \
              lazy clear of {MEMO_CAP} entries={lazy_clear:.3} us"
         );
+    }
+
+    #[test]
+    fn script_budget_override_defaults_to_fifty_ms() {
+        assert_eq!(budget_ms(None, 50), 50);
+        assert_eq!(budget_ms(Some(" 250 ".into()), 50), 250);
+        assert_eq!(budget_ms(Some("0".into()), 50), 50);
+        assert_eq!(budget_ms(Some("nope".into()), 50), 50);
+        assert_eq!(budget_ms(None, 500), 500);
+        assert!(page_script_budget() >= Duration::from_millis(1));
     }
 }

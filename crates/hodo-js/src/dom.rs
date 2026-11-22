@@ -36,14 +36,17 @@ pub(crate) struct PageListener {
 pub(crate) struct PageState {
     pub(crate) dom: Rc<RefCell<Dom>>,
     pub(crate) listeners: RefCell<Vec<PageListener>>,
+    /// What `window.location.href` reports; threaded in by the host.
+    pub(crate) url: String,
     handles: RefCell<Vec<u32>>,
 }
 
 impl PageState {
-    pub(crate) fn new(dom: Rc<RefCell<Dom>>) -> Self {
+    pub(crate) fn new(dom: Rc<RefCell<Dom>>, url: String) -> Self {
         Self {
             dom,
             listeners: RefCell::new(Vec::new()),
+            url,
             handles: RefCell::new(Vec::new()),
         }
     }
@@ -154,38 +157,94 @@ fn is_name(text: &str) -> bool {
             .all(|(i, c)| c.is_ascii_alphanumeric() || c == '-' || c == '_' || (i > 0 && c == ':'))
 }
 
-/// Only `tag`, `#id` and `.class` are supported; anything else yields an empty
-/// result, matching `querySelector` returning `null`.
-fn simple_selector(text: &str) -> Option<Selector> {
-    let text = text.trim();
-    let plain = |tag, id, classes| Selector {
-        tag,
-        id,
-        classes,
-        universal: false,
-    };
-    if let Some(id) = text.strip_prefix('#') {
-        is_name(id).then(|| plain(None, Some(id.to_string()), Vec::new()))
-    } else if let Some(class) = text.strip_prefix('.') {
-        is_name(class).then(|| plain(None, None, vec![class.to_string()]))
-    } else if is_name(text) {
-        Some(plain(Some(text.to_string()), None, Vec::new()))
-    } else {
-        None
+/// Parse a `querySelector` selector list by reusing hodo-css's full parser and
+/// matcher. A synthetic one-rule stylesheet `{selector}{}` yields one `Selector`
+/// per comma group, with attribute/compound/chain semantics owned by hodo-css
+/// (no grammar fork here). Raw block delimiters would let a selector inject
+/// extra rules into the sheet, so they are rejected outright.
+fn query_selectors(selector: &str) -> Vec<Selector> {
+    if selector.contains(['{', '}']) {
+        return Vec::new();
     }
+    hodo_css::parse_stylesheet(&format!("{selector}{{}}"))
+        .rules
+        .into_iter()
+        .map(|rule| rule.selector)
+        .collect()
 }
 
 fn query(dom: &Dom, selector: &str) -> Vec<NodeId> {
-    let Some(selector) = simple_selector(selector) else {
+    let selectors = query_selectors(selector);
+    if selectors.is_empty() {
         return Vec::new();
-    };
+    }
     let mut found = Vec::new();
     preorder(dom, dom.root(), |id| {
-        if matches_selector(&selector, dom, id) {
+        if selectors.iter().any(|sel| matches_selector(sel, dom, id)) {
             found.push(id);
         }
     });
     found
+}
+
+/// Whether `value` is already an absolute URL (has a `scheme:` prefix). Used so
+/// `src`/`href` reflection never mangles `https:`, `data:` or `javascript:` URLs.
+fn is_absolute_url(value: &str) -> bool {
+    let Some((scheme, _)) = value.split_once(':') else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+/// Collapse `.`/`..` segments of a resolved path, keeping any query/fragment.
+fn normalize_path(prefix: &str, path: &str) -> String {
+    let (path_only, suffix) = match path.find(['?', '#']) {
+        Some(index) => (&path[..index], &path[index..]),
+        None => (path, ""),
+    };
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in path_only.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other),
+        }
+    }
+    format!("{prefix}/{}{}", segments.join("/"), suffix)
+}
+
+/// Resolve a relative `src`/`href` against the page URL. Absolute and
+/// scheme-relative values need no base; without a usable base the raw value is
+/// returned. TODO(unify with hodo-net's URL resolver once hodo-js may depend on it).
+fn resolve_url(base: &str, value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() || is_absolute_url(value) {
+        return value.to_string();
+    }
+    let Some((scheme, rest)) = base.split_once("://") else {
+        return value.to_string();
+    };
+    if let Some(stripped) = value.strip_prefix("//") {
+        return format!("{scheme}:{stripped}");
+    }
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let prefix = format!("{scheme}://{authority}");
+    if value.starts_with('/') {
+        return format!("{prefix}{value}");
+    }
+    if value.starts_with(['?', '#']) {
+        let before_query = base.split(['?', '#']).next().unwrap_or(base);
+        return format!("{before_query}{value}");
+    }
+    let tail = &rest[authority_end..];
+    let path_part = tail.split(['?', '#']).next().unwrap_or(tail);
+    let base_dir = &path_part[..path_part.rfind('/').map(|p| p + 1).unwrap_or(0)];
+    normalize_path(&prefix, &format!("{base_dir}{value}"))
 }
 
 fn op_dom_root(id: u64) -> NativeFunction {
@@ -322,6 +381,83 @@ fn op_dom_set_text(id: u64) -> NativeFunction {
     })
 }
 
+/// Page-only: the tag name of a wrapped node, or `null` for the document root.
+/// Backs `nodeType`/`tagName`/`nodeName` on wrapper objects.
+fn op_dom_tag(id: u64) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |_this, args, _ctx| {
+        let state = with_state(id, Rc::clone).map_err(js_error)?;
+        let (dom, node) =
+            resolve_for(&state, handle_arg(args, 0).map_err(js_error)?).map_err(js_error)?;
+        let tag = {
+            let dom = dom.borrow();
+            dom.tag(node).map(str::to_string)
+        };
+        Ok(tag.map_or(JsValue::null(), |tag| JsValue::from(JsString::from(tag))))
+    })
+}
+
+/// Page-only: element children as opaque handles, backing `children`.
+/// Text nodes are filtered out here so the JS getter needs no shape knowledge.
+fn op_dom_children(id: u64) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |_this, args, ctx| {
+        let state = with_state(id, Rc::clone).map_err(js_error)?;
+        let (dom, node) =
+            resolve_for(&state, handle_arg(args, 0).map_err(js_error)?).map_err(js_error)?;
+        let mut handles = Vec::new();
+        {
+            let dom = dom.borrow();
+            for &child in dom.children(node) {
+                if dom.tag(child).is_some() {
+                    handles.push(alloc_handle(&state, child).map_err(js_error)?);
+                }
+            }
+        }
+        JsValue::from_json(&json!(handles), ctx).map_err(|err| js_error(err.to_string()))
+    })
+}
+
+/// Page-only: the real parent handle, or null at the document root. Backs both
+/// `parentNode` and `parentElement` (the JS side filters non-element parents).
+fn op_dom_parent(id: u64) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |_this, args, _ctx| {
+        let state = with_state(id, Rc::clone).map_err(js_error)?;
+        let (dom, node) =
+            resolve_for(&state, handle_arg(args, 0).map_err(js_error)?).map_err(js_error)?;
+        let parent = dom.borrow().parent(node);
+        match parent {
+            Some(parent) => Ok(JsValue::from(
+                alloc_handle(&state, parent).map_err(js_error)? as f64,
+            )),
+            None => Ok(JsValue::null()),
+        }
+    })
+}
+
+/// Page-only: first descendant with `tag`, backing `document.head`/`body`.
+fn op_dom_find_tag(id: u64) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |_this, args, ctx| {
+        let state = with_state(id, Rc::clone).map_err(js_error)?;
+        let (dom, node) =
+            resolve_for(&state, handle_arg(args, 0).map_err(js_error)?).map_err(js_error)?;
+        let tag = string_arg(args, 1, ctx).map_err(js_error)?;
+        let mut found = None;
+        {
+            let dom = dom.borrow();
+            preorder(&dom, node, |id| {
+                if found.is_none() && dom.tag(id).is_some_and(|t| t.eq_ignore_ascii_case(&tag)) {
+                    found = Some(id);
+                }
+            });
+        }
+        match found {
+            Some(node) => Ok(JsValue::from(
+                alloc_handle(&state, node).map_err(js_error)? as f64
+            )),
+            None => Ok(JsValue::null()),
+        }
+    })
+}
+
 fn op_dom_get_attribute(id: u64) -> NativeFunction {
     NativeFunction::from_copy_closure(move |_this, args, ctx| {
         let state = with_state(id, Rc::clone).map_err(js_error)?;
@@ -332,6 +468,26 @@ fn op_dom_get_attribute(id: u64) -> NativeFunction {
         Ok(value.map_or(JsValue::null(), |value| {
             JsValue::from(JsString::from(value))
         }))
+    })
+}
+
+/// Page-only: `src`/`href` reflection. Returns the attribute resolved against
+/// the page URL (or the raw value when no page URL is threaded in); absent
+/// attributes yield `null` like the browser getters do.
+fn op_dom_resolved_url(id: u64, attr: &'static str) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |_this, args, _ctx| {
+        let state = with_state(id, Rc::clone).map_err(js_error)?;
+        let (dom, node) =
+            resolve_for(&state, handle_arg(args, 0).map_err(js_error)?).map_err(js_error)?;
+        let raw = { dom.borrow().attr(node, attr).map(str::to_string) };
+        let value = match raw {
+            None => return Ok(JsValue::null()),
+            Some(raw) => match state.page.as_ref() {
+                Some(page) if !page.url.is_empty() => resolve_url(&page.url, &raw),
+                _ => raw,
+            },
+        };
+        Ok(JsValue::from(JsString::from(value)))
     })
 }
 
@@ -414,7 +570,38 @@ fn op_dom_add_listener(id: u64) -> NativeFunction {
     })
 }
 
+/// Page-only: the URL the host threaded into `new_page_with_url` (or the
+/// `<base>`/empty fallback). No network or navigation is performed here.
+fn op_page_url(id: u64) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |_this, _args, _ctx| {
+        let state = with_state(id, Rc::clone).map_err(js_error)?;
+        let url = state
+            .page
+            .as_ref()
+            .map_or_else(String::new, |page| page.url.clone());
+        Ok(JsValue::from(JsString::from(url)))
+    })
+}
+
+/// Page-only: getter/setter behind `document.title`. The value lives in
+/// `RuntimeState` so the host can read it without evaluating JS.
+fn op_page_title(id: u64, set: bool) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |_this, args, ctx| {
+        let state = with_state(id, Rc::clone).map_err(js_error)?;
+        if set {
+            let title = string_arg(args, 0, ctx).map_err(js_error)?;
+            *state.title.borrow_mut() = title;
+            Ok(JsValue::undefined())
+        } else {
+            Ok(JsValue::from(JsString::from(state.title.borrow().clone())))
+        }
+    })
+}
+
 pub(crate) fn register_natives(context: &mut boa_engine::Context, id: u64) {
+    register(context, "__hodo_page_url", 0, op_page_url(id));
+    register(context, "__hodo_get_title", 0, op_page_title(id, false));
+    register(context, "__hodo_set_title", 1, op_page_title(id, true));
     register(context, "__hodo_dom_root", 0, op_dom_root(id));
     register(
         context,
@@ -424,6 +611,13 @@ pub(crate) fn register_natives(context: &mut boa_engine::Context, id: u64) {
     );
     register(context, "__hodo_dom_query", 2, op_dom_query(id, false));
     register(context, "__hodo_dom_query_all", 2, op_dom_query(id, true));
+    register(context, "__hodo_dom_src", 1, op_dom_resolved_url(id, "src"));
+    register(
+        context,
+        "__hodo_dom_href",
+        1,
+        op_dom_resolved_url(id, "href"),
+    );
     register(
         context,
         "__hodo_dom_create_element",
@@ -444,6 +638,10 @@ pub(crate) fn register_natives(context: &mut boa_engine::Context, id: u64) {
     );
     register(context, "__hodo_dom_text", 1, op_dom_text(id));
     register(context, "__hodo_dom_set_text", 2, op_dom_set_text(id));
+    register(context, "__hodo_dom_tag", 1, op_dom_tag(id));
+    register(context, "__hodo_dom_children", 1, op_dom_children(id));
+    register(context, "__hodo_dom_parent", 1, op_dom_parent(id));
+    register(context, "__hodo_dom_find_tag", 2, op_dom_find_tag(id));
     register(
         context,
         "__hodo_dom_get_attribute",
@@ -534,9 +732,17 @@ mod tests {
                 .unwrap(),
             "kid"
         );
+        // hodo-css also provides combinators: `div > span` now matches for real.
         assert_eq!(
             runtime
-                .eval("String(document.querySelector('div > span'))")
+                .eval("document.querySelector('div > span').getAttribute('id')")
+                .unwrap(),
+            "kid"
+        );
+        // Genuinely unsupported syntax still yields null.
+        assert_eq!(
+            runtime
+                .eval("String(document.querySelector(':nope'))")
                 .unwrap(),
             "null"
         );
@@ -661,5 +867,488 @@ mod tests {
         );
         let _ = &mut a;
         let _ = &mut b;
+    }
+
+    #[test]
+    fn window_add_event_listener_fires_on_document_event() {
+        let (dom, _, _) = sample_dom();
+        let root = dom.borrow().root();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        runtime
+            .eval(
+                "window.addEventListener('DOMContentLoaded', function (e) { \
+                 console.log('ready:' + e); });",
+            )
+            .unwrap();
+        runtime.dispatch_page_event(root, "DOMContentLoaded", json!("go"));
+        runtime.tick();
+        assert_eq!(runtime.take_logs(), ["ready:go"]);
+    }
+
+    #[test]
+    fn window_set_timeout_schedules_on_the_existing_timer_registry() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        runtime
+            .eval("window.setTimeout(function () { console.log('fired'); }, 1);")
+            .unwrap();
+        assert_eq!(runtime.timer_count(), 1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        runtime.tick();
+        assert_eq!(runtime.timer_count(), 0);
+        assert_eq!(runtime.take_logs(), ["fired"]);
+    }
+
+    #[test]
+    fn window_location_href_is_the_threaded_url() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime =
+            ExtScriptRuntime::new_page_with_url(dom, "https://archive.org/details/foo?a=1");
+        assert_eq!(
+            runtime.eval("window.location.href").unwrap(),
+            "https://archive.org/details/foo?a=1"
+        );
+        // Both the holder and the property are read-only.
+        assert_eq!(
+            runtime
+                .eval("window.location.href = 'https://elsewhere.test/'; window.location.href")
+                .unwrap(),
+            "https://archive.org/details/foo?a=1"
+        );
+    }
+
+    #[test]
+    fn window_location_falls_back_to_base_href() {
+        let mut dom = Dom::new();
+        let base = dom.create(NodeKind::Element {
+            tag: "base".into(),
+            attrs: vec![("href".into(), "https://example.org/base/".into())],
+        });
+        dom.append(dom.root(), base);
+        let mut runtime = ExtScriptRuntime::new_page(Rc::new(RefCell::new(dom)));
+        assert_eq!(
+            runtime.eval("window.location.href").unwrap(),
+            "https://example.org/base/"
+        );
+    }
+
+    fn nested_dom() -> (Rc<RefCell<Dom>>, NodeId) {
+        let mut dom = Dom::new();
+        let head = dom.create(NodeKind::Element {
+            tag: "head".into(),
+            attrs: vec![("data-x".into(), "1".into())],
+        });
+        let body = dom.create(NodeKind::Element {
+            tag: "body".into(),
+            attrs: vec![("id".into(), "b".into()), ("class".into(), "c d".into())],
+        });
+        let para = dom.create(NodeKind::Element {
+            tag: "p".into(),
+            attrs: vec![("id".into(), "kid".into())],
+        });
+        let text = dom.create(NodeKind::Text("hello".into()));
+        let span = dom.create(NodeKind::Element {
+            tag: "span".into(),
+            attrs: Vec::new(),
+        });
+        dom.append(dom.root(), head);
+        dom.append(dom.root(), body);
+        dom.append(body, text);
+        dom.append(body, para);
+        dom.append(body, span);
+        (Rc::new(RefCell::new(dom)), body)
+    }
+
+    #[test]
+    fn children_filters_text_nodes_and_returns_wrapped_elements() {
+        let (dom, _) = nested_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var b = document.body; \
+                 JSON.stringify([b.children.length, b.children[0].tagName, \
+                 b.children[1].tagName, b.children[0] instanceof HTMLElement, \
+                 b.children[0].getAttribute('id')]);",
+            )
+            .unwrap();
+        assert_eq!(probe, r#"[2,"P","SPAN",true,"kid"]"#);
+    }
+
+    #[test]
+    fn attributes_view_reports_real_names_and_values() {
+        let (dom, _) = nested_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var a = document.body.attributes; \
+                 JSON.stringify([a.length, a.getNamedItem('id').value, \
+                 a.getNamedItem('class').value, a[0].name, \
+                 a.getNamedItem('missing')]);",
+            )
+            .unwrap();
+        assert_eq!(probe, r#"[2,"b","c d","id",null]"#);
+    }
+
+    #[test]
+    fn parent_node_and_parent_element_resolve_the_real_parent() {
+        let (dom, _) = nested_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "JSON.stringify([document.body.parentNode.nodeName, \
+                 document.body.parentElement, \
+                 document.body.children[0].parentElement.getAttribute('id'), \
+                 document.parentNode]);",
+            )
+            .unwrap();
+        assert_eq!(probe, r##"["#document",null,"b",null]"##);
+    }
+
+    #[test]
+    fn document_head_and_body_are_real_handles() {
+        let (dom, _) = nested_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "JSON.stringify([document.head.tagName, document.body.tagName, \
+                 document.head.getAttribute('data-x'), document.body.getAttribute('id'), \
+                 String(document.currentScript)]);",
+            )
+            .unwrap();
+        assert_eq!(probe, r#"["HEAD","BODY","1","b","null"]"#);
+    }
+
+    #[test]
+    fn wrapped_elements_stringify_without_parent_cycles() {
+        let (dom, _) = nested_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime.eval("JSON.stringify(document.body)").unwrap();
+        assert!(
+            !probe.contains("children")
+                && !probe.contains("parentNode")
+                && !probe.contains("attributes"),
+            "unexpected: {probe}"
+        );
+    }
+
+    #[test]
+    fn navigator_is_frozen_and_supports_feature_detection() {
+        let (dom, _) = nested_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "JSON.stringify([Object.isFrozen(navigator), \
+                 navigator.userAgent.indexOf('hodo') !== -1, navigator.language, \
+                 navigator.languages[0], navigator.platform, navigator.vendor, \
+                 navigator.foo === undefined, Boolean(navigator.mediaDevices), \
+                 navigator === window.navigator, self === window]);",
+            )
+            .unwrap();
+        assert_eq!(
+            probe,
+            r#"[true,true,"en-US","en-US","Win32","",true,false,true,true]"#
+        );
+    }
+
+    #[test]
+    fn document_title_roundtrips_into_runtime_state() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        assert_eq!(runtime.eval("document.title").unwrap(), "");
+        runtime.eval("document.title = 'Archive Page';").unwrap();
+        assert_eq!(runtime.eval("document.title").unwrap(), "Archive Page");
+        assert_eq!(
+            runtime.eval("window.document.title").unwrap(),
+            "Archive Page"
+        );
+        assert_eq!(runtime.document_title(), "Archive Page");
+    }
+
+    #[test]
+    fn dom_constructor_globals_are_page_only() {
+        let (dom, _, _) = sample_dom();
+        let mut page = ExtScriptRuntime::new_page(dom);
+        assert_eq!(
+            page.eval(
+                "JSON.stringify([typeof Node, typeof Element, typeof HTMLElement, typeof Document])"
+            )
+            .unwrap(),
+            r#"["function","function","function","function"]"#
+        );
+        let mut ext = ExtScriptRuntime::new();
+        assert_eq!(
+            ext.eval(
+                "JSON.stringify([typeof Node, typeof Element, typeof HTMLElement, typeof Document])"
+            )
+            .unwrap(),
+            r#"["undefined","undefined","undefined","undefined"]"#
+        );
+    }
+
+    #[test]
+    fn wrapped_elements_and_document_have_the_dom_prototype_chain() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var e = document.createElement('div'); \
+                 var g = document.getElementById('host'); \
+                 var q = document.querySelector('span'); \
+                 var qa = document.querySelectorAll('span')[0]; \
+                 JSON.stringify([\
+                   e instanceof HTMLElement, e instanceof Element, e instanceof Node, \
+                   g instanceof HTMLElement, q instanceof Element, qa instanceof Node, \
+                   document instanceof Document, document instanceof Node, \
+                   document instanceof Element])",
+            )
+            .unwrap();
+        assert_eq!(probe, "[true,true,true,true,true,true,true,true,false]");
+    }
+
+    #[test]
+    fn node_constants_match_the_dom_spec() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "JSON.stringify([Node.ELEMENT_NODE, Node.ATTRIBUTE_NODE, Node.TEXT_NODE, \
+                 Node.CDATA_SECTION_NODE, Node.ENTITY_REFERENCE_NODE, Node.ENTITY_NODE, \
+                 Node.PROCESSING_INSTRUCTION_NODE, Node.COMMENT_NODE, Node.DOCUMENT_NODE, \
+                 Node.DOCUMENT_TYPE_NODE, Node.DOCUMENT_FRAGMENT_NODE, Node.NOTATION_NODE])",
+            )
+            .unwrap();
+        assert_eq!(probe, "[1,2,3,4,5,6,7,8,9,10,11,12]");
+    }
+
+    #[test]
+    fn node_type_and_tag_name_come_from_the_real_node() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var host = document.getElementById('host'); \
+                 var kid = document.querySelector('span'); \
+                 var made = document.createElement('em'); \
+                 JSON.stringify([host.nodeType, host.tagName, host.nodeName, \
+                 kid.tagName, made.tagName, document.nodeType, document.nodeName, \
+                 host.parentNode.nodeName, String(host.parentElement)])",
+            )
+            .unwrap();
+        assert_eq!(
+            probe,
+            r##"[1,"DIV","DIV","SPAN","EM",9,"#document","#document","null"]"##
+        );
+    }
+
+    #[test]
+    fn direct_dom_constructor_invocation_throws() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var out = []; \
+                 ['Node', 'Element', 'HTMLElement', 'Document'].forEach(function (n) { \
+                   var C = window[n]; \
+                   try { new C(); out.push('no-throw'); } \
+                   catch (e) { out.push(e.name + ': ' + e.message); } \
+                 }); \
+                 JSON.stringify(out)",
+            )
+            .unwrap();
+        assert!(!probe.contains("no-throw"), "unexpected: {probe}");
+        assert_eq!(
+            probe,
+            r#"["TypeError: Illegal constructor: Node","TypeError: Illegal constructor: Element","TypeError: Illegal constructor: HTMLElement","TypeError: Illegal constructor: Document"]"#
+        );
+    }
+
+    #[test]
+    fn class_extends_htmlellement_parses_and_constructs() {
+        let (dom, _, _) = sample_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "class Foo extends HTMLElement {} \
+                 var f = new Foo(); \
+                 JSON.stringify([f instanceof Foo, f instanceof HTMLElement, \
+                 f instanceof Element, f instanceof Node])",
+            )
+            .unwrap();
+        assert_eq!(probe, "[true,true,true,true]");
+    }
+
+    /// Document-order fixture: scripts, img, anchor, div with assorted attrs.
+    fn url_dom() -> Rc<RefCell<Dom>> {
+        let mut dom = Dom::new();
+        let script = |src: &str, id: &str, class: &str| NodeKind::Element {
+            tag: "script".into(),
+            attrs: vec![
+                ("src".into(), src.into()),
+                ("id".into(), id.into()),
+                ("class".into(), class.into()),
+            ],
+        };
+        let nodes = vec![
+            dom.create(script(
+                "/_static/js/webcomponents-loader.js",
+                "s1",
+                "loader",
+            )),
+            dom.create(script(
+                "https://cdn.example/webcomponents-loader.js",
+                "s2",
+                "loader extra",
+            )),
+            dom.create(NodeKind::Element {
+                tag: "img".into(),
+                attrs: vec![
+                    ("src".into(), "pic.png".into()),
+                    ("alt".into(), "photo".into()),
+                ],
+            }),
+            dom.create(NodeKind::Element {
+                tag: "a".into(),
+                attrs: vec![
+                    ("href".into(), "bar?x=1".into()),
+                    ("class".into(), "link".into()),
+                ],
+            }),
+            dom.create(NodeKind::Element {
+                tag: "div".into(),
+                attrs: vec![
+                    ("data-role".into(), "card".into()),
+                    ("id".into(), "main".into()),
+                ],
+            }),
+            dom.create(NodeKind::Element {
+                tag: "link".into(),
+                attrs: vec![("href".into(), "../up.css".into())],
+            }),
+        ];
+        for node in nodes {
+            dom.append(dom.root(), node);
+        }
+        Rc::new(RefCell::new(dom))
+    }
+
+    #[test]
+    fn attribute_selectors_operators_quotes_compounds_and_lists() {
+        let mut runtime = ExtScriptRuntime::new_page(url_dom());
+        let mut ids = |js: &str| runtime.eval(js).unwrap();
+        // The archive.org blocker form: contains operator with a quoted value.
+        assert_eq!(
+            ids("document.querySelector('script[src*=\"webcomponents-loader\"]').getAttribute('id')"),
+            "s1"
+        );
+        assert_eq!(
+            ids("var n='webcomponents-loader'; document.querySelector('script[src*=\"'+n+'\"]').getAttribute('id')"),
+            "s1"
+        );
+        assert_eq!(
+            ids("document.querySelectorAll('script[src*=\"webcomponents-loader\"]').length"),
+            "2"
+        );
+        // Bare and quoted equality, contains, prefix, suffix, exists.
+        assert_eq!(
+            ids("document.querySelector('[data-role=card]').getAttribute('id')"),
+            "main"
+        );
+        assert_eq!(
+            ids("document.querySelector('[data-role=\"card\"]').getAttribute('id')"),
+            "main"
+        );
+        assert_eq!(ids("document.querySelectorAll('[src]').length"), "3");
+        assert_eq!(
+            ids("document.querySelector('script[src^=\"/_static\"]').getAttribute('id')"),
+            "s1"
+        );
+        assert_eq!(
+            ids("document.querySelectorAll('script[src$=\".js\"]').length"),
+            "2"
+        );
+        // HTML attribute names are case-insensitive; values are not.
+        assert_eq!(
+            ids("document.querySelectorAll('[SRC*=\"webcomponents\"]').length"),
+            "2"
+        );
+        assert_eq!(
+            ids("document.querySelectorAll('[src*=\"WEBCOMPONENTS\"]').length"),
+            "0"
+        );
+        // Compounds and comma lists, in document order.
+        assert_eq!(
+            ids("document.querySelector('script#s1[src*=\"loader\"]').getAttribute('id')"),
+            "s1"
+        );
+        assert_eq!(ids("document.querySelectorAll('.loader[src]').length"), "2");
+        assert_eq!(ids("document.querySelectorAll('img, a.link').length"), "2");
+        assert_eq!(
+            ids(
+                "JSON.stringify([].map.call(document.querySelectorAll('[src], a'), function(e){return e.tagName;}))"
+            ),
+            r#"["SCRIPT","SCRIPT","IMG","A"]"#
+        );
+        // Absent attribute: querySelector null, querySelectorAll empty.
+        assert_eq!(
+            ids("String(document.querySelector('[data-missing]'))"),
+            "null"
+        );
+        assert_eq!(
+            ids("document.querySelectorAll('[data-missing]').length"),
+            "0"
+        );
+        // Unsupported syntax stays an honest empty result.
+        assert_eq!(ids("String(document.querySelector(':nope'))"), "null");
+    }
+
+    #[test]
+    fn src_and_href_reflect_resolved_urls_and_raw_fallback() {
+        let mut runtime =
+            ExtScriptRuntime::new_page_with_url(url_dom(), "https://archive.org/details/foo?x=1");
+        assert_eq!(
+            runtime.eval("document.getElementById('s1').src").unwrap(),
+            "https://archive.org/_static/js/webcomponents-loader.js"
+        );
+        assert_eq!(
+            runtime.eval("document.getElementById('s2').src").unwrap(),
+            "https://cdn.example/webcomponents-loader.js"
+        );
+        assert_eq!(
+            runtime.eval("document.querySelector('img').src").unwrap(),
+            "https://archive.org/details/pic.png"
+        );
+        assert_eq!(
+            runtime.eval("document.querySelector('a').href").unwrap(),
+            "https://archive.org/details/bar?x=1"
+        );
+        assert_eq!(
+            runtime.eval("document.querySelector('link').href").unwrap(),
+            "https://archive.org/up.css"
+        );
+        // No src attribute -> null; direct assignment writes through to the DOM.
+        assert_eq!(
+            runtime.eval("document.getElementById('main').src").unwrap(),
+            "null"
+        );
+        runtime
+            .eval("document.getElementById('main').src = 'https://evil.test/x';")
+            .unwrap();
+        assert_eq!(
+            runtime.eval("document.getElementById('main').src").unwrap(),
+            "https://evil.test/x"
+        );
+        runtime
+            .eval("document.getElementById('main').setAttribute('src','next.png');")
+            .unwrap();
+        assert_eq!(
+            runtime.eval("document.getElementById('main').src").unwrap(),
+            "https://archive.org/details/next.png"
+        );
+        // Without a threaded page URL the raw attribute value is reported.
+        let mut raw = ExtScriptRuntime::new_page(url_dom());
+        assert_eq!(
+            raw.eval("document.querySelector('img').src").unwrap(),
+            "pic.png"
+        );
     }
 }
