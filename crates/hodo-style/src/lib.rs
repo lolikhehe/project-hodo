@@ -206,6 +206,10 @@ pub struct ComputedStyle {
     pub background: Color,
     pub font_size: f32,
     pub font_weight: u16,
+    /// Parsed font stack (first family + generic fallback). Stored and inherited
+    /// only; layout still uses its built-in font (TODO(fontstack) in the
+    /// integrator's layout pass).
+    pub font_family: String,
     pub italic: bool,
     pub underline: bool,
     pub margin: Edges<f32>,
@@ -609,6 +613,7 @@ fn initial_style() -> ComputedStyle {
         background: Color::TRANSPARENT,
         font_size: 16.0,
         font_weight: 400,
+        font_family: String::new(),
         italic: false,
         underline: false,
         margin: Edges::zero(),
@@ -705,6 +710,7 @@ fn hash_inherited(style: &ComputedStyle) -> u64 {
     (style.color.r, style.color.g, style.color.b, style.color.a).hash(&mut h);
     style.font_size.to_bits().hash(&mut h);
     style.font_weight.hash(&mut h);
+    style.font_family.hash(&mut h);
     style.italic.hash(&mut h);
     style.underline.hash(&mut h);
     std::mem::discriminant(&style.line_height).hash(&mut h);
@@ -916,6 +922,7 @@ fn cascade(
     style.color = parent.color;
     style.font_size = parent.font_size;
     style.font_weight = parent.font_weight;
+    style.font_family = parent.font_family.clone();
     style.italic = parent.italic;
     style.underline = parent.underline;
     // A Number line-height stays a number; a resolved Length inherits as-is.
@@ -967,6 +974,11 @@ fn cascade(
             "normal" => 400,
             other => other.parse().unwrap_or(style.font_weight),
         };
+    }
+    if let Some(v) = winning.get("font-family") {
+        if let Some(stack) = parse_font_family(v) {
+            style.font_family = stack;
+        }
     }
     if let Some(v) = winning.get("font-style") {
         style.italic = v.to_ascii_lowercase().contains("italic");
@@ -1471,6 +1483,26 @@ fn parse_font_size(value: &str, parent_size: f32) -> f32 {
     parse_length(value, parent_size).unwrap_or(parent_size)
 }
 
+/// Normalize a `font-family` value into the parsed stack. Quoted and unquoted
+/// names and generic keywords are accepted; nothing switches fonts yet.
+fn parse_font_family(value: &str) -> Option<String> {
+    let mut families = Vec::new();
+    for part in value.split(',') {
+        let raw = part.trim();
+        let family = raw
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .or_else(|| raw.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+            .unwrap_or(raw)
+            .trim();
+        if family.is_empty() || family.chars().any(char::is_control) {
+            return None;
+        }
+        families.push(family);
+    }
+    (!families.is_empty()).then(|| families.join(", "))
+}
+
 const MARGIN_KEYS: [&str; 4] = ["margin-top", "margin-right", "margin-bottom", "margin-left"];
 const PADDING_KEYS: [&str; 4] = [
     "padding-top",
@@ -1611,7 +1643,7 @@ fn parse_rgba(value: &str) -> Option<Color> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hodo_css::Selector;
+    use hodo_css::{parse_stylesheet_with, Selector, Viewport};
 
     fn rule(selector: Selector, decls: &[(&str, &str)]) -> StyleRule {
         StyleRule {
@@ -2043,6 +2075,85 @@ mod tests {
         let sheets = [sheet("p { color: red !important }")];
         let map = compute_styles(&dom, &sheets);
         assert_eq!(map.get(plain).unwrap().color, Color::rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn specificity_only_breaks_ties_within_origin_and_importance() {
+        // A high-specificity author !important still loses to a low-specificity
+        // UA !important, because origin outranks specificity.
+        let (dom, id) = one_element("div");
+        let sheets = [sheet("#target { color: red !important }")];
+        let mut dom = dom;
+        dom.set_attr(id, "id", "target".to_string());
+        let map = compute_styles_inner(&dom, &sheets, "div { color: green !important }");
+        assert_eq!(map.get(id).unwrap().color, Color::rgb(0, 128, 0));
+
+        // Within one origin+importance level, specificity still decides.
+        let sheets = [sheet("div { color: red } #target { color: blue }")];
+        let map = compute_styles(&dom, &sheets);
+        assert_eq!(map.get(id).unwrap().color, Color::rgb(0, 0, 255));
+    }
+
+    #[test]
+    fn font_family_parses_and_survives_cascade() {
+        let (_, _, stack) = css_style("div { font-family: Verdana, sans-serif }");
+        assert_eq!(stack.font_family, "Verdana, sans-serif");
+
+        let (_, _, quoted) = css_style("div { font-family: \"My Font\", serif }");
+        assert_eq!(quoted.font_family, "My Font, serif");
+
+        let (_, _, generic) = css_style("div { font-family: monospace }");
+        assert_eq!(generic.font_family, "monospace");
+
+        let (_, _, winning) =
+            css_style("div { font-family: Verdana, sans-serif } div { font-family: Courier }");
+        assert_eq!(winning.font_family, "Courier");
+    }
+
+    #[test]
+    fn font_family_inherits_to_children() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let parent = element(&mut dom, root, "div", &[]);
+        let child = element(&mut dom, parent, "span", &[]);
+        let sheets = [sheet("div { font-family: Verdana, sans-serif }")];
+        let map = compute_styles(&dom, &sheets);
+        assert_eq!(map.get(parent).unwrap().font_family, "Verdana, sans-serif");
+        assert_eq!(map.get(child).unwrap().font_family, "Verdana, sans-serif");
+    }
+
+    #[test]
+    fn viewport_lengths_reach_the_cascade_output() {
+        let vp = Viewport {
+            width: 1200,
+            height: 800,
+            ..Viewport::default()
+        };
+        let (dom, id) = one_element("div");
+        for (css, expected) in [
+            ("div { padding: 25vh }", 200.0),
+            ("div { padding: 10vw }", 120.0),
+            ("div { padding: 5vmin }", 40.0),
+            ("div { padding: 5vmax }", 60.0),
+        ] {
+            let map = compute_styles(&dom, &[parse_stylesheet_with(vp, css)]);
+            let padding = map.get(id).unwrap().padding;
+            assert_eq!(padding.top, expected, "css {css}");
+            assert!(padding.top.is_finite());
+        }
+
+        let map = compute_styles(
+            &dom,
+            &[parse_stylesheet_with(vp, "div { padding: 25vh 2em 2em }")],
+        );
+        let padding = map.get(id).unwrap().padding;
+        assert_eq!(padding.top, 200.0);
+        assert_eq!(padding.right, 32.0);
+        assert!(padding.bottom.is_finite() && padding.left.is_finite());
+
+        // Unknown unit keeps the existing fallback path (no padding).
+        let map = compute_styles(&dom, &[parse_stylesheet_with(vp, "div { padding: 10vi }")]);
+        assert_eq!(map.get(id).unwrap().padding.top, 0.0);
     }
 
     #[test]

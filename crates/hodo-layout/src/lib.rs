@@ -152,6 +152,7 @@ pub(crate) fn fallback_style() -> ComputedStyle {
         background: Color::TRANSPARENT,
         font_size: 16.0,
         font_weight: 400,
+        font_family: String::new(),
         italic: false,
         underline: false,
         margin: Edges::zero(),

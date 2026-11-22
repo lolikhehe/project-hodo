@@ -28,6 +28,39 @@ pub struct Stylesheet {
     pub rules: Vec<StyleRule>,
 }
 
+/// Media-feature evaluation context for `@media` blocks **and** the descriptor
+/// viewport units (`vh`/`vw`/`vmin`/`vmax`) resolve against while parsing.
+/// `parse_stylesheet` uses [`Viewport::default`]; callers with a real window
+/// should pass theirs through [`parse_stylesheet_with`]. Lengths resolve at
+/// parse time into fixed `px` text (see [`resolve_viewport_lengths`]); a resize
+/// mid-session does not re-resolve already-parsed declarations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Viewport {
+    pub width: u32,
+    pub height: u32,
+    pub media_type: MediaType,
+    /// Reserved for a future `scripting` feature; wave-1 queries ignore it.
+    pub scripting_enabled: bool,
+}
+
+impl Default for Viewport {
+    fn default() -> Self {
+        Self {
+            width: 1200,
+            height: 800,
+            media_type: MediaType::Screen,
+            scripting_enabled: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MediaType {
+    #[default]
+    Screen,
+    Print,
+}
+
 #[derive(Debug, Clone)]
 pub struct StyleRule {
     pub selector: Selector,
@@ -88,6 +121,17 @@ pub enum PseudoClass {
     NthChild(i32, i32),
     OnlyChild,
     Not(Box<Compound>),
+    /// `:where()` — matches any inner compound, zero specificity.
+    Where(Vec<Compound>),
+    /// `:is()` — matches any inner compound, specificity of the best one.
+    Is(Vec<Compound>),
+    /// `:link` / `:visited` — both match `a[href]` this wave (no history).
+    Link,
+    Visited,
+    /// Interaction pseudos parse but never match in a static render.
+    Hover,
+    Focus,
+    Active,
     Root,
     Empty,
 }
@@ -149,21 +193,63 @@ pub fn complex(sel: &Selector) -> ComplexSelector {
 
 // ---- stylesheet parsing -------------------------------------------------
 
-/// Parse a stylesheet. Invalid selectors drop only their own rule; at-rules
+/// Nesting guard for block at-rules: hostile input cannot overflow the stack
+/// before the rule cap applies.
+const MAX_AT_RULE_DEPTH: u8 = 16;
+
+/// One warning per stylesheet. Unsupported conditions drop their inner rules
+/// but keep parsing, mirroring the `grid-auto-flow` diagnostic precedent.
+#[derive(Default)]
+struct WarnOnce {
+    emitted: bool,
+}
+
+impl WarnOnce {
+    fn note(&mut self, message: &str) {
+        if !self.emitted {
+            self.emitted = true;
+            eprintln!("hodo-css: {message}");
+        }
+    }
+}
+
+/// Parse a stylesheet with the default viewport (1200x800, `screen`,
+/// scripting enabled). Invalid selectors drop only their own rule; at-rules
 /// and malformed declarations recover as before.
 pub fn parse_stylesheet(css: &str) -> Stylesheet {
+    parse_stylesheet_with(Viewport::default(), css)
+}
+
+/// Parse a stylesheet, evaluating `@media` / `@supports` against `viewport`.
+/// Inner rules are kept only for matching conditions; unsupported conditions
+/// are dropped with a single warning per stylesheet.
+pub fn parse_stylesheet_with(viewport: Viewport, css: &str) -> Stylesheet {
     let mut parser = Parser::new(css);
     let mut rules = Vec::new();
+    let mut warn = WarnOnce::default();
+    parse_rules(&mut parser, viewport, &mut warn, &mut rules, 0);
+    Stylesheet { rules }
+}
 
+fn parse_rules(
+    parser: &mut Parser<'_>,
+    viewport: Viewport,
+    warn: &mut WarnOnce,
+    rules: &mut Vec<StyleRule>,
+    depth: u8,
+) {
     loop {
         let state = parser.state();
         match parser.next() {
             Ok(Token::CDO | Token::CDC | Token::Semicolon) => continue,
-            Ok(Token::AtKeyword(_)) => skip_rule(&mut parser),
+            Ok(Token::AtKeyword(name)) => {
+                let name = name.to_string();
+                parse_at_rule(parser, &name, viewport, warn, rules, depth);
+            }
             Ok(Token::CurlyBracketBlock) => {}
             Ok(_) => {
                 parser.reset(&state);
-                if let Some(parsed) = parse_qualified_rule(&mut parser) {
+                if let Some(parsed) = parse_qualified_rule(parser, viewport) {
                     rules.extend(parsed);
                 }
             }
@@ -174,8 +260,177 @@ pub fn parse_stylesheet(css: &str) -> Stylesheet {
             break;
         }
     }
+}
 
-    Stylesheet { rules }
+fn parse_at_rule(
+    parser: &mut Parser<'_>,
+    name: &str,
+    viewport: Viewport,
+    warn: &mut WarnOnce,
+    rules: &mut Vec<StyleRule>,
+    depth: u8,
+) {
+    let prelude = parser
+        .parse_until_before(Delimiter::CurlyBracketBlock | Delimiter::Semicolon, |p| {
+            Ok::<_, ParseError<()>>(serialize_value(p))
+        })
+        .unwrap_or_default();
+    let is_block = matches!(parser.next(), Ok(Token::CurlyBracketBlock));
+    let applies = match name.to_ascii_lowercase().as_str() {
+        "media" => media_applies(&prelude, viewport, warn),
+        "supports" => supports_applies(&prelude, warn),
+        "import" => {
+            warn.note("@import ignored (fetching stylesheets in the parser is out of scope)");
+            false
+        }
+        "layer" => {
+            // Layers are parsed and diagnosed, but their cascade layer is not
+            // modelled yet: inner rules stay dropped this wave.
+            warn.note("@layer ignored (cascade layers unsupported; inner rules dropped)");
+            false
+        }
+        // @font-face, @keyframes, @page, @charset etc. keep the old skip path.
+        _ => false,
+    };
+    if !is_block {
+        return;
+    }
+    // Consume the block whether or not it matches, so recovery stays intact.
+    let _ = parser.parse_nested_block(|p| {
+        if applies && depth < MAX_AT_RULE_DEPTH {
+            parse_rules(p, viewport, warn, rules, depth + 1);
+        }
+        Ok::<_, ParseError<()>>(())
+    });
+}
+
+/// Split a query into whitespace-separated items, keeping each `(...)` as one
+/// item. Nested parentheses are rejected as unsupported (safe default).
+fn query_items(query: &str) -> Option<Vec<String>> {
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut in_condition = false;
+    for ch in query.trim().chars() {
+        match ch {
+            '(' if in_condition => return None,
+            '(' => {
+                if !current.is_empty() {
+                    items.push(std::mem::take(&mut current));
+                }
+                current.push(ch);
+                in_condition = true;
+            }
+            ')' if !in_condition => return None,
+            ')' => {
+                current.push(ch);
+                items.push(std::mem::take(&mut current));
+                in_condition = false;
+            }
+            ch if ch.is_whitespace() && !in_condition => {
+                if !current.is_empty() {
+                    items.push(std::mem::take(&mut current));
+                }
+            }
+            ch => current.push(ch),
+        }
+    }
+    if in_condition {
+        return None;
+    }
+    if !current.is_empty() {
+        items.push(current);
+    }
+    Some(items)
+}
+
+fn media_applies(query: &str, viewport: Viewport, warn: &mut WarnOnce) -> bool {
+    let Some(mut items) = query_items(query) else {
+        warn.note("@media condition unsupported (safe default: rules dropped)");
+        return false;
+    };
+    if items.is_empty() {
+        warn.note("@media condition unsupported (safe default: rules dropped)");
+        return false;
+    }
+    // Legacy `only` qualifier is a no-op; `not`, comma lists and `or` are
+    // deliberately unsupported and fall through to the non-matching path.
+    if items[0].eq_ignore_ascii_case("only") {
+        items.remove(0);
+    }
+    let mut index = 0;
+    if let Some(first) = items.first() {
+        if !first.starts_with('(') {
+            match first.to_ascii_lowercase().as_str() {
+                "screen" if viewport.media_type != MediaType::Screen => return false,
+                "print" if viewport.media_type != MediaType::Print => return false,
+                "screen" | "print" | "all" => {}
+                _ => {
+                    warn.note("@media condition unsupported (safe default: rules dropped)");
+                    return false;
+                }
+            }
+            index = 1;
+        }
+    }
+    while index < items.len() {
+        if items[index].eq_ignore_ascii_case("and") {
+            index += 1;
+            continue;
+        }
+        let Some(matched) = feature_matches(&items[index], viewport) else {
+            warn.note("@media condition unsupported (safe default: rules dropped)");
+            return false;
+        };
+        if !matched {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+fn feature_matches(item: &str, viewport: Viewport) -> Option<bool> {
+    let inner = item.strip_prefix('(')?.strip_suffix(')')?;
+    let (feature, value) = inner.split_once(':')?;
+    let value = value.trim();
+    match feature.trim().to_ascii_lowercase().as_str() {
+        "min-width" => Some(px_value(value)? <= f64::from(viewport.width)),
+        "max-width" => Some(px_value(value)? >= f64::from(viewport.width)),
+        "min-height" => Some(px_value(value)? <= f64::from(viewport.height)),
+        "max-height" => Some(px_value(value)? >= f64::from(viewport.height)),
+        "orientation" => match value.to_ascii_lowercase().as_str() {
+            "landscape" => Some(viewport.width >= viewport.height),
+            "portrait" => Some(viewport.width < viewport.height),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn px_value(value: &str) -> Option<f64> {
+    value.strip_suffix("px")?.trim().parse().ok()
+}
+
+fn supports_applies(condition: &str, warn: &mut WarnOnce) -> bool {
+    // Wave-1 whitelist: one plain `(property: value)` we actually implement.
+    // `not`/`and`/`or`/`selector()` and `position: sticky` stay non-matching.
+    let supported = condition
+        .trim()
+        .strip_prefix('(')
+        .and_then(|text| text.strip_suffix(')'))
+        .and_then(|inner| inner.split_once(':'))
+        .is_some_and(|(property, value)| {
+            let is_display = property.trim().eq_ignore_ascii_case("display");
+            let value = value.trim();
+            is_display
+                && (value.eq_ignore_ascii_case("flex")
+                    || value.eq_ignore_ascii_case("grid")
+                    || value.eq_ignore_ascii_case("table"))
+        });
+    if !supported {
+        warn.note("@supports condition unsupported (safe default: rules dropped)");
+    }
+    supported
 }
 
 fn skip_rule(parser: &mut Parser<'_>) {
@@ -194,7 +449,7 @@ fn skip_rule(parser: &mut Parser<'_>) {
     }
 }
 
-fn parse_qualified_rule(parser: &mut Parser<'_>) -> Option<Vec<StyleRule>> {
+fn parse_qualified_rule(parser: &mut Parser<'_>, viewport: Viewport) -> Option<Vec<StyleRule>> {
     // Collect the prelude once. Plain compounds use the allocation-light token
     // parser; selectors with blocks/functions are re-parsed from their text so
     // nested blocks can be expanded.
@@ -213,7 +468,7 @@ fn parse_qualified_rule(parser: &mut Parser<'_>) -> Option<Vec<StyleRule>> {
         return None;
     }
     let declarations = parser
-        .parse_nested_block(|p| Ok::<_, ParseError<()>>(parse_declarations(p)))
+        .parse_nested_block(|p| Ok::<_, ParseError<()>>(parse_declarations(p, viewport)))
         .unwrap_or_default();
 
     let mut rules = Vec::new();
@@ -373,7 +628,56 @@ fn selector_from_tokens(tokens: &[Token<'_>]) -> Result<Selector, ()> {
     Ok(selector)
 }
 
-fn parse_declarations(parser: &mut Parser<'_>) -> Vec<Declaration> {
+/// Resolve viewport-relative lengths in a declaration value to `px` text using
+/// the stylesheet's `Viewport`. Only whole `<number><unit>` words are touched;
+/// quoted text, `calc()` and unknown units are left alone.
+///
+/// NOTE(parse-time): like `px`, a viewport unit becomes a fixed number while
+/// parsing. A window resized mid-session does not re-resolve cached
+/// declarations — revisit by re-parsing with the new `Viewport` when resize
+/// support lands.
+fn resolve_viewport_lengths(value: &str, viewport: Viewport) -> String {
+    const UNITS: [&str; 4] = ["vmin", "vmax", "vh", "vw"];
+    if !UNITS.iter().any(|unit| value.contains(unit)) {
+        return value.to_string();
+    }
+    let (head, tail) = match value.split_once('!') {
+        Some((head, tail)) => (head, Some(tail)),
+        None => (value, None),
+    };
+    let sides = [
+        ("vmin", viewport.width.min(viewport.height)),
+        ("vmax", viewport.width.max(viewport.height)),
+        ("vh", viewport.height),
+        ("vw", viewport.width),
+    ];
+    let mut out = String::with_capacity(value.len());
+    for piece in head.split_inclusive(char::is_whitespace) {
+        let lead = piece.len() - piece.trim_start().len();
+        let trimmed = piece.trim();
+        let end = piece.trim_end().len();
+        let resolved = sides.into_iter().find_map(|(unit, side)| {
+            let number = trimmed.strip_suffix(unit)?.trim().parse::<f32>().ok()?;
+            number
+                .is_finite()
+                .then(|| format!("{}px", number * side as f32 / 100.0))
+        });
+        if let Some(px) = resolved {
+            out.push_str(&piece[..lead]);
+            out.push_str(&px);
+            out.push_str(&piece[end..]);
+        } else {
+            out.push_str(piece);
+        }
+    }
+    if let Some(tail) = tail {
+        out.push('!');
+        out.push_str(tail);
+    }
+    out
+}
+
+fn parse_declarations(parser: &mut Parser<'_>, viewport: Viewport) -> Vec<Declaration> {
     let mut declarations = Vec::new();
 
     loop {
@@ -395,7 +699,10 @@ fn parse_declarations(parser: &mut Parser<'_>) -> Vec<Declaration> {
                         Ok::<_, ParseError<()>>(serialize_value(p))
                     })
                     .unwrap_or_default();
-                declarations.push(Declaration { property, value });
+                declarations.push(Declaration {
+                    property,
+                    value: resolve_viewport_lengths(&value, viewport),
+                });
             }
             Ok(_) => skip_to_semicolon(parser),
             Err(_) => break,
@@ -408,7 +715,7 @@ fn parse_declarations(parser: &mut Parser<'_>) -> Vec<Declaration> {
 /// Parse an element's `style="..."` attribute as a declaration list.
 pub fn parse_style_attribute(css: &str) -> Vec<Declaration> {
     let mut parser = Parser::new(css);
-    parse_declarations(&mut parser)
+    parse_declarations(&mut parser, Viewport::default())
 }
 
 /// Value text of a declaration with a trailing `! important` removed.
@@ -638,6 +945,11 @@ fn parse_compound<'i>(parser: &mut Parser<'i>, not_depth: u8) -> Result<Compound
                                 "only-child" => PseudoClass::OnlyChild,
                                 "root" => PseudoClass::Root,
                                 "empty" => PseudoClass::Empty,
+                                "link" => PseudoClass::Link,
+                                "visited" => PseudoClass::Visited,
+                                "hover" => PseudoClass::Hover,
+                                "focus" => PseudoClass::Focus,
+                                "active" => PseudoClass::Active,
                                 _ => return Err(parser.new_error_for_next_token()),
                             });
                         continue;
@@ -667,6 +979,10 @@ fn parse_compound<'i>(parser: &mut Parser<'i>, not_depth: u8) -> Result<Compound
                         }
                         PseudoClass::Not(Box::new(arg))
                     }
+                    // One compound per variant; a combinator leaves tokens
+                    // unconsumed, so the whole rule drops as with `:not()`.
+                    "where" => PseudoClass::Where(parse_compound_list(parser, not_depth)?),
+                    "is" => PseudoClass::Is(parse_compound_list(parser, not_depth)?),
                     _ => return Err(parser.new_error_for_next_token()),
                 };
                 compound.pseudos.push(pseudo);
@@ -681,6 +997,36 @@ fn parse_compound<'i>(parser: &mut Parser<'i>, not_depth: u8) -> Result<Compound
         }
     }
     Ok(compound)
+}
+
+/// Parse a comma-separated list of single compounds inside `:is()` / `:where()`.
+/// Shares the `:not()` depth cap; an inner combinator leaves tokens unconsumed
+/// and drops the rule through `parse_nested_block`'s end-of-input check.
+fn parse_compound_list<'i>(
+    parser: &mut Parser<'i>,
+    not_depth: u8,
+) -> Result<Vec<Compound>, ParseError<()>> {
+    if not_depth >= MAX_NOT_DEPTH {
+        return Err(parser.new_error_for_next_token());
+    }
+    parser
+        .parse_nested_block(|p| {
+            let mut list = Vec::new();
+            loop {
+                let compound = parse_compound(p, not_depth + 1)?;
+                if compound.is_empty() {
+                    return Err(p.new_error_for_next_token());
+                }
+                list.push(compound);
+                match p.next() {
+                    Ok(Token::Comma) => continue,
+                    Ok(_) => return Err(p.new_error_for_next_token()),
+                    Err(_) => break, // end of the nested block
+                }
+            }
+            Ok(list)
+        })
+        .map_err(|_| parser.new_error_for_next_token())
 }
 
 fn parse_nested_text<'i>(parser: &mut Parser<'i>) -> Result<String, ParseError<()>> {
@@ -772,6 +1118,9 @@ fn parse_nth(text: &str) -> Option<(i32, i32)> {
 const CHAIN_PREFIX: &str = "\u{0}chain:";
 const COMP_SEP: char = '\u{1f}';
 const FIELD_SEP: char = '\u{1d}';
+/// Separates `:is()` / `:where()` variants inside one encoded pseudo atom.
+/// Must differ from `COMP_SEP` (chain compounds) and every depth separator.
+const PSEUDO_LIST_SEP: char = '\u{1a}';
 
 fn sep_for_depth(depth: u8) -> char {
     match depth {
@@ -875,6 +1224,24 @@ fn encode_compound(compound: &Compound, depth: u8) -> String {
                 char::from(b'0' + depth + 1),
                 encode_compound(arg, depth + 1)
             ),
+            PseudoClass::Where(args) | PseudoClass::Is(args) => {
+                let code = if matches!(pseudo, PseudoClass::Where(_)) {
+                    'W'
+                } else {
+                    'I'
+                };
+                let inner = args
+                    .iter()
+                    .map(|arg| encode_compound(arg, depth + 1))
+                    .collect::<Vec<_>>()
+                    .join(&PSEUDO_LIST_SEP.to_string());
+                format!("p{code}{}{FIELD_SEP}{inner}", char::from(b'0' + depth + 1))
+            }
+            PseudoClass::Link => "pL".to_string(),
+            PseudoClass::Visited => "pV".to_string(),
+            PseudoClass::Hover => "pH".to_string(),
+            PseudoClass::Focus => "pF".to_string(),
+            PseudoClass::Active => "pA".to_string(),
         };
         atoms.push(atom);
     }
@@ -972,6 +1339,30 @@ fn decode_compound(text: &str, depth: u8) -> Option<Compound> {
                         let (_, nested) = arg.split_once(FIELD_SEP)?;
                         PseudoClass::Not(Box::new(decode_compound(nested, nested_depth)?))
                     }
+                    'W' | 'I' => {
+                        let nested_depth = arg.chars().next()?.to_digit(10)? as u8;
+                        if nested_depth > MAX_NOT_DEPTH || nested_depth <= depth {
+                            return None;
+                        }
+                        let (_, list) = arg.split_once(FIELD_SEP)?;
+                        let args = list
+                            .split(PSEUDO_LIST_SEP)
+                            .map(|part| decode_compound(part, nested_depth))
+                            .collect::<Option<Vec<_>>>()?;
+                        if args.is_empty() {
+                            return None;
+                        }
+                        if code == 'W' {
+                            PseudoClass::Where(args)
+                        } else {
+                            PseudoClass::Is(args)
+                        }
+                    }
+                    'L' => PseudoClass::Link,
+                    'V' => PseudoClass::Visited,
+                    'H' => PseudoClass::Hover,
+                    'F' => PseudoClass::Focus,
+                    'A' => PseudoClass::Active,
                     _ => return None,
                 };
                 compound.pseudos.push(pseudo);
@@ -1021,12 +1412,31 @@ fn add_specificity(compound: &Compound, ids: &mut u32, classes: &mut u32, tags: 
     *classes += compound
         .pseudos
         .iter()
-        .filter(|pseudo| !matches!(pseudo, PseudoClass::Not(_)))
+        .filter(|pseudo| {
+            !matches!(
+                pseudo,
+                PseudoClass::Not(_) | PseudoClass::Where(_) | PseudoClass::Is(_)
+            )
+        })
         .count() as u32;
     *tags += u32::from(compound.tag.is_some());
     for pseudo in &compound.pseudos {
-        if let PseudoClass::Not(arg) = pseudo {
-            add_specificity(arg, ids, classes, tags);
+        match pseudo {
+            PseudoClass::Not(arg) => add_specificity(arg, ids, classes, tags),
+            // `:where()` contributes nothing; `:is()` takes its most specific
+            // variant, but only breaks ties inside this origin/importance level.
+            PseudoClass::Is(args) => {
+                let mut best = (0, 0, 0);
+                for arg in args {
+                    let (mut i, mut c, mut t) = (0, 0, 0);
+                    add_specificity(arg, &mut i, &mut c, &mut t);
+                    best = best.max((i, c, t));
+                }
+                *ids += best.0;
+                *classes += best.1;
+                *tags += best.2;
+            }
+            _ => {}
         }
     }
 }
@@ -1236,6 +1646,16 @@ fn matches_compound(compound: &Compound, dom: &Dom, id: NodeId, ctx: &mut MatchC
             PseudoClass::OnlyChild => previous.is_none() && next.is_none(),
             PseudoClass::NthChild(a, b) => nth_matches(*a, *b, index),
             PseudoClass::Not(arg) => !matches_compound(arg, dom, id, ctx),
+            PseudoClass::Where(args) | PseudoClass::Is(args) => {
+                args.iter().any(|arg| matches_compound(arg, dom, id, ctx))
+            }
+            // No visited-history tracking this wave: both are plain `a[href]`.
+            PseudoClass::Link | PseudoClass::Visited => {
+                dom.tag(id).is_some_and(|tag| tag.eq_ignore_ascii_case("a"))
+                    && attr_value(dom, id, "href").is_some()
+            }
+            // Static render has no pointer/focus state; never match.
+            PseudoClass::Hover | PseudoClass::Focus | PseudoClass::Active => false,
             PseudoClass::Root => dom.parent(id) == Some(dom.root()),
             PseudoClass::Empty => dom
                 .children(id)
@@ -1877,6 +2297,88 @@ mod tests {
     }
 
     #[test]
+    fn link_and_visited_match_anchors_with_href() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let link = elem(&mut dom, root, "a", &[("href", "https://example.com")]);
+        let bare = elem(&mut dom, root, "a", &[]);
+        let other = elem(&mut dom, root, "div", &[("href", "#")]);
+        for text in ["a:link", "a:visited", ":link", ":visited"] {
+            let sel = selector(text);
+            assert!(
+                matches_selector(&sel, &dom, link),
+                "{text} must match a[href]"
+            );
+            assert!(
+                !matches_selector(&sel, &dom, bare),
+                "{text} must skip bare a"
+            );
+            assert!(
+                !matches_selector(&sel, &dom, other),
+                "{text} must skip non-anchor"
+            );
+        }
+        // HN-shaped selector lists survive parsing; only the link arms apply.
+        let sheet = parse_stylesheet("a:link, a:visited { color: blue } p { color: red }");
+        assert_eq!(sheet.rules.len(), 3);
+        assert_eq!(sheet.rules[0].declarations[0].value, "blue");
+        assert_eq!(sheet.rules[1].declarations[0].value, "blue");
+        assert!(matches_selector(&sheet.rules[0].selector, &dom, link));
+        assert!(matches_selector(&sheet.rules[1].selector, &dom, link));
+    }
+
+    #[test]
+    fn interaction_pseudos_parse_but_never_match_statically() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let link = elem(&mut dom, root, "a", &[("href", "#")]);
+        for text in ["a:hover", "a:focus", "a:active", ":hover"] {
+            let sel = selector(text); // must survive parsing
+            assert!(!matches_selector(&sel, &dom, link), "{text} must not match");
+        }
+        // A non-matching interaction arm must not sink its sibling link arm.
+        let sheet = parse_stylesheet("a:hover, a:link { color: blue } p { color: red }");
+        assert_eq!(sheet.rules.len(), 3);
+        assert!(!matches_selector(&sheet.rules[0].selector, &dom, link));
+        assert!(matches_selector(&sheet.rules[1].selector, &dom, link));
+    }
+
+    #[test]
+    fn where_and_is_match_with_expected_specificity() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let wrapper = elem(&mut dom, root, "div", &[("id", "menu"), ("class", "menu")]);
+        let link = elem(&mut dom, wrapper, "a", &[("href", "#")]);
+        let flagged = elem(&mut dom, root, "p", &[("id", "b")]);
+        let other = elem(&mut dom, root, "p", &[("class", "a")]);
+
+        assert_eq!(specificity_full(&selector(":where(#id) a")), (0, 0, 1));
+        assert_eq!(specificity_full(&selector(":where(.menu) a")), (0, 0, 1));
+        assert_eq!(specificity_full(&selector(":is(.a, #b)")), (1, 0, 0));
+
+        assert!(matches_selector(&selector(":where(#menu) a"), &dom, link));
+        assert!(matches_selector(&selector(":where(.menu) a"), &dom, link));
+        assert!(!matches_selector(
+            &selector(":where(#menu) a"),
+            &dom,
+            wrapper
+        ));
+        assert!(matches_selector(&selector(":is(.a, #b)"), &dom, flagged));
+        assert!(matches_selector(&selector(":is(.a, #b)"), &dom, other));
+
+        // Inner combinators are unsupported: the rule drops, siblings survive.
+        for css in [
+            ":is(.a .b) { color: red } p { color: blue }",
+            ":where(> .a) { color: red } p { color: blue }",
+            ":where(:is(:where(.a))) { color: red } p { color: blue }",
+        ] {
+            let sheet = parse_stylesheet(css);
+            assert_eq!(sheet.rules.len(), 1, "unsupported inner: {css}");
+            assert_eq!(sheet.rules[0].declarations[0].value, "blue");
+        }
+    }
+
+    #[test]
     fn child_pseudo_classes_and_empty() {
         let (mut dom, _, first, target, last) = sample_tree();
         assert!(matches_selector(&selector("li:first-child"), &dom, first));
@@ -2002,7 +2504,7 @@ mod tests {
 
     #[test]
     fn invalid_selector_drops_only_its_own_rule() {
-        let css = ":hover { color: red } p { color: blue } > { color: green } \
+        let css = ":bogus { color: red } p { color: blue } > { color: green } \
                    div::before { color: yellow } .ok:not() { color: pink } a { color: black }";
         let sheet = parse_stylesheet(css);
         let values: Vec<&str> = sheet
@@ -2098,6 +2600,173 @@ mod tests {
         assert!(!is_important(&decls[1]));
         assert_eq!(declaration_value(&decls[1]), "0");
         assert_eq!(declaration_value(&decls[2]), "12px");
+    }
+
+    #[test]
+    fn viewport_units_resolve_to_px_at_parse_time() {
+        let vp = Viewport {
+            width: 1200,
+            height: 800,
+            ..Viewport::default()
+        };
+        let sheet = parse_stylesheet_with(
+            vp,
+            "div { padding: 25vh 10vw 5vmin 5vmax; width: 10vi; height: 25vh !important }",
+        );
+        let decls = &sheet.rules[0].declarations;
+        assert_eq!(declaration_value(&decls[0]), "200px 120px 40px 60px");
+        assert_eq!(declaration_value(&decls[1]), "10vi");
+        assert!(is_important(&decls[2]));
+        assert_eq!(declaration_value(&decls[2]), "200px");
+    }
+
+    #[test]
+    fn viewport_unit_resolution_leaves_other_values_untouched() {
+        let vp = Viewport {
+            width: 1200,
+            height: 800,
+            ..Viewport::default()
+        };
+        let sheet = parse_stylesheet_with(
+            vp,
+            "div { font-family: '25vh'; width: calc(25vh - 1px); margin: 2em; top: 50% }",
+        );
+        let values: Vec<&str> = sheet.rules[0]
+            .declarations
+            .iter()
+            .map(|d| d.value.as_str())
+            .collect();
+        assert_eq!(values, ["\"25vh\"", "calc(25vh - 1px)", "2em", "50%"]);
+    }
+
+    // --- wave-1 at-rules -------------------------------------------------
+
+    #[test]
+    fn media_screen_applies_and_print_does_not() {
+        let sheet = parse_stylesheet("@media screen { .a { color: red } }");
+        assert_eq!(sheet.rules.len(), 1);
+        assert_eq!(sheet.rules[0].selector.classes, ["a"]);
+        assert_eq!(sheet.rules[0].declarations[0].value, "red");
+
+        let sheet = parse_stylesheet("@media print { .a { color: red } }");
+        assert!(sheet.rules.is_empty());
+
+        let print = Viewport {
+            media_type: MediaType::Print,
+            ..Viewport::default()
+        };
+        let sheet = parse_stylesheet_with(print, "@media print { .a { color: red } }");
+        assert_eq!(sheet.rules.len(), 1);
+    }
+
+    #[test]
+    fn media_width_and_orientation_features_use_viewport() {
+        let sheet = parse_stylesheet("@media (min-width: 1000px) { .a { color: red } }");
+        assert_eq!(sheet.rules.len(), 1);
+        let sheet = parse_stylesheet("@media (min-width: 2000px) { .a { color: red } }");
+        assert!(sheet.rules.is_empty());
+
+        let narrow = Viewport {
+            width: 800,
+            height: 600,
+            ..Viewport::default()
+        };
+        let css = "@media (max-width: 900px) and (orientation: landscape) { .a { color: red } }";
+        let sheet = parse_stylesheet_with(narrow, css);
+        assert_eq!(sheet.rules.len(), 1);
+        let sheet = parse_stylesheet_with(
+            narrow,
+            "@media (orientation: portrait) { .a { color: red } }",
+        );
+        assert!(sheet.rules.is_empty());
+    }
+
+    #[test]
+    fn media_unsupported_features_are_non_matching() {
+        for query in [
+            "(hover: hover)",
+            "(prefers-color-scheme: dark)",
+            "((min-width: 100px))",
+            "screen and (pointer: coarse)",
+            "(min-width: 1000px), print",
+            "",
+        ] {
+            let css = format!("@media {query} {{ .a {{ color: red }} }} p {{ color: blue }}");
+            let sheet = parse_stylesheet(&css);
+            assert_eq!(sheet.rules.len(), 1, "query {query}");
+            assert_eq!(sheet.rules[0].declarations[0].value, "blue");
+        }
+    }
+
+    #[test]
+    fn supports_whitelist_is_literal() {
+        for condition in ["(display: grid)", "(display:flex)", "(display: table)"] {
+            let sheet =
+                parse_stylesheet(&format!("@supports {condition} {{ .a {{ color: red }} }}"));
+            assert_eq!(sheet.rules.len(), 1, "condition {condition}");
+        }
+        for condition in [
+            "(position: sticky)",
+            "selector(:has(*))",
+            "not (display: grid)",
+            "(display: grid) or (display: flex)",
+        ] {
+            let css =
+                format!("@supports {condition} {{ .a {{ color: red }} }} p {{ color: blue }}");
+            let sheet = parse_stylesheet(&css);
+            assert_eq!(sheet.rules.len(), 1, "condition {condition}");
+            assert_eq!(sheet.rules[0].declarations[0].value, "blue");
+        }
+    }
+
+    #[test]
+    fn import_is_rejected_explicitly() {
+        let sheet = parse_stylesheet("@import url(theme.css); @import 'x.css'; p { color: blue }");
+        assert_eq!(sheet.rules.len(), 1);
+        assert_eq!(sheet.rules[0].declarations[0].value, "blue");
+    }
+
+    #[test]
+    fn layer_blocks_are_dropped_with_recovery() {
+        let sheet = parse_stylesheet(
+            "@layer base { a { color: red } } @layer utilities { p { color: blue } } \
+             q { color: green }",
+        );
+        let values: Vec<&str> = sheet
+            .rules
+            .iter()
+            .map(|r| r.declarations[0].value.as_str())
+            .collect();
+        assert_eq!(values, ["green"]);
+    }
+
+    #[test]
+    fn media_blocks_match_flat_rule_count_and_recover() {
+        let nested = "@media screen { .a { color: red } } \
+                      @media (max-width: 2000px) { .b { color: green } } \
+                      @media print { .c { color: blue } } p { color: black }";
+        let flat = ".a { color: red } .b { color: green } p { color: black }";
+        let nested = parse_stylesheet(nested);
+        let flat = parse_stylesheet(flat);
+        assert_eq!(nested.rules.len(), flat.rules.len());
+        fn values(sheet: &Stylesheet) -> Vec<&str> {
+            sheet
+                .rules
+                .iter()
+                .map(|rule| rule.declarations[0].value.as_str())
+                .collect()
+        }
+        assert_eq!(values(&nested), values(&flat));
+
+        let sheet = parse_stylesheet(
+            "@media screen { :bogus { color: red } .ok { color: green } } p { color: blue }",
+        );
+        let values: Vec<&str> = sheet
+            .rules
+            .iter()
+            .map(|rule| rule.declarations[0].value.as_str())
+            .collect();
+        assert_eq!(values, ["green", "blue"]);
     }
 
     #[test]
