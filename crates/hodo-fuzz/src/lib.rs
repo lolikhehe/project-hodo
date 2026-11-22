@@ -6,6 +6,8 @@
 
 use std::sync::OnceLock;
 
+pub mod adversarial;
+
 /// Non-zero default seed: an all-zero xorshift64 state is a fixed point.
 pub const DEFAULT_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 
@@ -57,7 +59,7 @@ pub fn gen_string(seed: u64, max_len: usize) -> String {
     out
 }
 
-fn leak(value: String) -> &'static str {
+pub(crate) fn leak(value: String) -> &'static str {
     Box::leak(value.into_boxed_str())
 }
 

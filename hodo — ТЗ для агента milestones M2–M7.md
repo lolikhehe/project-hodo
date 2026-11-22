@@ -390,7 +390,15 @@ GPU зазвичай збільшує RSS (драйвери, шейдер-кеш
 - **Компоненти на наявному raster-харнесі, без нових залежностей:** toolbar = top app bar; рядок вкладок (active = surface-container-high, shape 8dp); URL-бар = M3 text field (focus ring 2px primary); popup розширення = surface-container + shape 12dp + scrim; error/about:hodo на токенах; фокус-кільця для клавіатурної навігації.
 - **Dark theme:** перемикач (about:hodo) + збереження вибору; перемикання = repaint без relayout.
 - **Гейти:** нуль raw-hex поза design.rs (греп-гейт у CI); піксель-тести на обидві теми; RAM-нейтрально; perf-дельта < 1%.
-- **Не-цілі:** dynamic color (екстракція зі шпалер), складні анімації, стилізація веб-контенту.
+- **Не-цілі (M9.1):** dynamic color (екстракція зі шпалер), складні анімації, стилізація веб-контенту.
+
+**M9.2 — Adaptive & Material 3 Expressive (ухвалено власником):**
+- **Window size classes (M3 adaptive, 5 класів за шириною):** compact `<600dp` / medium `600–839dp` / expanded `840–1199dp` / large `1200–1599dp` / xl `≥1600dp` — shell адаптується (large/xl = expanded-обробка): ширина URL-бару, вкладки labels → icons-only у compact, розмір popup-поверхні, колапсибельний нижній стрип у expanded+; гістерезис ±8dp на межах проти трешу; перемикання класу = swap layout-токенів + recompose, без рестарту.
+- **Expressive shapes:** shape-morphing кутів за state/size-class (напр. 4→12dp кнопки при hover, popup 12→28dp у expanded), розширений corner-репертуар лише в межах наявного `radius` (без SVG-шляхів cookie/scallop — задокументовано як адаптацію 2D-raster).
+- **Expressive typography:**-bold акценти (DejaVu Bold) для active-станів; type scale ролі не змінюються.
+- **Motion (мінімальний, на наявному кадротику):** eased fade для hover/press state layers, scrim+scale при відкритті popup; без spring-фізики.
+- **Adaptive color:** dynamic color зі шпалер ОС — НЕ GO wave 1 (безпечного джерела акценту немає, unsafe/OS-крейти поза варіантом A); baseline-схема + dark toggle; роупен при появі safe-обгортки.
+- **Гейти M9.2:** піксель-тести всіх трьох size-класів; shape-morph тести; perf-дельта < 1%;适应性 задокументована в docs.
 
 **DoD M9:** токен-таблиця в docs; light+dark піксель-тести зелені; hover/focus/pressed тести станів; греп-гейт жодного hex поза design.rs.
 

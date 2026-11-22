@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>hodo grid demo</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <h1>Grid demo (M7.5)</h1>
+
+  <h2>grid-template-columns: 100px 1fr 2fr</h2>
+  <div class="grid-fr">
+    <div class="cell" style="background:#8fb3e0;">100px</div>
+    <div class="cell" style="background:#e0a98f;">1fr</div>
+    <div class="cell" style="background:#a9e08f;">2fr</div>
+  </div>
+
+  <h2>gap: 12px</h2>
+  <div class="grid-gap">
+    <div class="cell">A</div><div class="cell">B</div><div class="cell">C</div>
+    <div class="cell">D</div><div class="cell">E</div><div class="cell">F</div>
+  </div>
+
+  <h2>grid-column / grid-row line placement</h2>
+  <div class="grid-place">
+    <div class="cell placed" style="background:#f0cccc;">2/4 by 2/4</div>
+    <div class="cell span2" style="background:#cce8cc;">span 2</div>
+    <div class="cell">C</div>
+    <div class="cell">D</div>
+  </div>
+
+  <h2>auto-flow: row filling</h2>
+  <div class="grid-auto">
+    <div class="cell">A</div><div class="cell">B</div><div class="cell">C</div>
+    <div class="cell">D</div><div class="cell">E</div>
+  </div>
+
+  <h2>minmax(100px, auto)</h2>
+  <div class="grid-minmax">
+    <div class="cell" style="background:#ccd8f0;">short</div>
+    <div class="cell" style="background:#f0e0cc;">a much longer cell that can grow</div>
+  </div>
+
+  <h2>repeat(3, 60px)</h2>
+  <div class="grid-repeat">
+    <div class="cell">A</div><div class="cell">B</div><div class="cell">C</div>
+    <div class="cell">D</div><div class="cell">E</div><div class="cell">F</div>
+  </div>
+</body>
+</html>

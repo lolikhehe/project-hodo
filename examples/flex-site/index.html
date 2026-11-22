@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>hodo flex demo</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <h1>Flexbox demo (M7.4)</h1>
+
+  <h2>Row with justify-content: start</h2>
+  <div class="row justify-start">
+    <div class="box" style="width:60px;height:40px;background:#8fb3e0;">A</div>
+    <div class="box" style="width:60px;height:40px;background:#e0a98f;">B</div>
+    <div class="box" style="width:60px;height:40px;background:#a9e08f;">C</div>
+  </div>
+
+  <h2>Row with justify-content: center</h2>
+  <div class="row justify-center">
+    <div class="box" style="width:60px;height:40px;background:#8fb3e0;">A</div>
+    <div class="box" style="width:60px;height:40px;background:#e0a98f;">B</div>
+    <div class="box" style="width:60px;height:40px;background:#a9e08f;">C</div>
+  </div>
+
+  <h2>Row with justify-content: space-between</h2>
+  <div class="row justify-between">
+    <div class="box" style="width:60px;height:40px;background:#8fb3e0;">A</div>
+    <div class="box" style="width:60px;height:40px;background:#e0a98f;">B</div>
+    <div class="box" style="width:60px;height:40px;background:#a9e08f;">C</div>
+  </div>
+
+  <h2>Column (flex-direction: column)</h2>
+  <div class="column">
+    <div class="box" style="width:80px;height:30px;background:#8fb3e0;">A</div>
+    <div class="box" style="width:80px;height:30px;background:#e0a98f;">B</div>
+    <div class="box" style="width:80px;height:30px;background:#a9e08f;">C</div>
+  </div>
+
+  <h2>Wrap with two lines and gap: 10px</h2>
+  <div class="wrap">
+    <div class="box" style="width:70px;height:40px;background:#8fb3e0;">A</div>
+    <div class="box" style="width:70px;height:40px;background:#e0a98f;">B</div>
+    <div class="box" style="width:70px;height:40px;background:#a9e08f;">C</div>
+    <div class="box" style="width:70px;height:40px;background:#e0d08f;">D</div>
+    <div class="box" style="width:70px;height:40px;background:#b38fe0;">E</div>
+    <div class="box" style="width:70px;height:40px;background:#8fe0c0;">F</div>
+  </div>
+
+  <h2>flex: 1 equal children</h2>
+  <div class="equal">
+    <div class="grow">A</div>
+    <div class="grow">B</div>
+    <div class="grow">C</div>
+  </div>
+
+  <h2>flex-basis in px</h2>
+  <div class="basis">
+    <div class="basis-box" style="background:#8fb3e0;">A</div>
+    <div class="basis-box" style="background:#e0a98f;">B</div>
+    <div class="basis-box" style="background:#a9e08f;">C</div>
+  </div>
+
+  <h2>align-items: center</h2>
+  <div class="align-center">
+    <div class="box" style="width:60px;height:30px;background:#8fb3e0;">A</div>
+    <div class="box" style="width:60px;height:50px;background:#e0a98f;">B</div>
+    <div class="box" style="width:60px;height:40px;background:#a9e08f;">C</div>
+  </div>
+
+  <h2>align-items: stretch</h2>
+  <div class="align-stretch">
+    <div class="box" style="width:60px;background:#8fb3e0;">A</div>
+    <div class="box" style="width:60px;background:#e0a98f;">B</div>
+    <div class="box" style="width:60px;background:#a9e08f;">C</div>
+  </div>
+
+  <h2>order reordering</h2>
+  <div class="ordered">
+    <div class="box order-a" style="width:60px;height:40px;background:#8fb3e0;">A</div>
+    <div class="box order-b" style="width:60px;height:40px;background:#e0a98f;">B</div>
+    <div class="box order-c" style="width:60px;height:40px;background:#a9e08f;">C</div>
+  </div>
+
+  <h2>row-reverse</h2>
+  <div class="reverse">
+    <div class="box" style="width:60px;height:40px;background:#8fb3e0;">A</div>
+    <div class="box" style="width:60px;height:40px;background:#e0a98f;">B</div>
+    <div class="box" style="width:60px;height:40px;background:#a9e08f;">C</div>
+  </div>
+</body>
+</html>

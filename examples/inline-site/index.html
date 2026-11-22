@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>hodo inline demo</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <h1>Inline text demo (M7.2-props)</h1>
+
+  <h2>line-height: number and px on spans</h2>
+  <p><span class="lhnum">Tall span, line-height 1.5</span> normal short text.</p>
+  <p><span class="lhpx">Tall span, line-height 24px</span> normal short text.</p>
+
+  <h2>text-align: left / center / right</h2>
+  <p class="left">This paragraph is aligned to the left edge of its box.</p>
+  <p class="center">This paragraph is aligned to the center of its box.</p>
+  <p class="right">This paragraph is aligned to the right edge of its box.</p>
+
+  <h2>text-indent: 40px on first line</h2>
+  <p class="indent">The first line of this paragraph starts forty pixels in. Every following
+line returns to the normal left edge so the indent is easy to see.</p>
+
+  <h2>letter-spacing: 3px and word-spacing: 8px</h2>
+  <p class="spacing">Spacious letters and widely separated words in one line of text.</p>
+
+  <h2>white-space: pre (aligned ASCII art)</h2>
+  <div class="pre">+---+---+
+| A | B |
++---+---+</div>
+
+  <h2>white-space: pre-wrap</h2>
+  <div class="prewrap">first line
+second line
+   indented third line</div>
+
+  <h2>white-space: nowrap</h2>
+  <div class="nowrap">This single line is deliberately long and must not wrap: one two three
+four five six seven eight nine ten eleven twelve.</div>
+
+  <h2>vertical-align: sub / super / px</h2>
+  <p>Base <span class="sub">sub</span> <span class="super">super</span>
+<span class="up">up 8px</span> end.</p>
+
+  <h2>text-decoration: underline and line-through</h2>
+  <p><span class="under">underlined text</span> and
+<span class="strike">crossed out text</span>.</p>
+
+  <h2>b / strong / i inside spans</h2>
+  <p><span>bold <b>b</b>, strong <strong>s</strong>, italic <i>i</i></span></p>
+
+  <h2>inline-block boxes with backgrounds</h2>
+  <p><span class="ib" style="background:#8fb3e0;">Box A</span>
+<span class="ib" style="background:#e0a98f;">Box B</span>
+<span class="ib" style="background:#a9e08f;">Box C</span></p>
+</body>
+</html>

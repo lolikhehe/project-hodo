@@ -1,0 +1,25 @@
+body { margin: 20px; color: #222222; font-family: sans-serif; }
+h1 { font-size: 24px; }
+h2 { font-size: 16px; margin-top: 20px; margin-bottom: 6px; }
+
+.lhnum { line-height: 1.5; }
+.lhpx { line-height: 24px; }
+
+.left { text-align: left; }
+.center { text-align: center; }
+.right { text-align: right; }
+.indent { text-indent: 40px; }
+.spacing { letter-spacing: 3px; word-spacing: 8px; }
+
+.pre { white-space: pre; font-family: monospace; }
+.prewrap { white-space: pre-wrap; font-family: monospace; }
+.nowrap { white-space: nowrap; }
+
+.sub { vertical-align: sub; }
+.super { vertical-align: super; }
+.up { vertical-align: 8px; }
+
+.under { text-decoration: underline; }
+.strike { text-decoration: line-through; }
+
+.ib { display: inline-block; width: 80px; height: 30px; border: 1px solid #333333; }

@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>hodo forms demo</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <h1>Forms demo (M7.3)</h1>
+
+  <form action="#" method="post">
+    <fieldset>
+      <legend>Account</legend>
+
+      <label for="user">User name</label>
+      <input id="user" type="text" value="alice" placeholder="enter name">
+
+      <label for="pass">Password</label>
+      <input id="pass" type="password" value="secret" placeholder="enter password">
+
+      <label for="note">Notes</label>
+      <textarea id="note" rows="4">hello world</textarea>
+
+      <label for="pick">Pick one</label>
+      <select id="pick">
+        <option>Red</option>
+        <option>Green</option>
+        <option>Blue</option>
+      </select>
+    </fieldset>
+
+    <fieldset>
+      <legend>Options</legend>
+
+      <label><input type="checkbox" checked> Remember me</label>
+      <label><input type="radio" name="size" value="s" checked> Small</label>
+      <label><input type="radio" name="size" value="l"> Large</label>
+
+      <label for="off">Disabled field</label>
+      <input id="off" type="text" value="disabled" disabled>
+    </fieldset>
+
+    <input type="submit" value="Send">
+    <input type="reset" value="Clear">
+    <button type="button">Plain button</button>
+  </form>
+</body>
+</html>

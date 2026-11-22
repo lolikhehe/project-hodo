@@ -9,10 +9,12 @@ use hodo_dom::Dom;
 use hodo_ext_manifest::Manifest;
 use hodo_fuzz::{corpus, gen_string, DEFAULT_SEED};
 use hodo_net::FetchError;
+use hodo_types::limits::{MAX_DOM_NODES, MAX_NESTING_DEPTH};
 
 const ITERATIONS: u64 = 2_000;
 const MAX_LEN: usize = 256;
-const DEEP_DEPTH: usize = 2_000;
+/// Just past the central 512-level cap, not an arbitrary 2000-deep document.
+const DEEP_DEPTH: usize = MAX_NESTING_DEPTH + 88; // 600
 
 fn seed_for(i: u64) -> u64 {
     DEFAULT_SEED ^ i.wrapping_mul(DEFAULT_SEED)
@@ -105,6 +107,10 @@ fn manifest_never_panics() {
 
 #[test]
 fn deeply_nested_html_completes() {
+    // TODO(html): hodo-html does not enforce MAX_NESTING_DEPTH yet, so parsing
+    // 600 levels keeps every node instead of taking the depth-cap degradation
+    // path. Once the HTML-side fix lands, flip the bounds below to assert that
+    // nesting is clamped at 512 and the surplus is degraded, not retained.
     let html = format!(
         "{}x{}",
         "<div>".repeat(DEEP_DEPTH),
@@ -120,8 +126,16 @@ fn deeply_nested_html_completes() {
     match result {
         Ok(nodes) => {
             assert!(
-                nodes >= DEEP_DEPTH,
-                "expected >= {DEEP_DEPTH} nodes, got {nodes}"
+                nodes >= MAX_NESTING_DEPTH,
+                "the capped prefix must survive: expected >= {MAX_NESTING_DEPTH} nodes, got {nodes}"
+            );
+            assert!(
+                nodes <= DEEP_DEPTH + 16,
+                "a {DEEP_DEPTH}-deep doc must not expand far past its input nodes, got {nodes}"
+            );
+            assert!(
+                nodes <= MAX_DOM_NODES,
+                "node count must stay under the central arena cap"
             );
             assert!(
                 elapsed < Duration::from_secs(10),

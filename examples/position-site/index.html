@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>hodo position demo</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <h1>Position / float demo (M8)</h1>
+
+  <h2>Fixed banner</h2>
+  <div class="banner">Fixed banner at top-left</div>
+
+  <h2>Relative offset box</h2>
+  <div class="rel-box">Shifted 30px right and 20px down</div>
+
+  <h2>Absolute positioned at parent corners</h2>
+  <div class="frame">
+    <div class="corner tl">TL</div>
+    <div class="corner tr">TR</div>
+    <div class="corner bl">BL</div>
+    <div class="corner br">BR</div>
+  </div>
+
+  <h2>overflow: hidden with long content</h2>
+  <div class="clip">This content is much too long for the box and must be clipped at the
+edges instead of spilling out into the rest of the page layout.</div>
+
+  <h2>min-width and max-width clamps</h2>
+  <div class="minw">min-width 200px</div>
+  <div class="maxw">max-width 300px with enough text to reach the clamp and stop growing.</div>
+
+  <h2>Floats with text wrapping beside them</h2>
+  <div class="floatleft">LEFT</div>
+  <div class="floatright">RIGHT</div>
+  <p class="wraptext">Text flows around both floated boxes: it sits to the right of the left box
+and to the left of the right box, then continues across the full width once both floats end.
+More words fill the lines so the wrapping is clearly visible in a pixel test.</p>
+  <div class="cleared">clear: both</div>
+</body>
+</html>

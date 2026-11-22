@@ -1,43 +1,60 @@
 //! Pipeline benchmark for the hodo browser engine.
 //!
 //! Runs load -> parse -> style -> layout -> render three times and reports the
-//! best (minimum) time for each stage. A stage that is still `todo!()` is caught
-//! and reported as pending instead of aborting the whole run.
+//! single run with the lowest total time (per-stage minima from different runs
+//! would describe a run that never happened). Every run's stage detail is still
+//! printed. A stage that is still `todo!()` is caught and reported as pending
+//! instead of aborting the whole run.
+
+mod bigdoc;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const RUNS: usize = 3;
+pub(crate) const RUNS: usize = 3;
 const PENDING: &str = "stage not yet implemented (pending wave-2 agent)";
 
 #[derive(Debug, Default, Clone, Copy)]
-struct Times {
+pub(crate) struct Times {
     load_html: Option<Duration>,
     load_css: Option<Duration>,
-    parse_html: Option<Duration>,
-    parse_css: Option<Duration>,
-    styles: Option<Duration>,
-    layout: Option<Duration>,
-    render: Option<Duration>,
+    pub(crate) parse_html: Option<Duration>,
+    pub(crate) parse_css: Option<Duration>,
+    pub(crate) styles: Option<Duration>,
+    pub(crate) layout: Option<Duration>,
+    pub(crate) render: Option<Duration>,
 }
 
 impl Times {
-    fn merge_best(&mut self, other: &Times) {
-        fn min(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
-            match (a, b) {
-                (Some(x), Some(y)) => Some(x.min(y)),
-                (Some(x), None) | (None, Some(x)) => Some(x),
-                (None, None) => None,
-            }
-        }
-        self.load_html = min(self.load_html, other.load_html);
-        self.load_css = min(self.load_css, other.load_css);
-        self.parse_html = min(self.parse_html, other.parse_html);
-        self.parse_css = min(self.parse_css, other.parse_css);
-        self.styles = min(self.styles, other.styles);
-        self.layout = min(self.layout, other.layout);
-        self.render = min(self.render, other.render);
+    /// Sum of the measured stages — the quantity used to pick the best run.
+    pub(crate) fn total(&self) -> Duration {
+        [
+            self.load_html,
+            self.load_css,
+            self.parse_html,
+            self.parse_css,
+            self.styles,
+            self.layout,
+            self.render,
+        ]
+        .into_iter()
+        .flatten()
+        .sum()
+    }
+}
+
+/// Keep one whole run — the one with the lowest total — rather than mixing
+/// per-stage minima from different runs into a timings row that never occurred.
+pub(crate) fn better_run(
+    current: Option<(usize, Times)>,
+    run: usize,
+    candidate: Times,
+) -> Option<(usize, Times)> {
+    match current {
+        None => Some((run, candidate)),
+        Some((_, best)) if candidate.total() < best.total() => Some((run, candidate)),
+        Some(existing) => Some(existing),
     }
 }
 
@@ -60,7 +77,7 @@ fn read_direct(path: &Path) -> String {
 }
 
 /// Time one stage, turning a panic into a reported "pending" result.
-fn time_stage<T>(name: &str, f: impl FnOnce() -> T) -> (Option<Duration>, Option<T>) {
+pub(crate) fn time_stage<T>(name: &str, f: impl FnOnce() -> T) -> (Option<Duration>, Option<T>) {
     let started = Instant::now();
     let outcome = catch_unwind(AssertUnwindSafe(f));
     let elapsed = started.elapsed();
@@ -95,8 +112,9 @@ fn load_text(path: &Path, name: &str) -> (Option<Duration>, String) {
     (dur, text)
 }
 
-fn print_best(best: &Times) {
-    println!("\n=== best of {RUNS} runs ===");
+fn print_best(run: usize, best: &Times) {
+    println!("\n=== best single run {run}/{RUNS} (lowest total) ===");
+    println!("  total: {:.3} ms", best.total().as_secs_f64() * 1000.0);
     macro_rules! show {
         ($label:expr, $value:expr) => {
             match $value {
@@ -107,6 +125,19 @@ fn print_best(best: &Times) {
     }
     show!("load html", best.load_html);
     show!("load css", best.load_css);
+    print_best_stages(best);
+}
+
+/// Shared stage summary used by both the demo pipeline and the big-doc corpus.
+pub(crate) fn print_best_stages(best: &Times) {
+    macro_rules! show {
+        ($label:expr, $value:expr) => {
+            match $value {
+                Some(d) => println!("  {}: {:.3} ms", $label, d.as_secs_f64() * 1000.0),
+                None => println!("  {}: {PENDING}", $label),
+            }
+        };
+    }
     show!("parse html", best.parse_html);
     show!("parse css", best.parse_css);
     show!("compute styles", best.styles);
@@ -115,6 +146,20 @@ fn print_best(best: &Times) {
 }
 
 fn main() {
+    if std::env::args().skip(1).any(|arg| arg == "--big-doc") {
+        // The DEEP corpus recurses ~200 levels deep through parse/style/layout.
+        // A debug build's frames overflow the 1 MiB Windows main-thread stack,
+        // so run the whole corpus on a thread with a 16 MiB stack instead.
+        std::thread::Builder::new()
+            .name("big-doc".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(bigdoc::run)
+            .expect("spawn big-doc thread")
+            .join()
+            .expect("big-doc thread panicked");
+        return;
+    }
+
     let dir = demo_dir();
     let html_path = dir.join("index.html");
     let css_path = dir.join("style.css");
@@ -126,7 +171,7 @@ fn main() {
     println!("hodo pipeline benchmark ({RUNS} runs, viewport 1200x800)");
     println!("demo site: {}", dir.display());
 
-    let mut best = Times::default();
+    let mut best: Option<(usize, Times)> = None;
 
     for run in 1..=RUNS {
         println!("\n--- run {run}/{RUNS} ---");
@@ -178,8 +223,47 @@ fn main() {
             println!("  frame buffer: {} bytes", buffer.len());
         }
 
-        best.merge_best(&t);
+        best = better_run(best, run, t);
     }
 
-    print_best(&best);
+    let (run, best) = best.expect("at least one run");
+    print_best(run, &best);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ms(millis: u64) -> Option<Duration> {
+        Some(Duration::from_millis(millis))
+    }
+
+    /// Per-stage minima would bolt run A's fast parse onto run B's fast layout
+    /// and report a 30 ms run that never happened. The chosen run must be real.
+    #[test]
+    fn best_run_is_lowest_total_not_per_stage_minima() {
+        let a = Times {
+            parse_html: ms(10),
+            layout: ms(100),
+            ..Times::default()
+        };
+        let b = Times {
+            parse_html: ms(50),
+            layout: ms(20),
+            ..Times::default()
+        };
+        let c = Times {
+            parse_html: ms(30),
+            layout: ms(60),
+            ..Times::default()
+        };
+        let best = better_run(None, 1, a)
+            .and_then(|cur| better_run(Some(cur), 2, b))
+            .and_then(|cur| better_run(Some(cur), 3, c))
+            .expect("a best run");
+        assert_eq!(best.0, 2, "run 2 has the lowest total (70 ms)");
+        assert_eq!(best.1.parse_html, ms(50));
+        assert_eq!(best.1.layout, ms(20));
+        assert_eq!(best.1.total(), Duration::from_millis(70));
+    }
 }

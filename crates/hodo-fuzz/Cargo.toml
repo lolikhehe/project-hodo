@@ -10,6 +10,10 @@ hodo-css.workspace = true
 hodo-dom.workspace = true
 hodo-ext-manifest.workspace = true
 hodo-net.workspace = true
+hodo-ext-ipc.workspace = true
+hodo-style.workspace = true
+hodo-layout.workspace = true
+hodo-types.workspace = true
 
 [lints]
 workspace = true

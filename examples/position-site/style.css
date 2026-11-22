@@ -1,0 +1,23 @@
+body { margin: 20px; padding-top: 40px; color: #222222; font-family: sans-serif; }
+h1 { font-size: 24px; }
+h2 { font-size: 16px; margin-top: 24px; margin-bottom: 6px; }
+
+.banner { position: fixed; top: 0; left: 0; width: 600px; height: 24px; background: #222222; color: #ffffff; }
+.rel-box { position: relative; top: 20px; left: 30px; width: 220px; height: 40px; background: #cfe6e0; }
+
+.frame { position: relative; width: 400px; height: 180px; border: 2px solid #333333; margin-top: 30px; }
+.corner { position: absolute; width: 60px; height: 30px; background: #f0cccc; border: 1px solid #333333; }
+.tl { top: 0; left: 0; }
+.tr { top: 0; right: 0; }
+.bl { bottom: 0; left: 0; }
+.br { bottom: 0; right: 0; }
+
+.clip { width: 220px; height: 60px; overflow: hidden; border: 1px solid #333333; background: #eeeeee; }
+
+.minw { min-width: 200px; height: 30px; background: #ccd8f0; }
+.maxw { max-width: 300px; background: #f0e0cc; }
+
+.floatleft { float: left; width: 120px; height: 80px; background: #99ccff; margin: 0 10px 10px 0; }
+.floatright { float: right; width: 120px; height: 80px; background: #ffcc99; margin: 0 0 10px 10px; }
+.wraptext { margin-top: 10px; }
+.cleared { clear: both; height: 30px; background: #ddd0e8; }

@@ -1,0 +1,7 @@
+body { margin: 20px; color: #222222; font-family: sans-serif; }
+h1 { font-size: 24px; }
+form { margin-top: 12px; }
+fieldset { border: 1px solid #333333; margin-bottom: 12px; }
+legend { font-weight: bold; }
+label { display: block; margin-top: 8px; }
+input, textarea, select, button { margin-top: 4px; }

@@ -1,0 +1,11 @@
+# Pinned LARGE-stage baselines (milliseconds) for the hodo-perf M5.3 gate.
+# Re-calibrated 2026-11-22 on the quiet tree with `cargo run --release -p hodo-perf -- --big-doc`
+# (best of 3 runs, viewport 1200x800), over four calibration runs. Pins are the
+# slowest observed quiet-tree value per stage plus ~1% headroom, so the built-in
+# 1.10x gate tolerates normal run-to-run scheduling noise without going stale.
+# Set HODO_PERF_NO_GATE=1 on machines more than 10x slower than the reference
+# (e.g. constrained CI runners) to print the numbers without failing the gate.
+restyle_styles_ms = 27.5
+restyle_layout_ms = 64.0
+append_styles_ms = 27.8
+append_layout_ms = 62.5

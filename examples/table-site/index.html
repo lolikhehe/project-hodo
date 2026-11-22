@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>hodo table demo</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <h1>Table demo (M7.3)</h1>
+
+  <table width="520" class="demo">
+    <caption>Demo table: three rows by four columns</caption>
+    <tr>
+      <th width="120">Name</th>
+      <th width="120">Code</th>
+      <th width="120">Qty</th>
+      <th width="120">Note</th>
+    </tr>
+    <tr>
+      <td rowspan="2">Alpha</td>
+      <td colspan="2">A-1 / ten</td>
+      <td>first</td>
+    </tr>
+    <tr>
+      <td>B-2</td>
+      <td>twenty</td>
+      <td>second</td>
+    </tr>
+  </table>
+
+  <h2>Nested table</h2>
+  <table width="400" class="demo">
+    <caption>Outer table with a nested table in a cell</caption>
+    <tr>
+      <td width="200">Left cell</td>
+      <td width="200">
+        <table class="inner" width="160">
+          <caption>Inner table</caption>
+          <tr><td width="80">x</td><td width="80">y</td></tr>
+          <tr><td>1</td><td>2</td></tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
