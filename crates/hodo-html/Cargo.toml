@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 hodo-dom.workspace = true
+hodo-types.workspace = true
 html5ever = "0.40.1"
 string_cache = "0.11"
 

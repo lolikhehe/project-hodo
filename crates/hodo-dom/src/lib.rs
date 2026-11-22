@@ -5,8 +5,24 @@
 //! handle's generation. Untrusted handles (from JS, IPC or extensions) must be
 //! filtered through [`Dom::validate`] first; forged indices are developer
 //! misuse, never parser-fed data.
+//!
+//! # String interning (opt-in)
+//!
+//! [`Dom::new`] keeps the original storage behaviour: every tag/attribute
+//! `String` lives in its `Node`. [`Dom::with_interning`] instead moves those
+//! strings into a per-`Dom` [`StringInterner`]; each `Node` then holds only
+//! [`Interned`] ids in a parallel side table, so a document with repeated
+//! tags/classes pays for each distinct string once instead of once per element.
+//! The public `tag`/`attr`/`set_attr`/`text` signatures are identical in both
+//! modes. In interned mode, callers must use those accessors: [`NodeKind::Element`]'s
+//! `tag` is emptied and its `attrs` Vec is cleared (the pool is the single
+//! source of truth). This is a RAM win on repetitive documents (the dedup map
+//! plus one copy per unique string replaces thousands of copies and their Vec
+//! allocations) and a small loss on all-unique documents (the map and side
+//! table are extra bookkeeping).
 
 use hodo_types::limits::MAX_DOM_NODES;
+use std::collections::HashMap;
 
 /// Opaque handle into the node arena: low 20 bits are the slot, high 12 bits
 /// the generation. A reused slot therefore hands out a *different* handle, so
@@ -46,7 +62,69 @@ impl NodeId {
     }
 }
 
-/// What a node represents.
+/// A u32 index into a [`StringInterner`] table. Equal indices mean equal
+/// strings, so consumers (e.g. selector matching) can compare ids instead of
+/// walking bytes. Ids are meaningful only with the `Dom` that produced them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Interned(u32);
+
+impl Interned {
+    /// Raw table index. Stable for the lifetime of the owning `Dom`.
+    #[inline]
+    pub const fn index(self) -> u32 {
+        self.0
+    }
+}
+
+/// A per-`Dom` string pool: `Vec<Box<str>>` holds one copy of each unique
+/// string, `HashMap` deduplicates on insertion. The map is kept for the `Dom`'s
+/// lifetime (dropping it would lose O(1) dedup and reintroduce duplicates).
+#[derive(Debug, Clone, Default)]
+pub struct StringInterner {
+    strings: Vec<Box<str>>,
+    map: HashMap<String, u32>,
+}
+
+impl StringInterner {
+    /// Return the id for `s`, inserting it once if unseen.
+    pub fn intern(&mut self, s: &str) -> Interned {
+        if let Some(&index) = self.map.get(s) {
+            return Interned(index);
+        }
+        let index = self.strings.len() as u32;
+        self.strings.push(Box::from(s));
+        self.map.insert(s.to_string(), index);
+        Interned(index)
+    }
+
+    /// Borrow the string behind `id`. The borrow is tied to `&self`.
+    #[inline]
+    pub fn get(&self, id: Interned) -> &str {
+        &self.strings[id.0 as usize]
+    }
+
+    /// Look up an existing id without inserting.
+    #[inline]
+    pub fn lookup(&self, s: &str) -> Option<Interned> {
+        self.map.get(s).copied().map(Interned)
+    }
+
+    /// Number of distinct strings in the pool.
+    #[inline]
+    pub fn unique_count(&self) -> usize {
+        self.strings.len()
+    }
+
+    /// Bytes of string data owned by the pool (table + map keys), excluding
+    /// allocator overhead and the side table that points into it.
+    pub fn heap_bytes(&self) -> usize {
+        self.strings.iter().map(|s| s.len()).sum::<usize>()
+            + self.map.keys().map(String::len).sum::<usize>()
+    }
+}
+
+/// What a node represents. Public shape is unchanged: external callers build
+/// elements with `String` fields and read `Node::kind` directly.
 #[derive(Debug, Clone)]
 pub enum NodeKind {
     Document,
@@ -65,6 +143,14 @@ pub struct Node {
     pub children: Vec<NodeId>,
 }
 
+/// Interned ids for one arena slot; parallel to `nodes`, indexed by slot.
+#[derive(Debug, Clone, Default)]
+struct StrMeta {
+    tag: Option<Interned>,
+    /// (name, value) ids, in the same order as `NodeKind::Element.attrs`.
+    attrs: Vec<(Interned, Interned)>,
+}
+
 /// The node arena, rooted at a `Document` node.
 #[derive(Debug, Clone)]
 pub struct Dom {
@@ -78,9 +164,16 @@ pub struct Dom {
     free: Vec<u32>,
     /// Lazily created trash root: owned by the arena but unreachable from the root.
     detached: Option<NodeId>,
+    /// String pool. Empty but present in the default (non-interned) mode.
+    interner: StringInterner,
+    /// When true, tag/attr strings live only in `interner`, not in `Node`.
+    interning: bool,
+    /// Interned ids parallel to `nodes` (same slot indices).
+    str_meta: Vec<StrMeta>,
 }
 
 impl Dom {
+    /// Original behaviour: every tag/attr string is stored in its `Node`.
     pub fn new() -> Self {
         Self {
             nodes: vec![Node {
@@ -93,7 +186,19 @@ impl Dom {
             root_id: NodeId(0),
             free: Vec::new(),
             detached: None,
+            interner: StringInterner::default(),
+            interning: false,
+            str_meta: vec![StrMeta::default()],
         }
+    }
+
+    /// Opt in to string interning. `tag`/`attr`/`set_attr` keep their signatures
+    /// and return `&str` borrowed from the pool, but element nodes lose their
+    /// `tag` bytes and `attrs` allocation: use the accessors, not the raw fields.
+    pub fn with_interning() -> Self {
+        let mut dom = Self::new();
+        dom.interning = true;
+        dom
     }
 
     pub fn root(&self) -> NodeId {
@@ -102,6 +207,39 @@ impl Dom {
 
     /// Create a node, reusing a detached slot when one is available.
     pub fn create(&mut self, kind: NodeKind) -> NodeId {
+        // Check the cap before interning so a rejected node cannot pollute the pool.
+        if self.free.is_empty() && self.nodes.len() >= MAX_DOM_NODES {
+            return self.root_id;
+        }
+
+        let (kind, meta) = if self.interning {
+            match kind {
+                NodeKind::Element { tag, attrs } => {
+                    let tag_id = self.interner.intern(&tag);
+                    let ids = attrs
+                        .iter()
+                        .map(|(k, v)| (self.interner.intern(k), self.interner.intern(v)))
+                        .collect();
+                    // Drop the per-node strings and the attrs Vec allocation:
+                    // the pool is now the single source of truth.
+                    let stripped = NodeKind::Element {
+                        tag: String::new(),
+                        attrs: Vec::new(),
+                    };
+                    (
+                        stripped,
+                        StrMeta {
+                            tag: Some(tag_id),
+                            attrs: ids,
+                        },
+                    )
+                }
+                other => (other, StrMeta::default()),
+            }
+        } else {
+            (kind, StrMeta::default())
+        };
+
         let node = Node {
             kind,
             parent: None,
@@ -116,17 +254,14 @@ impl Dom {
             self.nodes[slot as usize] = node;
             self.generations[slot as usize] = generation;
             self.trashed[slot as usize] = false;
+            self.str_meta[slot as usize] = meta;
             (slot, generation)
         } else {
-            if self.nodes.len() >= MAX_DOM_NODES {
-                // Cap reached: degrade to the root handle instead of wrapping
-                // the 20-bit slot encoding (no panic on oversized input).
-                return self.root_id;
-            }
             let slot = self.nodes.len() as u32;
             self.nodes.push(node);
             self.generations.push(0);
             self.trashed.push(false);
+            self.str_meta.push(meta);
             (slot, 0)
         };
         let id = NodeId::encode(slot, generation);
@@ -227,20 +362,52 @@ impl Dom {
     }
 
     pub fn tag(&self, id: NodeId) -> Option<&str> {
-        match &self.nodes[id.slot() as usize].kind {
+        let slot = id.slot() as usize;
+        if self.interning {
+            return self.str_meta.get(slot)?.tag.map(|i| self.interner.get(i));
+        }
+        match &self.nodes[slot].kind {
             NodeKind::Element { tag, .. } => Some(tag),
             _ => None,
         }
     }
 
     pub fn attr(&self, id: NodeId, name: &str) -> Option<&str> {
-        match &self.nodes[id.slot() as usize].kind {
+        let slot = id.slot() as usize;
+        if self.interning {
+            let wanted = self.interner.lookup(name)?;
+            return self
+                .str_meta
+                .get(slot)?
+                .attrs
+                .iter()
+                .find(|(k, _)| *k == wanted)
+                .map(|(_, v)| self.interner.get(*v));
+        }
+        match &self.nodes[slot].kind {
             NodeKind::Element { attrs, .. } => attrs
                 .iter()
                 .find(|(k, _)| k == name)
                 .map(|(_, v)| v.as_str()),
             _ => None,
         }
+    }
+
+    /// Interned id of `name`'s value on `id`, for u32-based comparison in
+    /// selector matching (e.g. `a.attr_interned(n, "class") == b.attr_interned(n, "class")`).
+    /// `None` if interning is off, the name was never interned, or the attribute
+    /// is absent. Ids are only comparable within the same `Dom`.
+    pub fn attr_interned(&self, id: NodeId, name: &str) -> Option<u32> {
+        if !self.interning {
+            return None;
+        }
+        let wanted = self.interner.lookup(name)?;
+        self.str_meta
+            .get(id.slot() as usize)?
+            .attrs
+            .iter()
+            .find(|(k, _)| *k == wanted)
+            .map(|(_, v)| v.index())
     }
 
     /// Set an attribute on a live element, adding it when absent. No-op for
@@ -250,7 +417,20 @@ impl Dom {
         if !self.validate(id) {
             return;
         }
-        if let NodeKind::Element { attrs, .. } = &mut self.nodes[id.slot() as usize].kind {
+        let slot = id.slot() as usize;
+        if self.interning {
+            // Node.kind's strings are emptied in this mode, so match by id.
+            let key = self.interner.intern(name);
+            let val = self.interner.intern(&value);
+            let meta = &mut self.str_meta[slot];
+            if let Some((_, v)) = meta.attrs.iter_mut().find(|(k, _)| *k == key) {
+                *v = val;
+                return;
+            }
+            meta.attrs.push((key, val));
+            return;
+        }
+        if let NodeKind::Element { attrs, .. } = &mut self.nodes[slot].kind {
             if let Some((_, v)) = attrs.iter_mut().find(|(k, _)| k == name) {
                 *v = value;
             } else {
@@ -272,6 +452,18 @@ impl Dom {
 
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
+    }
+
+    /// Number of distinct strings in this `Dom`'s pool (0 in default mode).
+    #[inline]
+    pub fn interner_len(&self) -> usize {
+        self.interner.unique_count()
+    }
+
+    /// Bytes of string data held by the pool (table + dedup map keys).
+    #[inline]
+    pub fn interner_heap_bytes(&self) -> usize {
+        self.interner.heap_bytes()
     }
 
     /// Visit every node reachable from the root in pre-order. Trash is unreachable.
@@ -303,6 +495,7 @@ impl Dom {
         self.generations.push(0);
         // The trash root is an internal node, never a valid external handle.
         self.trashed.push(true);
+        self.str_meta.push(StrMeta::default());
         let id = NodeId::encode(slot, 0);
         self.detached = Some(id);
         id
@@ -316,6 +509,10 @@ impl Dom {
         debug_assert!(
             slot < self.generations.len(),
             "generation table out of sync"
+        );
+        debug_assert!(
+            slot < self.str_meta.len(),
+            "interner side table out of sync"
         );
         debug_assert!(!self.trashed[slot], "trash node reached from the live tree");
         debug_assert_eq!(
@@ -338,12 +535,20 @@ mod tests {
     use hodo_types::limits::MAX_NESTING_DEPTH;
     use std::collections::HashSet;
     use std::mem::size_of;
+    use std::time::Instant;
 
     fn elem(dom: &mut Dom, tag: &str) -> NodeId {
         dom.create(NodeKind::Element {
             tag: tag.into(),
             attrs: Vec::new(),
         })
+    }
+
+    /// Every structural test runs against both storage modes. Assertions are
+    /// written against the frozen accessors so they are mode-independent.
+    fn run_both(f: impl Fn(Dom)) {
+        f(Dom::new());
+        f(Dom::with_interning());
     }
 
     fn next_rand(state: &mut u64) -> u64 {
@@ -355,203 +560,211 @@ mod tests {
 
     #[test]
     fn tree_build_and_preorder_walk() {
-        let mut dom = Dom::new();
-        let html = elem(&mut dom, "html");
-        let head = elem(&mut dom, "head");
-        let title = elem(&mut dom, "title");
-        let body = elem(&mut dom, "body");
-        let p = elem(&mut dom, "p");
-        let text = dom.create(NodeKind::Text("hello".into()));
+        run_both(|mut dom| {
+            let html = elem(&mut dom, "html");
+            let head = elem(&mut dom, "head");
+            let title = elem(&mut dom, "title");
+            let body = elem(&mut dom, "body");
+            let p = elem(&mut dom, "p");
+            let text = dom.create(NodeKind::Text("hello".into()));
 
-        dom.append(dom.root(), html);
-        dom.append(html, head);
-        dom.append(head, title);
-        dom.append(html, body);
-        dom.append(body, p);
-        dom.append(body, text);
+            dom.append(dom.root(), html);
+            dom.append(html, head);
+            dom.append(head, title);
+            dom.append(html, body);
+            dom.append(body, p);
+            dom.append(body, text);
 
-        let mut seen = Vec::new();
-        dom.walk(|_, node| {
-            let label = match &node.kind {
-                NodeKind::Document => "document".to_string(),
-                NodeKind::Element { tag, .. } => tag.clone(),
-                NodeKind::Text(t) => t.clone(),
-            };
-            seen.push(label);
+            let mut seen = Vec::new();
+            dom.walk(|id, node| {
+                let label = match &node.kind {
+                    NodeKind::Document => "document".to_string(),
+                    NodeKind::Element { .. } => dom.tag(id).unwrap_or("").to_string(),
+                    NodeKind::Text(_) => dom.text(id).unwrap_or("").to_string(),
+                };
+                seen.push(label);
+            });
+            assert_eq!(
+                seen,
+                ["document", "html", "head", "title", "body", "p", "hello"]
+            );
         });
-        assert_eq!(
-            seen,
-            ["document", "html", "head", "title", "body", "p", "hello"]
-        );
     }
 
     #[test]
     fn append_reparent_detaches_old_parent() {
-        let mut dom = Dom::new();
-        let a = elem(&mut dom, "a");
-        let b = elem(&mut dom, "b");
-        let child = elem(&mut dom, "child");
-        dom.append(dom.root(), a);
-        dom.append(dom.root(), b);
-        dom.append(a, child);
+        run_both(|mut dom| {
+            let a = elem(&mut dom, "a");
+            let b = elem(&mut dom, "b");
+            let child = elem(&mut dom, "child");
+            dom.append(dom.root(), a);
+            dom.append(dom.root(), b);
+            dom.append(a, child);
 
-        assert_eq!(dom.children(a), &[child]);
-        assert_eq!(dom.parent(child), Some(a));
+            assert_eq!(dom.children(a), &[child]);
+            assert_eq!(dom.parent(child), Some(a));
 
-        dom.append(b, child);
-        assert!(dom.children(a).is_empty(), "old parent must lose the child");
-        assert_eq!(dom.children(b), &[child]);
-        assert_eq!(dom.parent(child), Some(b));
+            dom.append(b, child);
+            assert!(dom.children(a).is_empty(), "old parent must lose the child");
+            assert_eq!(dom.children(b), &[child]);
+            assert_eq!(dom.parent(child), Some(b));
 
-        // Re-appending to the same parent must not duplicate the child.
-        dom.append(b, child);
-        assert_eq!(dom.children(b), &[child]);
+            // Re-appending to the same parent must not duplicate the child.
+            dom.append(b, child);
+            assert_eq!(dom.children(b), &[child]);
+        });
     }
 
     #[test]
     fn accessors_tag_attr_text() {
-        let mut dom = Dom::new();
-        let el = dom.create(NodeKind::Element {
-            tag: "a".into(),
-            attrs: vec![("href".into(), "/x".into()), ("id".into(), "link".into())],
-        });
-        let txt = dom.create(NodeKind::Text("hi".into()));
+        run_both(|mut dom| {
+            let el = dom.create(NodeKind::Element {
+                tag: "a".into(),
+                attrs: vec![("href".into(), "/x".into()), ("id".into(), "link".into())],
+            });
+            let txt = dom.create(NodeKind::Text("hi".into()));
 
-        assert_eq!(dom.tag(el), Some("a"));
-        assert_eq!(dom.attr(el, "href"), Some("/x"));
-        assert_eq!(dom.attr(el, "id"), Some("link"));
-        assert_eq!(dom.attr(el, "missing"), None);
-        assert_eq!(dom.text(el), None);
-        assert_eq!(dom.tag(txt), None);
-        assert_eq!(dom.attr(txt, "href"), None);
-        assert_eq!(dom.text(txt), Some("hi"));
-        assert_eq!(dom.tag(dom.root()), None);
-        assert_eq!(dom.text(dom.root()), None);
-        assert_eq!(dom.attr(dom.root(), "x"), None);
+            assert_eq!(dom.tag(el), Some("a"));
+            assert_eq!(dom.attr(el, "href"), Some("/x"));
+            assert_eq!(dom.attr(el, "id"), Some("link"));
+            assert_eq!(dom.attr(el, "missing"), None);
+            assert_eq!(dom.text(el), None);
+            assert_eq!(dom.tag(txt), None);
+            assert_eq!(dom.attr(txt, "href"), None);
+            assert_eq!(dom.text(txt), Some("hi"));
+            assert_eq!(dom.tag(dom.root()), None);
+            assert_eq!(dom.text(dom.root()), None);
+            assert_eq!(dom.attr(dom.root(), "x"), None);
+        });
     }
 
     #[test]
     fn len_counts_nodes_and_is_empty_tracks_len() {
-        let mut dom = Dom::new();
-        assert_eq!(dom.len(), 1);
-        assert!(!dom.is_empty());
+        run_both(|mut dom| {
+            assert_eq!(dom.len(), 1);
+            assert!(!dom.is_empty());
 
-        let a = elem(&mut dom, "a");
-        dom.append(dom.root(), a);
-        assert_eq!(dom.len(), 2);
-        assert!(!dom.is_empty());
+            let a = elem(&mut dom, "a");
+            dom.append(dom.root(), a);
+            assert_eq!(dom.len(), 2);
+            assert!(!dom.is_empty());
 
-        let b = elem(&mut dom, "b");
-        dom.append(b, a); // reparenting must not create or destroy nodes
-        assert_eq!(dom.len(), 3);
-        assert!(!dom.is_empty());
+            let b = elem(&mut dom, "b");
+            dom.append(b, a); // reparenting must not create or destroy nodes
+            assert_eq!(dom.len(), 3);
+            assert!(!dom.is_empty());
+        });
     }
 
     #[test]
     fn walk_visits_every_node_exactly_once() {
-        let mut dom = Dom::new();
-        for _ in 0..50 {
-            let id = elem(&mut dom, "n");
-            dom.append(NodeId(id.0 / 2), id);
-        }
+        run_both(|mut dom| {
+            for _ in 0..50 {
+                let id = elem(&mut dom, "n");
+                dom.append(NodeId(id.0 / 2), id);
+            }
 
-        let mut seen = HashSet::new();
-        let mut count = 0;
-        dom.walk(|id, _| {
-            assert!(seen.insert(id.0), "duplicate visit of node {}", id.0);
-            count += 1;
+            let mut seen = HashSet::new();
+            let mut count = 0;
+            dom.walk(|id, _| {
+                assert!(seen.insert(id.0), "duplicate visit of node {}", id.0);
+                count += 1;
+            });
+            assert_eq!(count, dom.len());
+            assert_eq!(seen.len(), dom.len());
         });
-        assert_eq!(count, dom.len());
-        assert_eq!(seen.len(), dom.len());
     }
 
     #[test]
     fn append_refuses_cycles_self_and_root_reparent() {
-        let mut dom = Dom::new();
-        let a = elem(&mut dom, "a");
-        let b = elem(&mut dom, "b");
-        let c = elem(&mut dom, "c");
-        dom.append(dom.root(), a);
-        dom.append(a, b);
-        dom.append(b, c);
+        run_both(|mut dom| {
+            let a = elem(&mut dom, "a");
+            let b = elem(&mut dom, "b");
+            let c = elem(&mut dom, "c");
+            dom.append(dom.root(), a);
+            dom.append(a, b);
+            dom.append(b, c);
 
-        dom.append(a, a); // self
-        assert_eq!(dom.parent(a), Some(dom.root()));
+            dom.append(a, a); // self
+            assert_eq!(dom.parent(a), Some(dom.root()));
 
-        dom.append(c, a); // would place an ancestor below its descendant
-        assert_eq!(dom.parent(a), Some(dom.root()));
-        assert_eq!(dom.children(a), &[b]);
-        assert!(dom.children(c).is_empty());
+            dom.append(c, a); // would place an ancestor below its descendant
+            assert_eq!(dom.parent(a), Some(dom.root()));
+            assert_eq!(dom.children(a), &[b]);
+            assert!(dom.children(c).is_empty());
 
-        let orphan = elem(&mut dom, "orphan");
-        dom.append(orphan, dom.root());
-        assert_eq!(dom.parent(dom.root()), None);
+            let orphan = elem(&mut dom, "orphan");
+            dom.append(orphan, dom.root());
+            assert_eq!(dom.parent(dom.root()), None);
 
-        // Attach the orphan so every node is reachable, then confirm the walk
-        // terminates and covers the whole tree even after refused appends.
-        dom.append(c, orphan);
-        let mut n = 0;
-        dom.walk(|_, _| n += 1);
-        assert_eq!(n, dom.len());
+            // Attach the orphan so every node is reachable, then confirm the walk
+            // terminates and covers the whole tree even after refused appends.
+            dom.append(c, orphan);
+            let mut n = 0;
+            dom.walk(|_, _| n += 1);
+            assert_eq!(n, dom.len());
+        });
     }
 
     #[test]
     fn three_level_random_tree_parent_child_invariants() {
-        let mut dom = Dom::new();
-        let mut rng = 0x9E37_79B9_7F4A_7C15_u64;
-        let root = dom.root();
+        run_both(|mut dom| {
+            let mut rng = 0x9E37_79B9_7F4A_7C15_u64;
+            let root = dom.root();
 
-        let mut level1 = Vec::new();
-        for _ in 0..8 {
-            let n = elem(&mut dom, "l1");
-            dom.append(root, n);
-            level1.push(n);
-        }
-        let mut level2 = Vec::new();
-        for _ in 0..24 {
-            let p = level1[(next_rand(&mut rng) as usize) % level1.len()];
-            let n = elem(&mut dom, "l2");
-            dom.append(p, n);
-            level2.push(n);
-        }
-        for _ in 0..64 {
-            let p = level2[(next_rand(&mut rng) as usize) % level2.len()];
-            let n = elem(&mut dom, "l3");
-            dom.append(p, n);
-        }
-
-        assert_eq!(dom.len(), 1 + 8 + 24 + 64);
-        assert_eq!(dom.parent(root), None);
-
-        for i in 0..dom.len() {
-            let id = NodeId(i as u32);
-            let kids = dom.children(id);
-            let unique: HashSet<_> = kids.iter().collect();
-            assert_eq!(unique.len(), kids.len(), "duplicate child under node {i}");
-            for &c in kids {
-                assert_eq!(dom.parent(c), Some(id), "child must point back to parent");
+            let mut level1 = Vec::new();
+            for _ in 0..8 {
+                let n = elem(&mut dom, "l1");
+                dom.append(root, n);
+                level1.push(n);
             }
-            if id != root {
-                // Test-only invariant of this hand-built tree: every non-root
-                // node has a parent (not parser-fed data).
-                let p = dom.parent(id);
-                assert!(p.is_some(), "non-root node has a parent");
-                if let Some(p) = p {
-                    assert!(
-                        dom.children(p).contains(&id),
-                        "parent must list the node as a child"
-                    );
+            let mut level2 = Vec::new();
+            for _ in 0..24 {
+                let p = level1[(next_rand(&mut rng) as usize) % level1.len()];
+                let n = elem(&mut dom, "l2");
+                dom.append(p, n);
+                level2.push(n);
+            }
+            for _ in 0..64 {
+                let p = level2[(next_rand(&mut rng) as usize) % level2.len()];
+                let n = elem(&mut dom, "l3");
+                dom.append(p, n);
+            }
+
+            assert_eq!(dom.len(), 1 + 8 + 24 + 64);
+            assert_eq!(dom.parent(root), None);
+
+            for i in 0..dom.len() {
+                let id = NodeId(i as u32);
+                let kids = dom.children(id);
+                let unique: HashSet<_> = kids.iter().collect();
+                assert_eq!(unique.len(), kids.len(), "duplicate child under node {i}");
+                for &c in kids {
+                    assert_eq!(dom.parent(c), Some(id), "child must point back to parent");
+                }
+                if id != root {
+                    // Test-only invariant of this hand-built tree: every non-root
+                    // node has a parent (not parser-fed data).
+                    let p = dom.parent(id);
+                    assert!(p.is_some(), "non-root node has a parent");
+                    if let Some(p) = p {
+                        assert!(
+                            dom.children(p).contains(&id),
+                            "parent must list the node as a child"
+                        );
+                    }
                 }
             }
-        }
+        });
     }
 
     #[test]
     fn document_root_has_no_parent() {
-        let dom = Dom::new();
-        assert_eq!(dom.parent(dom.root()), None);
-        assert!(dom.children(dom.root()).is_empty());
-        assert_eq!(dom.tag(dom.root()), None);
+        run_both(|dom| {
+            assert_eq!(dom.parent(dom.root()), None);
+            assert!(dom.children(dom.root()).is_empty());
+            assert_eq!(dom.tag(dom.root()), None);
+        });
     }
 
     fn count_walk(dom: &Dom) -> usize {
@@ -562,9 +775,9 @@ mod tests {
 
     fn collect_tags(dom: &Dom) -> Vec<String> {
         let mut tags = Vec::new();
-        dom.walk(|_, node| {
-            if let NodeKind::Element { tag, .. } = &node.kind {
-                tags.push(tag.clone());
+        dom.walk(|id, node| {
+            if matches!(node.kind, NodeKind::Element { .. }) {
+                tags.push(dom.tag(id).unwrap_or("").to_string());
             }
         });
         tags
@@ -572,87 +785,91 @@ mod tests {
 
     #[test]
     fn detach_subtree_removes_it_from_parent_and_walk() {
-        let mut dom = Dom::new();
-        let shell = elem(&mut dom, "shell");
-        let branch = elem(&mut dom, "branch");
-        let leaf = elem(&mut dom, "leaf");
-        dom.append(dom.root(), shell);
-        dom.append(shell, branch);
-        dom.append(branch, leaf);
+        run_both(|mut dom| {
+            let shell = elem(&mut dom, "shell");
+            let branch = elem(&mut dom, "branch");
+            let leaf = elem(&mut dom, "leaf");
+            dom.append(dom.root(), shell);
+            dom.append(shell, branch);
+            dom.append(branch, leaf);
 
-        assert_eq!(count_walk(&dom), 4);
-        dom.detach_subtree(branch);
+            assert_eq!(count_walk(&dom), 4);
+            dom.detach_subtree(branch);
 
-        assert!(dom.children(shell).is_empty());
-        assert_eq!(collect_tags(&dom), ["shell"]);
-        assert_eq!(count_walk(&dom), 2); // document + shell
-        assert!(!dom.validate(branch));
-        assert!(!dom.validate(leaf));
-        assert!(dom.validate(shell));
-        assert!(dom.validate(dom.root()));
+            assert!(dom.children(shell).is_empty());
+            assert_eq!(collect_tags(&dom), ["shell"]);
+            assert_eq!(count_walk(&dom), 2); // document + shell
+            assert!(!dom.validate(branch));
+            assert!(!dom.validate(leaf));
+            assert!(dom.validate(shell));
+            assert!(dom.validate(dom.root()));
+        });
     }
 
     #[test]
     fn reused_slot_bumps_generation_and_invalidates_old_handle() {
-        let mut dom = Dom::new();
-        let old = elem(&mut dom, "old");
-        dom.append(dom.root(), old);
-        dom.detach_subtree(old);
-        assert!(!dom.validate(old));
+        run_both(|mut dom| {
+            let old = elem(&mut dom, "old");
+            dom.append(dom.root(), old);
+            dom.detach_subtree(old);
+            assert!(!dom.validate(old));
 
-        let new = elem(&mut dom, "new");
-        assert_eq!(old.slot(), new.slot(), "create must reuse the free slot");
-        assert_ne!(old, new, "a reused slot must produce a different handle");
-        assert_ne!(old.generation(), new.generation());
-        assert!(!dom.validate(old));
-        assert!(dom.validate(new));
-        assert_eq!(dom.tag(new), Some("new"));
-        assert_eq!(dom.children(dom.root()), &[]);
+            let new = elem(&mut dom, "new");
+            assert_eq!(old.slot(), new.slot(), "create must reuse the free slot");
+            assert_ne!(old, new, "a reused slot must produce a different handle");
+            assert_ne!(old.generation(), new.generation());
+            assert!(!dom.validate(old));
+            assert!(dom.validate(new));
+            assert_eq!(dom.tag(new), Some("new"));
+            assert_eq!(dom.children(dom.root()), &[]);
 
-        // A second reuse keeps invalidating every older generation.
-        dom.detach_subtree(new);
-        let newest = elem(&mut dom, "newest");
-        assert!(!dom.validate(new));
-        assert!(!dom.validate(old));
-        assert!(dom.validate(newest));
+            // A second reuse keeps invalidating every older generation.
+            dom.detach_subtree(new);
+            let newest = elem(&mut dom, "newest");
+            assert!(!dom.validate(new));
+            assert!(!dom.validate(old));
+            assert!(dom.validate(newest));
+        });
     }
 
     #[test]
     fn validate_rejects_forged_and_internal_handles() {
-        let mut dom = Dom::new();
-        assert!(!dom.validate(NodeId(u32::MAX)));
-        assert!(!dom.validate(NodeId(SLOT_MASK)));
-        let a = elem(&mut dom, "a");
-        dom.detach_subtree(a);
-        let internal_trash = NodeId::encode((dom.len() - 1) as u32, 0);
-        assert!(!dom.validate(internal_trash));
-        dom.append(dom.root(), internal_trash); // forged append is ignored
-        assert!(dom.children(dom.root()).is_empty());
+        run_both(|mut dom| {
+            assert!(!dom.validate(NodeId(u32::MAX)));
+            assert!(!dom.validate(NodeId(SLOT_MASK)));
+            let a = elem(&mut dom, "a");
+            dom.detach_subtree(a);
+            let internal_trash = NodeId::encode((dom.len() - 1) as u32, 0);
+            assert!(!dom.validate(internal_trash));
+            dom.append(dom.root(), internal_trash); // forged append is ignored
+            assert!(dom.children(dom.root()).is_empty());
+        });
     }
 
     #[test]
     fn parent_child_invariants_hold_after_detach_and_reuse() {
-        let mut dom = Dom::new();
-        let keep = elem(&mut dom, "keep");
-        let gone = elem(&mut dom, "gone");
-        let child = elem(&mut dom, "child");
-        dom.append(dom.root(), keep);
-        dom.append(dom.root(), gone);
-        dom.append(gone, child);
-        dom.detach_subtree(gone);
-        let replacement = elem(&mut dom, "replacement");
-        dom.append(keep, replacement);
+        run_both(|mut dom| {
+            let keep = elem(&mut dom, "keep");
+            let gone = elem(&mut dom, "gone");
+            let child = elem(&mut dom, "child");
+            dom.append(dom.root(), keep);
+            dom.append(dom.root(), gone);
+            dom.append(gone, child);
+            dom.detach_subtree(gone);
+            let replacement = elem(&mut dom, "replacement");
+            dom.append(keep, replacement);
 
-        assert_eq!(dom.children(dom.root()), &[keep]);
-        assert_eq!(dom.parent(keep), Some(dom.root()));
-        assert_eq!(dom.children(keep), &[replacement]);
-        assert_eq!(dom.parent(replacement), Some(keep));
-        assert_eq!(collect_tags(&dom), ["keep", "replacement"]);
-        dom.walk(|id, node| {
-            assert!(dom.validate(id));
-            for &c in &node.children {
-                assert_eq!(dom.parent(c), Some(id));
-            }
+            assert_eq!(dom.children(dom.root()), &[keep]);
+            assert_eq!(dom.parent(keep), Some(dom.root()));
+            assert_eq!(dom.children(keep), &[replacement]);
+            assert_eq!(dom.parent(replacement), Some(keep));
+            assert_eq!(collect_tags(&dom), ["keep", "replacement"]);
+            dom.walk(|id, node| {
+                assert!(dom.validate(id));
+                for &c in &node.children {
+                    assert_eq!(dom.parent(c), Some(id));
+                }
+            });
         });
     }
 
@@ -665,5 +882,221 @@ mod tests {
             "depth cap and node size exceed the stack budget"
         );
         assert!(MAX_DOM_NODES as u32 <= SLOT_MASK);
+    }
+
+    // ---- Interning-specific contracts -------------------------------------
+
+    #[test]
+    fn interner_roundtrip_same_string_same_index() {
+        let mut pool = StringInterner::default();
+        let a = pool.intern("class");
+        let b = pool.intern("class");
+        let c = pool.intern("id");
+        assert_eq!(a, b, "interning the same string must return the same id");
+        assert_ne!(a, c);
+        assert_eq!(pool.get(a), "class");
+        assert_eq!(pool.get(c), "id");
+        assert_eq!(pool.unique_count(), 2);
+        assert_eq!(pool.lookup("class"), Some(a));
+        assert_eq!(pool.lookup("missing"), None);
+    }
+
+    #[test]
+    fn same_class_doc_stores_far_fewer_unique_strings_than_elements() {
+        let mut dom = Dom::with_interning();
+        for i in 0..500 {
+            let class = if i % 2 == 0 { "card" } else { "card wide" };
+            let id = dom.create(NodeKind::Element {
+                tag: "div".into(),
+                attrs: vec![("class".into(), class.into())],
+            });
+            dom.append(dom.root(), id);
+        }
+        assert_eq!(dom.len(), 501);
+        assert!(
+            dom.interner_len() < 10,
+            "unique strings should be far below the 500 element count, got {}",
+            dom.interner_len()
+        );
+        for i in 0..500 {
+            let id = NodeId((i + 1) as u32); // slot 0 is the document root
+            assert_eq!(dom.tag(id), Some("div"));
+            assert_eq!(
+                dom.attr(id, "class"),
+                if i % 2 == 0 {
+                    Some("card")
+                } else {
+                    Some("card wide")
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn detach_and_slot_reuse_keeps_interner_consistent() {
+        run_both(|mut dom| {
+            let old = dom.create(NodeKind::Element {
+                tag: "old".into(),
+                attrs: vec![("class".into(), "gone".into())],
+            });
+            dom.append(dom.root(), old);
+            dom.detach_subtree(old);
+
+            let new = dom.create(NodeKind::Element {
+                tag: "new".into(),
+                attrs: vec![("id".into(), "fresh".into())],
+            });
+            assert_eq!(old.slot(), new.slot(), "slot must be reused");
+            assert_eq!(dom.tag(new), Some("new"));
+            assert_eq!(dom.attr(new, "id"), Some("fresh"));
+            assert_eq!(
+                dom.attr(new, "class"),
+                None,
+                "no stale attr from old occupant"
+            );
+            assert_eq!(dom.attr_interned(new, "class"), None);
+        });
+    }
+
+    #[test]
+    fn set_attr_keeps_both_modes_in_sync() {
+        run_both(|mut dom| {
+            let el = dom.create(NodeKind::Element {
+                tag: "div".into(),
+                attrs: vec![("class".into(), "a".into())],
+            });
+            dom.set_attr(el, "class", "b".into());
+            assert_eq!(dom.attr(el, "class"), Some("b"));
+            dom.set_attr(el, "id", "x".into());
+            assert_eq!(dom.attr(el, "id"), Some("x"));
+            assert_eq!(dom.attr(el, "class"), Some("b"));
+
+            let other = dom.create(NodeKind::Element {
+                tag: "div".into(),
+                attrs: vec![("class".into(), "b".into())],
+            });
+            if dom.interning {
+                assert_eq!(
+                    dom.attr_interned(el, "class"),
+                    dom.attr_interned(other, "class"),
+                    "equal values must share an interned id"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn attr_interned_ids_are_stable_and_comparable() {
+        let mut dom = Dom::with_interning();
+        let a = dom.create(NodeKind::Element {
+            tag: "div".into(),
+            attrs: vec![("class".into(), "x".into())],
+        });
+        let b = dom.create(NodeKind::Element {
+            tag: "span".into(),
+            attrs: vec![("class".into(), "x".into())],
+        });
+        let c = dom.create(NodeKind::Element {
+            tag: "div".into(),
+            attrs: vec![("class".into(), "y".into())],
+        });
+        assert_eq!(dom.attr_interned(a, "class"), dom.attr_interned(b, "class"));
+        assert_ne!(dom.attr_interned(a, "class"), dom.attr_interned(c, "class"));
+        assert_eq!(dom.attr_interned(a, "missing"), None);
+
+        let plain = Dom::new();
+        assert_eq!(plain.interner_len(), 0, "default mode must not intern");
+    }
+
+    #[test]
+    fn default_mode_keeps_node_string_fields() {
+        // Byte-for-byte compatibility: `Dom::new()` still stores the strings in
+        // the node, so direct `Node::kind` readers keep working.
+        let mut dom = Dom::new();
+        let id = dom.create(NodeKind::Element {
+            tag: "div".into(),
+            attrs: vec![("class".into(), "card".into())],
+        });
+        match &dom.get(id).kind {
+            NodeKind::Element { tag, attrs } => {
+                assert_eq!(tag, "div");
+                assert_eq!(attrs, &[("class".to_string(), "card".to_string())]);
+            }
+            _ => panic!("expected element"),
+        }
+        assert_eq!(dom.interner_len(), 0);
+    }
+
+    // ---- Micro A/B ---------------------------------------------------------
+
+    #[test]
+    fn perf_ab_interned_vs_plain() {
+        fn run(intern: bool) -> (u128, u128, usize, usize) {
+            let mut dom = if intern {
+                Dom::with_interning()
+            } else {
+                Dom::new()
+            };
+            let build = Instant::now();
+            for i in 0..2000 {
+                let id = dom.create(NodeKind::Element {
+                    tag: "div".into(),
+                    attrs: vec![("class".into(), format!("s{}", i % 4))],
+                });
+                dom.append(dom.root(), id);
+            }
+            let build_us = build.elapsed().as_micros();
+
+            let first = NodeId(1);
+            let read = Instant::now();
+            let mut total = 0usize;
+            for _ in 0..10_000 {
+                total += dom.attr(first, "class").map_or(0, str::len);
+            }
+            let read_us = read.elapsed().as_micros();
+            assert_eq!(total, 10_000 * 2, "A/B must read a real value");
+
+            // Heap attributable to strings/attrs. Plain pays one string buffer
+            // per node plus a Vec<(String, String)> allocation per element.
+            // Interned pays the pool plus one compact id per interned slot.
+            let (string_bytes, side_bytes) = if intern {
+                (
+                    dom.interner_heap_bytes(),
+                    dom.str_meta
+                        .iter()
+                        .map(|m| size_of::<Interned>() + m.attrs.len() * 8)
+                        .sum::<usize>(),
+                )
+            } else {
+                let mut payload = 0usize;
+                let mut vec_alloc = 0usize;
+                for n in &dom.nodes {
+                    match &n.kind {
+                        NodeKind::Element { tag, attrs } => {
+                            payload += tag.len()
+                                + attrs.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>();
+                            vec_alloc += attrs.len() * size_of::<(String, String)>();
+                        }
+                        NodeKind::Text(t) => payload += t.len(),
+                        NodeKind::Document => {}
+                    }
+                }
+                (payload, vec_alloc)
+            };
+            (
+                build_us,
+                read_us,
+                string_bytes + side_bytes,
+                dom.interner_len(),
+            )
+        }
+
+        let (plain_build, plain_read, plain_bytes, plain_unique) = run(false);
+        let (intern_build, intern_read, intern_bytes, intern_unique) = run(true);
+        println!(
+            "A/B 2000 elements (class=s0..s3) + 10k reads (microseconds):\n\
+             plain:    build {plain_build}us, reads {plain_read}us, heap ~{plain_bytes} bytes (string buffers + attrs Vecs), unique {plain_unique}\n\
+             interned: build {intern_build}us, reads {intern_read}us, heap ~{intern_bytes} bytes (pool + compact ids), unique {intern_unique}"
+        );
     }
 }

@@ -9,12 +9,16 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
+#[cfg(feature = "js")]
+use hodo_dom::NodeId;
 use hodo_ext_api::{
     validate_api_value, ApiCall, ApiRegistry, ApiResult, Clock, ExtEvent, RuntimeConfig,
     SystemClock,
 };
 use serde_json::{json, Map, Value};
 
+#[cfg(feature = "js")]
+mod dom;
 mod executor;
 mod prelude;
 
@@ -52,8 +56,36 @@ const RECURSION_LIMIT: usize = 256;
 /// handing it extension-controlled source (runtime limits apply only after parse).
 const MAX_SOURCE_BRACKET_DEPTH: usize = 24;
 
+/// Read-only methods eligible for the per-tick memo.
+///
+/// Audited against `hodo-ext-api`'s `ApiCall` dispatch table (read-only): only
+/// the three storage getters reach a native registry call today. The other four
+/// names are frozen here for the ext-api integrator — `i18n.getMessage` is
+/// still a pure JS stub and `runtime.getURL`/`getManifest`/`id` are not exposed
+/// yet. Extending this list needs the matching dispatch-table/prelude entry.
+/// Never add a write, event, DOM native or hook-backed method (in particular
+/// `fetch`). Hook/fetch *implementations* are never cached: on a memo hit we
+/// never reach them, while `fetch` is deliberately non-PURE so it always
+/// reaches its side-effecting custom seam.
+const PURE_METHODS: &[&str] = &[
+    "storage.local.get",
+    "storage.sync.get",
+    "storage.session.get",
+    "i18n.getMessage",
+    "runtime.getURL",
+    "runtime.getManifest",
+    "runtime.id",
+];
+/// Hard bound on cached results per runtime (FIFO eviction).
+const MEMO_CAP: usize = 128;
+
 #[cfg(feature = "js")]
 type FetchHook = Rc<dyn Fn(&ApiCall) -> ApiResult>;
+
+/// Worker/broker seam: when installed, every dispatch goes through this hook
+/// instead of the local registry. `None` keeps today's in-process behaviour.
+#[cfg(feature = "js")]
+type DispatchHook = Rc<dyn Fn(&ApiCall) -> ApiResult>;
 
 #[cfg(feature = "js")]
 #[derive(Clone)]
@@ -84,7 +116,19 @@ enum Task {
         name: String,
         args: Vec<Value>,
     },
+    /// Page DOM event from the shell (`click`, `input`, `keydown`,
+    /// `DOMContentLoaded`, ...), delivered during the next tick.
+    PageEvent {
+        node_id: NodeId,
+        kind: String,
+        payload: Value,
+    },
 }
+
+/// Generic host-facing seam for message replies. The host decides how a reply
+/// is correlated to a request; hodo-js only produces `(message, response)`.
+#[cfg(feature = "js")]
+type ReplyHook = Rc<dyn Fn(&Value, &Value)>;
 
 #[cfg(feature = "js")]
 pub(crate) struct RuntimeState {
@@ -96,7 +140,20 @@ pub(crate) struct RuntimeState {
     logs: RefCell<Vec<String>>,
     /// Host-side permission-gated implementation of `fetch` (absent in tests).
     fetch_hook: RefCell<Option<FetchHook>>,
+    /// Isolated-worker forwarder; `None` means the registry handles calls.
+    dispatch_hook: RefCell<Option<DispatchHook>>,
+    /// `Some` only for page (popup) contexts.
+    pub(crate) page: Option<dom::PageState>,
+    /// Replies produced by `runtime.onMessage` listeners' `sendResponse`.
+    message_replies: RefCell<Vec<(Value, Value)>>,
+    reply_hook: RefCell<Option<ReplyHook>>,
     next_id: Cell<u64>,
+    /// Incremented at every tick boundary and on every write post. The
+    /// prelude's PURE-read memo compares it and drops stale entries lazily.
+    memo_epoch: Cell<u64>,
+    /// Writes posted but not yet dispatched: a synchronous PURE read would see
+    /// stale state, so the prelude falls back to the normal task path.
+    pending_writes: Cell<u32>,
 }
 
 #[cfg(feature = "js")]
@@ -114,8 +171,44 @@ impl RuntimeState {
             timers: RefCell::new(Vec::new()),
             logs: RefCell::new(Vec::new()),
             fetch_hook: RefCell::new(None),
+            dispatch_hook: RefCell::new(None),
+            page: None,
+            message_replies: RefCell::new(Vec::new()),
+            reply_hook: RefCell::new(None),
             next_id: Cell::new(1),
+            memo_epoch: Cell::new(1),
+            pending_writes: Cell::new(0),
         }
+    }
+
+    /// Bump the memo epoch visible to the prelude. Called at tick boundaries
+    /// and when a write is posted, so every cached PURE read is dropped on the
+    /// next lookup (one global write, no per-entry work in Rust).
+    fn bump_memo_epoch(&self, context: &mut Context) {
+        let epoch = self.memo_epoch.get().wrapping_add(1).max(1);
+        self.memo_epoch.set(epoch);
+        let _ = context.global_object().set(
+            JsString::from("__hodoMemoEpoch"),
+            JsValue::from(epoch as f64),
+            false,
+            context,
+        );
+    }
+
+    /// Single dispatch path: hook first, then the specialized fetch hook, then
+    /// the in-process registry. Identical to the old behaviour when both hooks
+    /// are absent.
+    fn dispatch_call(&self, call: &ApiCall) -> ApiResult {
+        if let Some(hook) = self.dispatch_hook.borrow().as_ref() {
+            return hook(call);
+        }
+        if matches!(call, ApiCall::Fetch { .. }) {
+            if let Some(hook) = self.fetch_hook.borrow().as_ref() {
+                return hook(call);
+            }
+            return ApiResult::Err("fetch: no host hook installed".to_string());
+        }
+        self.registry.borrow_mut().dispatch(call)
     }
 
     fn fresh_id(&self) -> u64 {
@@ -253,6 +346,52 @@ impl ExtScriptRuntime {
         }
     }
 
+    /// Create a *page* (popup) context over `dom`. This is the only constructor
+    /// that installs the page prelude; no extension API global is ever created.
+    #[cfg(feature = "js")]
+    #[must_use]
+    pub fn new_page(dom: Rc<RefCell<hodo_dom::Dom>>) -> Self {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let config = RuntimeConfig::default();
+        let registry = Rc::new(RefCell::new(ApiRegistry::new()));
+        let mut state_inner =
+            RuntimeState::new(Rc::clone(&registry), Rc::new(SystemClock), config.clone());
+        state_inner.page = Some(dom::PageState::new(dom));
+        let state = Rc::new(state_inner);
+        HANDLES.with(|handles| {
+            handles.borrow_mut().insert(id, Rc::clone(&state));
+        });
+
+        let executor = Rc::new(HodoJobExecutor::default());
+        let hooks = Rc::new(ExtensionHooks::new(config.extension_name.clone()));
+        let mut context = Context::builder()
+            .job_executor(Rc::clone(&executor))
+            .host_hooks(Rc::clone(&hooks))
+            .build()
+            .expect("building a fresh boa context should not fail");
+        let mut limits = context.runtime_limits();
+        limits.set_loop_iteration_limit(LOOP_ITERATION_LIMIT);
+        limits.set_recursion_limit(RECURSION_LIMIT);
+        context.set_runtime_limits(limits);
+
+        register_natives(&mut context, id);
+        dom::register_natives(&mut context, id);
+        let prelude = prelude::build_page_prelude();
+        context
+            .eval(Source::from_bytes(prelude.as_str()))
+            .expect("the page prelude is valid JavaScript");
+        hooks.set_block_compile(true);
+
+        Self {
+            registry,
+            context,
+            id,
+            state,
+            executor,
+            hooks,
+        }
+    }
+
     /// The single registry every `chrome.*` / `browser.*` call dispatches into.
     #[must_use]
     pub fn registry(&self) -> &Rc<RefCell<ApiRegistry>> {
@@ -311,6 +450,11 @@ impl ExtScriptRuntime {
         for line in self.hooks.take_unhandled() {
             self.state.log(line);
         }
+        // One drain = one tick. Invalidate after the drain so nothing cached
+        // during this tick leaks into the next one, and clear the write guard
+        // now that every posted task has been dispatched.
+        self.state.bump_memo_epoch(&mut self.context);
+        self.state.pending_writes.set(0);
         count
     }
 
@@ -331,19 +475,76 @@ impl ExtScriptRuntime {
     #[cfg(not(feature = "js"))]
     pub fn set_fetch_hook(&mut self, _hook: Rc<dyn Fn(&ApiCall) -> ApiResult>) {}
 
+    /// Install (or clear with `None`) the isolated-worker dispatch hook. While
+    /// set, every `chrome.*` / `browser.*` call is forwarded to it instead of
+    /// the local registry. `None` restores the in-process path.
+    #[cfg(feature = "js")]
+    pub fn set_dispatch_hook(&mut self, hook: Option<DispatchHook>) {
+        *self.state.dispatch_hook.borrow_mut() = hook;
+    }
+
+    /// Non-JS builds have no dispatch hook.
+    #[cfg(not(feature = "js"))]
+    pub fn set_dispatch_hook(&mut self, _hook: Option<Rc<dyn Fn(&ApiCall) -> ApiResult>>) {}
+
     /// Enqueue an externally-originated event (e.g. an extension message or an
     /// alarm fired by the host) for delivery during the next tick.
     #[cfg(feature = "js")]
     pub fn fire_event(&mut self, name: &str, payload: Value) {
-        self.state.queue.borrow_mut().push_back(Task::Event {
-            name: "__hodoFire".to_string(),
-            args: vec![json!(name), payload],
-        });
+        // `runtime.onMessage` is the one event whose listeners receive a
+        // `sendResponse` callback; route it through the listener-aware,
+        // reply-capable dispatcher instead of the generic event fan-out.
+        let task = if name == "runtime.onMessage" {
+            Task::Event {
+                name: "__hodoFireMessage".to_string(),
+                args: vec![payload],
+            }
+        } else {
+            Task::Event {
+                name: "__hodoFire".to_string(),
+                args: vec![json!(name), payload],
+            }
+        };
+        self.state.queue.borrow_mut().push_back(task);
     }
 
     /// Non-JS builds have no event loop.
     #[cfg(not(feature = "js"))]
     pub fn fire_event(&mut self, _name: &str, _payload: Value) {}
+
+    /// Deliver a DOM event from the shell to listeners registered on `node_id`.
+    /// The event is queued and invoked on the next [`Self::tick`].
+    #[cfg(feature = "js")]
+    pub fn dispatch_page_event(&mut self, node_id: NodeId, kind: &str, payload: Value) {
+        self.state.queue.borrow_mut().push_back(Task::PageEvent {
+            node_id,
+            kind: kind.to_string(),
+            payload,
+        });
+    }
+
+    /// Install a host callback for message replies. Keeping this generic lets
+    /// the host own request/reply correlation without exposing its queue here.
+    #[cfg(feature = "js")]
+    pub fn set_message_reply_hook(&mut self, hook: Option<ReplyHook>) {
+        *self.state.reply_hook.borrow_mut() = hook;
+    }
+
+    /// Non-JS builds have no message replies.
+    #[cfg(not(feature = "js"))]
+    pub fn set_message_reply_hook(&mut self, _hook: Option<Rc<dyn Fn(&Value, &Value)>>) {}
+
+    /// Drain the `(message, response)` pairs produced by `sendResponse`.
+    #[cfg(feature = "js")]
+    pub fn take_message_replies(&mut self) -> Vec<(Value, Value)> {
+        std::mem::take(&mut self.state.message_replies.borrow_mut())
+    }
+
+    /// Non-JS builds have no message replies.
+    #[cfg(not(feature = "js"))]
+    pub fn take_message_replies(&mut self) -> Vec<(Value, Value)> {
+        Vec::new()
+    }
 
     /// Number of active timers (used by tests and idle-unload accounting).
     #[must_use]
@@ -404,6 +605,7 @@ impl Drop for ExtScriptRuntime {
         // them here prevents any late delivery after the context is gone.
         self.state.timers.borrow_mut().clear();
         self.state.queue.borrow_mut().clear();
+        dom::drop_page(&self.state);
     }
 }
 
@@ -452,16 +654,7 @@ impl ExtScriptRuntime {
             } => {
                 let mut last = Value::Null;
                 for call in calls {
-                    let hooked = matches!(call, ApiCall::Fetch { .. })
-                        && self.state.fetch_hook.borrow().is_some();
-                    let result = if hooked {
-                        let hook = self.state.fetch_hook.borrow();
-                        hook.as_ref().expect("just checked")(&call)
-                    } else if matches!(call, ApiCall::Fetch { .. }) {
-                        ApiResult::Err("fetch: no host hook installed".to_string())
-                    } else {
-                        self.state.registry.borrow_mut().dispatch(&call)
-                    };
+                    let result = self.state.dispatch_call(&call);
                     last = match result {
                         ApiResult::Ok(value) => value,
                         ApiResult::Err(err) => {
@@ -476,9 +669,7 @@ impl ExtScriptRuntime {
                         map.insert(
                             key.clone(),
                             self.state
-                                .registry
-                                .borrow_mut()
-                                .dispatch(&ApiCall::StorageGet { key: key.clone() })
+                                .dispatch_call(&ApiCall::StorageGet { key: key.clone() })
                                 .into_ok_or_null(),
                         );
                     }
@@ -500,6 +691,11 @@ impl ExtScriptRuntime {
                     self.state.log(err);
                 }
             }
+            Task::PageEvent {
+                node_id,
+                kind,
+                payload,
+            } => self.fire_page_event(node_id, &kind, &payload),
         }
     }
 
@@ -602,6 +798,51 @@ impl ExtScriptRuntime {
             .collect();
         if let Err(err) = call_global(&mut self.context, function, &values) {
             self.state.log(err);
+        }
+    }
+
+    fn fire_page_event(&mut self, node_id: NodeId, kind: &str, payload: &Value) {
+        let Some(page) = self.state.page.as_ref() else {
+            return;
+        };
+        let callbacks: Vec<u64> = page
+            .listeners
+            .borrow()
+            .iter()
+            .filter(|listener| listener.node == node_id && listener.kind == kind)
+            .map(|listener| listener.callback_id)
+            .collect();
+        if callbacks.is_empty() {
+            return;
+        }
+        let value = match JsValue::from_json(payload, &mut self.context) {
+            Ok(value) => value,
+            Err(err) => {
+                self.state
+                    .log(format!("page event payload conversion failed: {err}"));
+                return;
+            }
+        };
+        for callback_id in callbacks {
+            let key = PropertyKey::from(JsString::from(format!("__hodoListener_{callback_id}")));
+            let callback = match self.context.global_object().get(key, &mut self.context) {
+                Ok(callback) => callback,
+                Err(err) => {
+                    self.state
+                        .log(format!("page listener lookup failed: {err}"));
+                    continue;
+                }
+            };
+            if let Some(function) = callback.as_callable() {
+                if let Err(err) = function.call(
+                    &JsValue::undefined(),
+                    std::slice::from_ref(&value),
+                    &mut self.context,
+                ) {
+                    self.state
+                        .log(format!("page listener: {}", error_message(&err)));
+                }
+            }
         }
     }
 }
@@ -739,10 +980,15 @@ fn map_entries(value: &Value) -> Option<Vec<(String, Value)>> {
 }
 
 #[cfg(feature = "js")]
+fn pure_method(name: &str) -> Option<&'static str> {
+    PURE_METHODS.iter().copied().find(|method| *method == name)
+}
+
+#[cfg(feature = "js")]
 fn make_calls(
     name: &str,
     args: &[Value],
-    state: &RuntimeState,
+    now_ms: u64,
 ) -> Result<(Vec<ApiCall>, Option<Vec<String>>), String> {
     let mut calls = Vec::new();
     let mut merge_keys = None;
@@ -855,7 +1101,7 @@ fn make_calls(
                 name: name.to_string(),
                 delay_ms: number("delayMs").max(number("delay")),
                 period_ms: info.get("periodMs").and_then(Value::as_u64),
-                now_ms: state.clock.now_ms(),
+                now_ms,
             });
         }
         "alarms.clear" => {
@@ -867,6 +1113,32 @@ fn make_calls(
                 name: name.to_string(),
             });
         }
+        // PURE reads for the ext-api integrator: the prelude's __hodoApiCall
+        // memoizes every name in PURE_METHODS automatically once it reaches
+        // this table. None of these dispatch to a write or a host hook.
+        "i18n.getMessage" => {
+            let key = args
+                .first()
+                .and_then(Value::as_str)
+                .ok_or_else(|| "i18n.getMessage expects a key".to_string())?
+                .to_string();
+            let substitutions = args
+                .get(1)
+                .and_then(Value::as_array)
+                .map(|items| items.iter().map(string_value).collect())
+                .unwrap_or_default();
+            calls.push(ApiCall::I18nGetMessage { key, substitutions });
+        }
+        "runtime.getURL" => {
+            let path = args
+                .first()
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            calls.push(ApiCall::RuntimeGetUrl { path });
+        }
+        "runtime.getManifest" => calls.push(ApiCall::RuntimeGetManifest),
+        "runtime.id" => calls.push(ApiCall::RuntimeId),
         "fetch" => {
             let url = args
                 .first()
@@ -894,9 +1166,81 @@ fn make_calls(
     Ok((calls, merge_keys))
 }
 
+/// Translate one wire `ApiCall` (`method` + `params`) through the same
+/// `make_calls` table the JS wrappers use. `params` may be a positional array
+/// or a single value. Multi-key `storage.*.get` has no single-call wire form
+/// and therefore yields no calls.
+///
+/// # Errors
+/// Returns the same message as an unknown or malformed JS API call.
+#[cfg(feature = "js")]
+pub fn decode_api_call(method: &str, params: Value) -> Result<Vec<ApiCall>, String> {
+    let args: Vec<Value> = match params {
+        Value::Array(items) => items,
+        other => vec![other],
+    };
+    let (calls, _merge_keys) = make_calls(method, &args, SystemClock.now_ms())?;
+    Ok(calls)
+}
+
+/// Non-JS builds have no dispatch table.
+#[cfg(not(feature = "js"))]
+pub fn decode_api_call(_method: &str, _params: Value) -> Result<Vec<ApiCall>, String> {
+    Err("js engine disabled".to_string())
+}
+
 #[cfg(feature = "js")]
 fn string_value(value: &Value) -> String {
     value.as_str().unwrap_or_default().to_string()
+}
+
+/// Synchronous result for a PURE read, used by the prelude to fill its memo
+/// before the next JS statement runs. Returns `undefined` when a write is
+/// pending or the call cannot be dispatched; the prelude then falls back to
+/// the ordinary task queue, keeping error and ordering behaviour unchanged.
+#[cfg(feature = "js")]
+fn op_pure_read(id: u64) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |_this, args, ctx| {
+        let state = with_state(id, Rc::clone).map_err(js_error)?;
+        // A host reply hook means the host owns call/message routing (the
+        // isolated worker). A local sync read would be stale and would bypass
+        // the host's wire entirely, so fall through to __hodoPost; the memo is
+        // still filled from the eventual settle result.
+        if state.reply_hook.borrow().is_some() || state.pending_writes.get() > 0 {
+            return Ok(JsValue::undefined());
+        }
+        let name = string_arg(args, 0, ctx).unwrap_or_default();
+        if pure_method(&name).is_none() {
+            return Ok(JsValue::undefined());
+        }
+        let values = json_arg(args, 1, ctx).unwrap_or(Value::Null);
+        let Some(list) = values.as_array() else {
+            return Ok(JsValue::undefined());
+        };
+        let Ok((calls, merge_keys)) = make_calls(&name, list, state.clock.now_ms()) else {
+            return Ok(JsValue::undefined());
+        };
+        let mut last = Value::Null;
+        for call in &calls {
+            match state.dispatch_call(call) {
+                ApiResult::Ok(value) => last = value,
+                ApiResult::Err(_) => return Ok(JsValue::undefined()),
+            }
+        }
+        if let Some(keys) = &merge_keys {
+            let mut map = Map::new();
+            for key in keys {
+                map.insert(
+                    key.clone(),
+                    state
+                        .dispatch_call(&ApiCall::StorageGet { key: key.clone() })
+                        .into_ok_or_null(),
+                );
+            }
+            last = Value::Object(map);
+        }
+        JsValue::from_json(&last, ctx).map_err(|err| js_error(err.to_string()))
+    })
 }
 
 #[cfg(feature = "js")]
@@ -912,11 +1256,25 @@ fn op_post_task(id: u64) -> NativeFunction {
                 .as_array()
                 .cloned()
                 .ok_or_else(|| "api args must be an array".to_string())?;
-            make_calls(&name, &list, &state)
+            make_calls(&name, &list, state.clock.now_ms())
+                .map(|(calls, merge_keys)| (name, calls, merge_keys))
         });
         let call_id = state.fresh_id();
+        // Any non-PURE post is a write or a side-effecting/host-hook path.
+        // Invalidate the whole PURE memo immediately, before a later read in
+        // the same JS turn can observe a stale value.
+        let pure = match &prepared {
+            Ok((name, _, _)) => pure_method(name).is_some(),
+            Err(_) => false,
+        };
+        if !pure {
+            state.bump_memo_epoch(ctx);
+            state
+                .pending_writes
+                .set(state.pending_writes.get().saturating_add(1));
+        }
         let task = match prepared {
-            Ok((calls, merge_keys)) => Task::Api {
+            Ok((_, calls, merge_keys)) => Task::Api {
                 id: call_id,
                 calls,
                 merge_keys,
@@ -988,6 +1346,24 @@ fn op_log(id: u64) -> NativeFunction {
 }
 
 #[cfg(feature = "js")]
+fn op_message_reply(id: u64) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |_this, args, ctx| {
+        let state = with_state(id, Rc::clone).map_err(js_error)?;
+        let message = json_arg(args, 0, ctx).map_err(js_error)?;
+        let response = json_arg(args, 1, ctx).map_err(js_error)?;
+        validate_api_value(&response).map_err(js_error)?;
+        state
+            .message_replies
+            .borrow_mut()
+            .push((message.clone(), response.clone()));
+        if let Some(hook) = state.reply_hook.borrow().as_ref() {
+            hook(&message, &response);
+        }
+        Ok(JsValue::undefined())
+    })
+}
+
+#[cfg(feature = "js")]
 fn register(context: &mut Context, name: &str, length: usize, function: NativeFunction) {
     context
         .register_global_callable(JsString::from(name), length, function)
@@ -997,10 +1373,12 @@ fn register(context: &mut Context, name: &str, length: usize, function: NativeFu
 #[cfg(feature = "js")]
 fn register_natives(context: &mut Context, id: u64) {
     register(context, "__hodo_post_task", 2, op_post_task(id));
+    register(context, "__hodo_read_pure", 2, op_pure_read(id));
     register(context, "__hodo_set_timeout", 3, op_timer(id, false));
     register(context, "__hodo_set_interval", 3, op_timer(id, true));
     register(context, "__hodo_clear_timer", 1, op_clear_timer(id));
     register(context, "__hodo_log", 1, op_log(id));
+    register(context, "__hodo_message_reply", 2, op_message_reply(id));
 }
 
 #[cfg(test)]
@@ -1009,6 +1387,7 @@ mod tests {
     use super::*;
     use hodo_ext_api::{ApiDialect, FakeClock};
     use serde_json::json;
+    use std::time::Instant;
 
     fn get(registry: &Rc<RefCell<ApiRegistry>>, key: &str) -> Value {
         match registry
@@ -1036,6 +1415,46 @@ mod tests {
         )
     }
 
+    /// A host-owned (isolated worker) context has no authoritative local state:
+    /// a PURE read must travel through `__hodoPost` so the wire shim can emit
+    /// the broker call, not short-circuit on the shadow registry's local null.
+    #[test]
+    fn worker_style_context_routes_pure_reads_through_post() {
+        let config = RuntimeConfig {
+            dialect: hodo_ext_api::ApiDialect::ChromeMv3,
+            allowed_namespaces: vec!["storage".into(), "tabs".into()],
+            ..RuntimeConfig::default()
+        };
+        let mut runtime = ExtScriptRuntime::with_config_and_registry(
+            config,
+            Rc::new(RefCell::new(ApiRegistry::new())),
+            Rc::new(SystemClock),
+        );
+        let wires = Rc::new(RefCell::new(Vec::new()));
+        let seen = Rc::clone(&wires);
+        runtime.set_message_reply_hook(Some(Rc::new(move |message, _| {
+            seen.borrow_mut().push(message.clone());
+        })));
+        runtime
+            .eval(
+                "var __hodo_native_post = __hodoPost; \
+                 __hodoPost = function (name, args) { \
+                   __hodo_message_reply(JSON.stringify({ name: name, args: args }), null); \
+                   return 1; \
+                 };",
+            )
+            .unwrap();
+        runtime
+            .eval("chrome.storage.local.get('k').then(function (v) { __hodo_log('got:' + v.k); });")
+            .unwrap();
+        let wires = wires.borrow();
+        assert_eq!(wires.len(), 1, "no wire registration for the PURE read");
+        let registration: Value =
+            serde_json::from_str(wires[0].as_str().expect("wire text")).expect("wire JSON");
+        assert_eq!(registration["name"], json!("storage.local.get"));
+        assert_eq!(registration["args"], json!(["k"]));
+    }
+
     #[test]
     fn eval_arithmetic() {
         let mut runtime = ExtScriptRuntime::new();
@@ -1061,6 +1480,41 @@ mod tests {
         runtime.tick();
         assert_eq!(trace(&mut runtime), vec!["hello".to_string()]);
         assert_eq!(get(runtime.registry(), "greeting"), json!("hello"));
+    }
+
+    #[test]
+    fn pure_runtime_and_i18n_reads_use_dispatch_table() {
+        use hodo_ext_api::RuntimeInfo;
+        let registry = Rc::new(RefCell::new(ApiRegistry::new()));
+        registry.borrow_mut().set_runtime_info(Rc::new(RuntimeInfo {
+            id: "ext-123".into(),
+            url_base: "chrome-extension://ext-123".into(),
+            manifest: json!({ "name": "Demo", "version": "1.0" }),
+            messages: None,
+        }));
+        let mut runtime = ExtScriptRuntime::with_config_and_registry(
+            RuntimeConfig {
+                dialect: ApiDialect::ChromeMv3,
+                ..RuntimeConfig::default()
+            },
+            registry,
+            Rc::new(SystemClock),
+        );
+        runtime
+            .eval(
+                "Promise.all([chrome.runtime.id, chrome.runtime.getURL('popup.html'), \
+                 chrome.runtime.getManifest(), chrome.i18n.getMessage('missing')]) \
+                 .then(function (r) { __hodo_log(JSON.stringify(r)); });",
+            )
+            .unwrap();
+        runtime.tick();
+        assert_eq!(
+            trace(&mut runtime),
+            vec![
+                r#"["ext-123","chrome-extension://ext-123/popup.html",{"name":"Demo","version":"1.0"},""]"#
+                    .to_string()
+            ]
+        );
     }
 
     #[test]
@@ -1493,5 +1947,333 @@ mod tests {
             .unwrap();
         runtime.tick();
         assert!(trace(&mut runtime).iter().any(|line| line == "rejected"));
+    }
+
+    #[test]
+    fn dispatch_hook_forwards_calls_and_can_be_cleared() {
+        let registry = Rc::new(RefCell::new(ApiRegistry::new()));
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let seen_hook = Rc::clone(&seen);
+        let mut runtime =
+            ExtScriptRuntime::with_allowed_and_registry(&["storage"], Rc::clone(&registry));
+        runtime.set_dispatch_hook(Some(Rc::new(move |call| {
+            seen_hook.borrow_mut().push(format!("{call:?}"));
+            ApiResult::Ok(json!("hooked"))
+        })));
+        runtime
+            .eval("browser.storage.local.set('k', 1).then(function (v) { __hodo_log(v); });")
+            .unwrap();
+        runtime.tick();
+        assert_eq!(trace(&mut runtime), vec!["hooked".to_string()]);
+        assert_eq!(seen.borrow().len(), 1);
+        assert!(get(&registry, "k").is_null());
+
+        runtime.set_dispatch_hook(None);
+        runtime.eval("browser.storage.local.set('k', 2);").unwrap();
+        runtime.tick();
+        assert_eq!(get(&registry, "k"), json!(2));
+    }
+
+    #[test]
+    fn decode_api_call_uses_existing_dispatch_table() {
+        let calls = decode_api_call("storage.local.set", json!({"k": 1})).unwrap();
+        assert!(matches!(
+            &calls[0],
+            ApiCall::StorageSet { key, value } if key == "k" && *value == json!(1)
+        ));
+        assert!(decode_api_call("nope", json!([])).is_err());
+    }
+
+    #[test]
+    fn fire_message_reply_roundtrip_with_mock_responder() {
+        let mut runtime = ExtScriptRuntime::new();
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let seen_hook = Rc::clone(&seen);
+        runtime.set_message_reply_hook(Some(Rc::new(move |message, response| {
+            seen_hook
+                .borrow_mut()
+                .push((message.clone(), response.clone()));
+        })));
+        runtime
+            .eval("chrome.runtime.onMessage.addListener(function (m, sender, reply) { reply('pong:' + m); });")
+            .unwrap();
+        runtime.tick();
+        runtime.fire_event("runtime.onMessage", json!("ping"));
+        runtime.tick();
+        let expected = vec![(json!("ping"), json!("pong:ping"))];
+        assert_eq!(*seen.borrow(), expected);
+        assert_eq!(runtime.take_message_replies(), expected);
+        assert!(runtime.take_message_replies().is_empty());
+    }
+
+    #[test]
+    fn fire_message_without_listener_produces_no_reply() {
+        let mut runtime = ExtScriptRuntime::new();
+        runtime.fire_event("runtime.onMessage", json!("ping"));
+        runtime.tick();
+        assert!(runtime.take_message_replies().is_empty());
+    }
+
+    // ---- per-tick PURE memo -------------------------------------------------
+
+    fn counting_storage_hook(
+        calls: Rc<RefCell<u32>>,
+        store: Rc<RefCell<HashMap<String, Value>>>,
+    ) -> DispatchHook {
+        Rc::new(move |call| {
+            *calls.borrow_mut() += 1;
+            match call {
+                ApiCall::StorageGet { key } => {
+                    ApiResult::Ok(store.borrow().get(key).cloned().unwrap_or(Value::Null))
+                }
+                ApiCall::StorageSet { key, value } => {
+                    store.borrow_mut().insert(key.clone(), value.clone());
+                    ApiResult::Ok(Value::Null)
+                }
+                _ => ApiResult::Ok(Value::Null),
+            }
+        })
+    }
+
+    #[test]
+    fn memo_same_key_repeats_only_one_underlying_dispatch() {
+        let calls = Rc::new(RefCell::new(0));
+        let store = Rc::new(RefCell::new(HashMap::new()));
+        store.borrow_mut().insert("k".to_string(), json!("v"));
+        let mut runtime = ExtScriptRuntime::with_allowed(&["storage"]);
+        runtime.set_dispatch_hook(Some(counting_storage_hook(
+            Rc::clone(&calls),
+            Rc::clone(&store),
+        )));
+        runtime
+            .eval("var out=[]; for (var i=0;i<10;i++) browser.storage.local.get('k').then(function(v){ out.push(v); });")
+            .unwrap();
+        assert_eq!(*calls.borrow(), 1);
+        runtime.eval("__hodo_log(out.join('|'));").unwrap();
+        assert_eq!(trace(&mut runtime), vec!["v|v|v|v|v|v|v|v|v|v".to_string()]);
+    }
+
+    #[test]
+    fn memo_write_invalidates_before_later_reads_in_the_same_tick() {
+        let calls = Rc::new(RefCell::new(0));
+        let store = Rc::new(RefCell::new(HashMap::new()));
+        let mut runtime = ExtScriptRuntime::with_allowed(&["storage"]);
+        runtime.set_dispatch_hook(Some(counting_storage_hook(
+            Rc::clone(&calls),
+            Rc::clone(&store),
+        )));
+        runtime
+            .eval(
+                "browser.storage.local.get('k').then(function(v){__hodo_log('a:'+v);}); \
+                   browser.storage.local.set('k',2); \
+                   browser.storage.local.get('k').then(function(v){__hodo_log('b:'+v);});",
+            )
+            .unwrap();
+        assert_eq!(*calls.borrow(), 3);
+        assert_eq!(
+            trace(&mut runtime),
+            vec!["a:null".to_string(), "b:2".to_string()]
+        );
+    }
+
+    #[test]
+    fn memo_is_invalidated_at_each_tick_boundary() {
+        let calls = Rc::new(RefCell::new(0));
+        let store = Rc::new(RefCell::new(HashMap::new()));
+        store.borrow_mut().insert("k".to_string(), json!(1));
+        let mut runtime = ExtScriptRuntime::with_allowed(&["storage"]);
+        runtime.set_dispatch_hook(Some(counting_storage_hook(
+            Rc::clone(&calls),
+            Rc::clone(&store),
+        )));
+        for _ in 0..3 {
+            runtime.eval("browser.storage.local.get('k');").unwrap();
+        }
+        assert_eq!(*calls.borrow(), 3);
+    }
+
+    #[test]
+    fn memo_distinct_params_are_distinct_entries() {
+        let calls = Rc::new(RefCell::new(0));
+        let store = Rc::new(RefCell::new(HashMap::new()));
+        let mut runtime = ExtScriptRuntime::with_allowed(&["storage"]);
+        runtime.set_dispatch_hook(Some(counting_storage_hook(
+            Rc::clone(&calls),
+            Rc::clone(&store),
+        )));
+        runtime
+            .eval(
+                "browser.storage.local.get('a'); browser.storage.local.get('b'); \
+                   browser.storage.local.get('a'); browser.storage.local.get('b');",
+            )
+            .unwrap();
+        assert_eq!(*calls.borrow(), 2);
+    }
+
+    #[test]
+    fn memo_is_bounded_and_evicts_oldest_entries() {
+        let calls = Rc::new(RefCell::new(0));
+        let store = Rc::new(RefCell::new(HashMap::new()));
+        let mut runtime = ExtScriptRuntime::with_allowed(&["storage"]);
+        runtime.set_dispatch_hook(Some(counting_storage_hook(
+            Rc::clone(&calls),
+            Rc::clone(&store),
+        )));
+        let mut script = String::new();
+        for i in 0..=MEMO_CAP {
+            script.push_str(&format!("browser.storage.local.get('k{i}');"));
+        }
+        // k0 is evicted once the 129th distinct key arrives; k128 survives.
+        script.push_str("browser.storage.local.get('k0'); browser.storage.local.get('k128');");
+        runtime.eval(&script).unwrap();
+        assert_eq!(*calls.borrow() as usize, MEMO_CAP + 2);
+    }
+
+    #[test]
+    fn page_runtimes_have_independent_memos_and_dom_reads_stay_uncached() {
+        let mut a = ExtScriptRuntime::new_page(Rc::new(RefCell::new(hodo_dom::Dom::new())));
+        let mut b = ExtScriptRuntime::new_page(Rc::new(RefCell::new(hodo_dom::Dom::new())));
+        assert_eq!(
+            a.eval("__hodoMemoPut('x','A'); __hodoMemoGet('x').value")
+                .unwrap(),
+            "A"
+        );
+        assert_eq!(
+            b.eval("__hodoMemoGet('x') === __hodoMemoMiss").unwrap(),
+            "true"
+        );
+        assert_eq!(
+            a.eval(
+                "__hodoMemoPut('x','A'); __hodoMemoPut('y','B'); \
+                 Object.keys(__hodoMemo.entries).length"
+            )
+            .unwrap(),
+            "2"
+        );
+        assert_eq!(
+            b.eval("Object.keys(__hodoMemo.entries).length").unwrap(),
+            "0"
+        );
+
+        // DOM natives are separate ops, never routed through the memo: a
+        // write is visible to the very next read in the same page context.
+        let dom = Rc::new(RefCell::new(hodo_dom::Dom::new()));
+        let mut page = ExtScriptRuntime::new_page(Rc::clone(&dom));
+        page.eval("var el = document.createElement('div'); el.setAttribute('x','1');")
+            .unwrap();
+        assert_eq!(page.eval("el.getAttribute('x')").unwrap(), "1");
+        page.eval("el.setAttribute('x','2');").unwrap();
+        assert_eq!(page.eval("el.getAttribute('x')").unwrap(), "2");
+    }
+
+    #[test]
+    fn fetch_hook_path_bypasses_the_memo() {
+        let calls = Rc::new(RefCell::new(0));
+        let counter = Rc::clone(&calls);
+        let mut runtime = ExtScriptRuntime::new();
+        runtime.set_fetch_hook(Rc::new(move |_call| {
+            *counter.borrow_mut() += 1;
+            ApiResult::Ok(json!({ "ok": true, "status": 200, "body": "x" }))
+        }));
+        runtime.eval("fetch('/x'); fetch('/x');").unwrap();
+        assert_eq!(*calls.borrow(), 2);
+    }
+
+    #[test]
+    fn memo_perf_ab_1000_reads() {
+        let calls = Rc::new(RefCell::new(0));
+        let store = Rc::new(RefCell::new(HashMap::new()));
+        let mut runtime = ExtScriptRuntime::with_allowed(&["storage"]);
+        runtime.set_dispatch_hook(Some(counting_storage_hook(
+            Rc::clone(&calls),
+            Rc::clone(&store),
+        )));
+        runtime
+            .eval("browser.storage.local.set('bench', 7);")
+            .unwrap();
+        runtime.tick();
+        *calls.borrow_mut() = 0;
+        let script = "var sum=0; for (var i=0;i<1000;i++) { \
+                      browser.storage.local.get('bench').then(function(v){ sum+=v; }); }";
+        runtime
+            .eval("var __hodoPureSaved = __hodoPure; __hodoPure = {};")
+            .unwrap();
+        let start = Instant::now();
+        runtime.context.eval(Source::from_bytes(script)).unwrap();
+        let off_js = start.elapsed().as_secs_f64() * 1e6 / 1000.0;
+        let start = Instant::now();
+        runtime.tick();
+        let off_tick = start.elapsed().as_secs_f64() * 1e6 / 1000.0;
+        let off = off_js + off_tick;
+        let off_calls = *calls.borrow();
+        *calls.borrow_mut() = 0;
+        runtime.eval("__hodoPure = __hodoPureSaved;").unwrap();
+        let start = Instant::now();
+        runtime.context.eval(Source::from_bytes(script)).unwrap();
+        let on_js = start.elapsed().as_secs_f64() * 1e6 / 1000.0;
+        let start = Instant::now();
+        runtime.tick();
+        let on_tick = start.elapsed().as_secs_f64() * 1e6 / 1000.0;
+        let on = on_js + on_tick;
+        let on_calls = *calls.borrow();
+        eprintln!(
+            "memo A/B (1000 storage.get): off={off:.3} us/call (js={off_js:.3}, tick={off_tick:.3}, \
+             {off_calls} dispatches), on={on:.3} us/call (js={on_js:.3}, tick={on_tick:.3}, \
+             {on_calls} dispatches), speedup={:.2}x",
+            off / on
+        );
+        assert!(on < off, "memo path must be faster than full dispatch");
+    }
+
+    #[test]
+    fn memo_hit_preserves_callback_style_invocation() {
+        let calls = Rc::new(RefCell::new(0));
+        let store = Rc::new(RefCell::new(HashMap::new()));
+        store.borrow_mut().insert("k".to_string(), json!("v"));
+        let mut runtime = ExtScriptRuntime::with_allowed(&["storage"]);
+        runtime.set_dispatch_hook(Some(counting_storage_hook(
+            Rc::clone(&calls),
+            Rc::clone(&store),
+        )));
+        runtime
+            .eval("var n=0; chrome.storage.local.get('k', function (v) { n++; __hodo_log('a:'+v); }); \
+                   chrome.storage.local.get('k', function (v) { n++; __hodo_log('b:'+v); });")
+            .unwrap();
+        assert_eq!(*calls.borrow(), 1);
+        runtime.eval("__hodo_log('n:'+n);").unwrap();
+        assert_eq!(
+            trace(&mut runtime),
+            vec!["a:v".to_string(), "b:v".to_string(), "n:2".to_string()]
+        );
+    }
+
+    #[test]
+    fn memo_no_op_tick_invalidation_cost() {
+        let mut runtime = ExtScriptRuntime::new();
+        for _ in 0..10 {
+            runtime.tick();
+        }
+        let start = Instant::now();
+        for _ in 0..1000 {
+            runtime.tick();
+        }
+        let tick = start.elapsed().as_secs_f64() * 1e6 / 1000.0;
+        let start = Instant::now();
+        for _ in 0..1000 {
+            runtime.state.bump_memo_epoch(&mut runtime.context);
+        }
+        let epoch = start.elapsed().as_secs_f64() * 1e6 / 1000.0;
+        let populate = format!("for (var i=0;i<{MEMO_CAP};i++) __hodoMemoPut('k'+i, i);");
+        runtime.context.eval(Source::from_bytes(&populate)).unwrap();
+        let start = Instant::now();
+        runtime
+            .context
+            .eval(Source::from_bytes("__hodoMemoSync();"))
+            .unwrap();
+        let lazy_clear = start.elapsed().as_secs_f64() * 1e6;
+        eprintln!(
+            "no-op tick={tick:.3} us, epoch bump={epoch:.3} us, \
+             lazy clear of {MEMO_CAP} entries={lazy_clear:.3} us"
+        );
     }
 }

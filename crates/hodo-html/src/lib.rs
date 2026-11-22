@@ -5,6 +5,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use hodo_dom::{Dom, NodeId, NodeKind};
+use hodo_types::limits::MAX_NESTING_DEPTH;
 use html5ever::tendril::{fmt::UTF8, Tendril, TendrilSink};
 use html5ever::tree_builder::{ElemName, ElementFlags, NodeOrText, TreeSink};
 use html5ever::{Attribute, LocalNameStaticSet, NamespaceStaticSet, QualName};
@@ -29,14 +30,15 @@ struct Sink {
     dom: RefCell<Dom>,
     names: RefCell<HashMap<NodeId, QualName>>,
     templates: RefCell<HashMap<NodeId, NodeId>>,
-    stack: RefCell<Vec<NodeId>>,
     /// Detached node used to take children out of their parent (Dom has no detach API).
     trash: NodeId,
 }
 
 impl Default for Sink {
     fn default() -> Self {
-        let mut dom = Dom::new();
+        // Shell page parsing owns the hot DOM path; intern tag/attr strings so
+        // repetitive documents pay per distinct string, not per element.
+        let mut dom = Dom::with_interning();
         let trash = dom.create(NodeKind::Element {
             tag: "#detached".to_string(),
             attrs: Vec::new(),
@@ -45,7 +47,6 @@ impl Default for Sink {
             dom: RefCell::new(dom),
             names: RefCell::new(HashMap::new()),
             templates: RefCell::new(HashMap::new()),
-            stack: RefCell::new(Vec::new()),
             trash,
         }
     }
@@ -64,19 +65,48 @@ impl Sink {
         }
     }
 
+    /// Depth of a node from the document root (the root itself is depth 0).
+    fn depth(&self, id: NodeId) -> usize {
+        let dom = self.dom.borrow();
+        let mut depth = 0;
+        let mut cursor = dom.parent(id);
+        while let Some(parent) = cursor {
+            depth += 1;
+            cursor = dom.parent(parent);
+        }
+        depth
+    }
+
+    /// Beyond the central nesting cap, content is degraded into the detached
+    /// trash node instead of growing the reachable tree: parsing continues, no
+    /// node is reachable past `MAX_NESTING_DEPTH`, and no recursive pass sees a
+    /// deeper tree (layout relies on the same 512-level bound).
+    fn capped(&self, id: NodeId) -> NodeId {
+        if self.depth(id) >= MAX_NESTING_DEPTH {
+            self.trash
+        } else {
+            id
+        }
+    }
+
     fn append_text(&self, parent: NodeId, text: Tendril<UTF8>) {
         let value = text.to_string();
+        let parent = self.capped(parent);
         let mut dom = self.dom.borrow_mut();
-        if let Some(last) = dom.children(parent).last().copied() {
-            if let Some(previous) = dom.text(last) {
-                let mut merged = String::with_capacity(previous.len() + value.len());
-                merged.push_str(previous);
-                merged.push_str(&value);
-                let new_id = dom.create(NodeKind::Text(merged));
-                dom.append(self.trash, last);
-                dom.append(parent, new_id);
-                return;
-            }
+        // Adjacent chunks share one Text node: detach the old slot (so its
+        // allocation is reused by `create`) instead of leaking it into trash.
+        // This keeps chunked parses at one node with the full text and cannot
+        // exhaust MAX_DOM_NODES through merge churn.
+        let merged = dom
+            .children(parent)
+            .last()
+            .copied()
+            .and_then(|last| dom.text(last).map(|prev| (last, format!("{prev}{value}"))));
+        if let Some((last, merged)) = merged {
+            dom.detach_subtree(last);
+            let id = dom.create(NodeKind::Text(merged));
+            dom.append(parent, id);
+            return;
         }
         let id = dom.create(NodeKind::Text(value));
         dom.append(parent, id);
@@ -131,7 +161,6 @@ impl TreeSink for Sink {
             .borrow_mut()
             .create(NodeKind::Element { tag, attrs });
         self.names.borrow_mut().insert(id, name.clone());
-        self.stack.borrow_mut().push(id);
 
         if is_template {
             let fragment = self.dom.borrow_mut().create(NodeKind::Element {
@@ -167,6 +196,7 @@ impl TreeSink for Sink {
             .get(parent)
             .copied()
             .unwrap_or(*parent);
+        let parent = self.capped(parent);
         match child {
             NodeOrText::AppendNode(id) => self.dom.borrow_mut().append(parent, id),
             NodeOrText::AppendText(text) => self.append_text(parent, text),
@@ -212,6 +242,7 @@ impl TreeSink for Sink {
         let Some(parent) = self.dom.borrow().parent(*sibling) else {
             return;
         };
+        let parent = self.capped(parent);
         let handle = match new_node {
             NodeOrText::AppendNode(id) => id,
             NodeOrText::AppendText(text) => self
@@ -236,9 +267,16 @@ impl TreeSink for Sink {
         self.reorder(parent, reordered);
     }
 
-    fn add_attrs_if_missing(&self, _target: &Self::Handle, _attrs: Vec<Attribute>) {
-        // The arena exposes no attribute mutation; the tree builder only uses this
-        // for duplicate <html>/<body> tags, which is rare in real documents.
+    fn add_attrs_if_missing(&self, target: &Self::Handle, attrs: Vec<Attribute>) {
+        // html5ever calls this for duplicate <html>/<body> tags: keep the first
+        // element but adopt attributes that were not present on it.
+        let mut dom = self.dom.borrow_mut();
+        for attr in attrs {
+            let name = attr.name.local.to_string();
+            if dom.attr(*target, &name).is_none() {
+                dom.set_attr(*target, &name, attr.value.to_string());
+            }
+        }
     }
 
     fn remove_from_parent(&self, target: &Self::Handle) {
@@ -246,15 +284,15 @@ impl TreeSink for Sink {
     }
 
     fn reparent_children(&self, node: &Self::Handle, new_parent: &Self::Handle) {
+        // Never lift nodes degraded into the detached trash back into the tree.
+        if *node == self.trash || *new_parent == self.trash {
+            return;
+        }
         let children: Vec<NodeId> = self.dom.borrow().children(*node).to_vec();
         let mut dom = self.dom.borrow_mut();
         for child in children {
             dom.append(*new_parent, child);
         }
-    }
-
-    fn pop(&self, _node: &Self::Handle) {
-        self.stack.borrow_mut().pop();
     }
 }
 
@@ -271,9 +309,8 @@ mod tests {
 
     fn find_tag(dom: &Dom, tag: &str) -> NodeId {
         let mut found = None;
-        dom.walk(|id, node| {
-            if found.is_none() && matches!(&node.kind, NodeKind::Element { tag: t, .. } if t == tag)
-            {
+        dom.walk(|id, _| {
+            if found.is_none() && dom.tag(id) == Some(tag) {
                 found = Some(id);
             }
         });
@@ -282,8 +319,8 @@ mod tests {
 
     fn all_tags(dom: &Dom, tag: &str) -> Vec<NodeId> {
         let mut found = Vec::new();
-        dom.walk(|id, node| {
-            if matches!(&node.kind, NodeKind::Element { tag: t, .. } if t == tag) {
+        dom.walk(|id, _| {
+            if dom.tag(id) == Some(tag) {
                 found.push(id);
             }
         });
@@ -292,11 +329,10 @@ mod tests {
 
     fn text_content(dom: &Dom, id: NodeId) -> String {
         fn collect(dom: &Dom, id: NodeId, out: &mut String) {
-            let node = dom.get(id);
-            if let NodeKind::Text(text) = &node.kind {
+            if let Some(text) = dom.text(id) {
                 out.push_str(text);
             }
-            for &child in &node.children {
+            for &child in dom.children(id) {
                 collect(dom, child, out);
             }
         }
@@ -311,6 +347,37 @@ mod tests {
                 assert_eq!(dom.parent(child), Some(id), "child parent link mismatch");
             }
         });
+    }
+
+    #[test]
+    fn helpers_read_interned_dom() {
+        // Mirror of the helper reads with per-node strings stripped: the pool
+        // must serve tag/attr/text reads identically to Dom::new() mode.
+        let mut dom = Dom::with_interning();
+        let root = dom.root();
+        let html = dom.create(NodeKind::Element {
+            tag: "html".into(),
+            attrs: Vec::new(),
+        });
+        let body = dom.create(NodeKind::Element {
+            tag: "body".into(),
+            attrs: vec![("class".into(), "c".into())],
+        });
+        let p = dom.create(NodeKind::Element {
+            tag: "p".into(),
+            attrs: Vec::new(),
+        });
+        let text = dom.create(NodeKind::Text("hi".into()));
+        dom.append(root, html);
+        dom.append(html, body);
+        dom.append(body, p);
+        dom.append(p, text);
+
+        assert_eq!(find_tag(&dom, "p"), p);
+        assert_eq!(all_tags(&dom, "body"), vec![body]);
+        assert_eq!(text_content(&dom, p), "hi");
+        assert_eq!(dom.tag(body), Some("body"));
+        assert_eq!(dom.attr(body, "class"), Some("c"));
     }
 
     #[test]
@@ -405,5 +472,61 @@ mod tests {
     fn utf8_input() {
         let dom = parse_document("<p>Привет 世界 🌍</p>");
         assert_eq!(text_content(&dom, find_tag(&dom, "p")), "Привет 世界 🌍");
+    }
+
+    #[test]
+    fn duplicate_body_attrs_are_kept_on_the_first_body() {
+        let dom = parse_document("<body><body class=\"x\" id=\"y\">text</body>");
+        let bodies = all_tags(&dom, "body");
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(dom.attr(bodies[0], "class"), Some("x"));
+        assert_eq!(dom.attr(bodies[0], "id"), Some("y"));
+        assert_eq!(text_content(&dom, bodies[0]), "text");
+        assert_sane(&dom);
+    }
+
+    #[test]
+    fn chunked_text_merges_into_one_node() {
+        let mut parser = html5ever::parse_document(Sink::default(), Default::default()).from_utf8();
+        for chunk in ["<p>Hel", "lo ", "world</p>"] {
+            parser.process(Tendril::from_slice(chunk.as_bytes()));
+        }
+        let dom = parser.finish();
+        let p = find_tag(&dom, "p");
+        let children = dom.children(p);
+        assert_eq!(
+            children.len(),
+            1,
+            "adjacent chunks must share one Text node"
+        );
+        assert_eq!(dom.text(children[0]), Some("Hello world"));
+        assert_sane(&dom);
+    }
+
+    #[test]
+    fn parser_caps_reachable_nesting_at_central_limit() {
+        let html = format!(
+            "{}x{}",
+            "<div>".repeat(MAX_NESTING_DEPTH + 88),
+            "</div>".repeat(MAX_NESTING_DEPTH + 88)
+        );
+        let dom = parse_document(&html);
+        let mut max_depth = 0;
+        let mut stack = vec![(dom.root(), 0usize)];
+        while let Some((id, depth)) = stack.pop() {
+            max_depth = max_depth.max(depth);
+            for &child in dom.children(id) {
+                stack.push((child, depth + 1));
+            }
+        }
+        assert!(
+            max_depth <= MAX_NESTING_DEPTH,
+            "reachable depth {max_depth} exceeds the cap of {MAX_NESTING_DEPTH}"
+        );
+        assert!(
+            max_depth >= MAX_NESTING_DEPTH - 4,
+            "the capped prefix must survive, got depth {max_depth}"
+        );
+        assert_sane(&dom);
     }
 }
