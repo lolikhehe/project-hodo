@@ -32,10 +32,19 @@ struct Sink {
     templates: RefCell<HashMap<NodeId, NodeId>>,
     /// Detached node used to take children out of their parent (Dom has no detach API).
     trash: NodeId,
+    /// Mirrors html5ever's TreeBuilderOpts::scripting_enabled: gates the
+    /// <noscript> display:none injection so scripting-off semantics render.
+    scripting_enabled: bool,
 }
 
 impl Default for Sink {
     fn default() -> Self {
+        Self::new(true)
+    }
+}
+
+impl Sink {
+    fn new(scripting_enabled: bool) -> Self {
         // Shell page parsing owns the hot DOM path; intern tag/attr strings so
         // repetitive documents pay per distinct string, not per element.
         let mut dom = Dom::with_interning();
@@ -48,11 +57,10 @@ impl Default for Sink {
             names: RefCell::new(HashMap::new()),
             templates: RefCell::new(HashMap::new()),
             trash,
+            scripting_enabled,
         }
     }
-}
 
-impl Sink {
     fn detach(&self, id: NodeId) {
         self.dom.borrow_mut().append(self.trash, id);
     }
@@ -156,11 +164,13 @@ impl TreeSink for Sink {
             .map(|attr| (attr.name.local.to_string(), attr.value.to_string()))
             .collect();
         let is_template = is_html && tag == "template";
-        // html5ever defaults to scripting_enabled=true, so <noscript> content
-        // arrives as raw text that would otherwise paint. Hide the subtree the
-        // same way hodo-shell hides <script>/<style>; an inline style outranks
-        // the UA and author sheets and every layout engine skips display:none.
-        if is_html && tag == "noscript" {
+        // With scripting enabled html5ever parses <noscript> content as raw
+        // text that would otherwise paint. Hide the subtree the same way
+        // hodo-shell hides <script>/<style>; an inline style outranks the UA
+        // and author sheets and every layout engine skips display:none. With
+        // scripting disabled the children are real elements: no hide, so they
+        // render normally.
+        if self.scripting_enabled && is_html && tag == "noscript" {
             if let Some((_, value)) = attrs.iter_mut().find(|(k, _)| k == "style") {
                 value.push_str(";display:none");
             } else {
@@ -307,9 +317,24 @@ impl TreeSink for Sink {
     }
 }
 
-/// Parse an HTML5 document into the arena DOM.
+/// Parse an HTML5 document into the arena DOM with scripting enabled.
+///
+/// Equivalent to `parse_document_with(true, html)`; existing callers are
+/// unchanged.
 pub fn parse_document(html: &str) -> Dom {
-    html5ever::parse_document(Sink::default(), Default::default())
+    parse_document_with(true, html)
+}
+
+/// Parse an HTML5 document into the arena DOM with an explicit scripting mode.
+///
+/// `scripting_enabled` is threaded into `html5ever::ParseOpts::tree_builder`
+/// (TreeBuilderOpts::scripting_enabled), which is what switches `<noscript>`
+/// content between raw text (enabled) and real child elements (disabled). The
+/// same flag gates the injected `display:none` in `create_element`.
+pub fn parse_document_with(scripting_enabled: bool, html: &str) -> Dom {
+    let mut opts = html5ever::ParseOpts::default();
+    opts.tree_builder.scripting_enabled = scripting_enabled;
+    html5ever::parse_document(Sink::new(scripting_enabled), opts)
         .from_utf8()
         .one(html.as_bytes())
 }
@@ -551,6 +576,30 @@ mod tests {
             style.contains("display:none"),
             "hide must be appended: {style}"
         );
+        assert_sane(&dom);
+    }
+
+    #[test]
+    fn noscript_children_are_real_elements_when_scripting_disabled() {
+        let dom = parse_document_with(false, "<noscript><h2>enable JS</h2></noscript><p>real</p>");
+        // No injected display:none: scripting-off content renders normally.
+        let noscript = find_tag(&dom, "noscript");
+        assert_eq!(dom.attr(noscript, "style"), None);
+        // html5ever parses the notice as a real element tree, not raw text.
+        let h2 = find_tag(&dom, "h2");
+        assert_eq!(text_content(&dom, h2), "enable JS");
+        assert_eq!(text_content(&dom, find_tag(&dom, "p")), "real");
+        assert_sane(&dom);
+    }
+
+    #[test]
+    fn noscript_is_hidden_raw_text_with_scripting_enabled_explicitly() {
+        let dom = parse_document_with(true, "<noscript><h2>enable JS</h2></noscript>");
+        let noscript = find_tag(&dom, "noscript");
+        assert_eq!(dom.attr(noscript, "style"), Some("display:none"));
+        // Raw text mode: no <h2> element is produced, only a text node.
+        assert!(all_tags(&dom, "h2").is_empty());
+        assert!(text_content(&dom, noscript).contains("enable JS"));
         assert_sane(&dom);
     }
 
