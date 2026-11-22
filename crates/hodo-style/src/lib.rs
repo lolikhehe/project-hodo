@@ -14,20 +14,22 @@
 //! is independent of thread scheduling.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 
 use hodo_css::{
-    complex, declaration_value, is_compound, is_important, matches_selector_ref,
-    parse_style_attribute, parse_stylesheet, specificity_ref, AncestorBloom, Compound, Declaration,
-    MatchContext, PseudoClass, RuleIndex, StyleRule, Stylesheet,
+    cascade_layer, complex, declaration_value, is_compound, is_important, matches_selector_ref,
+    parse_style_attribute, parse_stylesheet, resolve_custom_properties, specificity_ref,
+    substitute_vars, AncestorBloom, Compound, Declaration, MatchContext, PseudoClass, RuleIndex,
+    StyleRule, Stylesheet, LAYER_MARKER,
 };
 use hodo_dom::{Dom, NodeId, NodeKind};
 use hodo_types::{Color, Edges, Size};
 
-type OrderedRule<'a> = (u8, usize, &'a StyleRule);
-// (origin rank, specificity, source order, pre-split declaration references)
-type Match<'a> = (u8, (u32, u32, u32), usize, &'a [&'a Declaration]);
+// (origin, source order, rule, layer rank; u32::MAX = unlayered)
+type OrderedRule<'a> = (u8, usize, &'a StyleRule, u32);
+// (origin rank, layer rank, specificity, source order, declaration references)
+type Match<'a> = (u8, u32, (u32, u32, u32), usize, &'a [&'a Declaration]);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Display {
@@ -254,6 +256,13 @@ pub struct ComputedStyle {
     /// Per-side offsets; `None` means `auto`.
     pub offsets: Edges<Option<f32>>,
     pub width: Option<f32>,
+    /// Percentage width (`n` from `n%`), resolved against the containing
+    /// block's content width in layout. `width` is `None` when this is `Some`.
+    pub width_percent: Option<f32>,
+    /// Percentage components of margin/padding (`n` from `n%`), resolved
+    /// against the containing block's content width in layout.
+    pub margin_percent: Edges<Option<f32>>,
+    pub padding_percent: Edges<Option<f32>>,
     pub height: Option<f32>,
     pub min_size: Size,
     pub max_size: Size,
@@ -396,7 +405,7 @@ fn match_one(
     index.candidates(dom, id, candidates);
     let mut matched = Vec::new();
     for &candidate in candidates.iter() {
-        let Some(&(_, _, rule)) = ordered.get(candidate) else {
+        let Some(&(_, _, rule, _)) = ordered.get(candidate) else {
             continue;
         };
         if matches_selector_ref(&rule.selector, dom, id, &mut ctx) {
@@ -509,30 +518,33 @@ fn compute_styles_tracked_with(
     use_cache: bool,
     threads: usize,
 ) -> (StyleMap, SharingStats) {
-    // (origin, source order, rule); origin 0 = UA, 1 = author.
+    // (origin, source order, rule, layer); origin 0 = UA, 1 = author.
     let mut ordered: Vec<OrderedRule<'_>> = Vec::new();
     let mut order = 0;
     for rule in &ua.rules {
-        ordered.push((0, order, rule));
+        ordered.push((0, order, rule, u32::MAX));
         order += 1;
     }
     for sheet in sheets {
         for rule in &sheet.rules {
-            ordered.push((1, order, rule));
+            ordered.push((1, order, rule, cascade_layer(rule).unwrap_or(u32::MAX)));
             order += 1;
         }
     }
-    let index = RuleIndex::new(ordered.iter().map(|(_, _, rule)| *rule));
+    let index = RuleIndex::new(ordered.iter().map(|(_, _, rule, _)| *rule));
     let needs_bloom = ordered
         .iter()
-        .any(|(_, _, rule)| !is_compound(&rule.selector));
+        .any(|(_, _, rule, _)| !is_compound(&rule.selector));
     // Split declarations once per style pass, not once per element × rule.
     let prepared: Vec<(Vec<&Declaration>, Vec<&Declaration>)> = ordered
         .iter()
-        .map(|(_, _, rule)| {
+        .map(|(_, _, rule, _)| {
             let mut normal = Vec::new();
             let mut important = Vec::new();
             for declaration in &rule.declarations {
+                if declaration.property == LAYER_MARKER {
+                    continue;
+                }
                 if is_important(declaration) {
                     important.push(declaration);
                 } else {
@@ -564,27 +576,37 @@ fn compute_styles_tracked_with(
         None
     };
     let mut stats = SharingStats::default();
+    // Resolved custom properties ride alongside computed styles: they inherit
+    // and must not live in `ComputedStyle` (other crates construct it directly).
+    let mut custom: Vec<BTreeMap<String, String>> = vec![BTreeMap::new(); dom.len()];
     // Pre-order guarantees a node's parent is already resolved when it is visited.
     dom.walk(|id, node| {
+        let parent_custom = dom
+            .parent(id)
+            .map(|p| custom[p.slot() as usize].clone())
+            .unwrap_or_default();
         let parent = dom
             .parent(id)
             .and_then(|p| map.get(p).cloned())
             .unwrap_or_else(initial_style);
         match node.kind {
-            NodeKind::Text(_) => map.set(id, parent),
+            NodeKind::Text(_) => {
+                custom[id.slot() as usize] = parent_custom;
+                map.set(id, parent);
+            }
             NodeKind::Element { .. } => {
-                map.set(
+                let (style, vars) = cascade(
+                    dom,
                     id,
-                    cascade(
-                        dom,
-                        id,
-                        &mut rules,
-                        &mut matched[id.slot() as usize],
-                        &parent,
-                        cache.as_mut(),
-                        &mut stats,
-                    ),
+                    &mut rules,
+                    &mut matched[id.slot() as usize],
+                    &parent,
+                    &parent_custom,
+                    cache.as_mut(),
+                    &mut stats,
                 );
+                custom[id.slot() as usize] = vars;
+                map.set(id, style);
             }
             NodeKind::Document => {}
         }
@@ -603,6 +625,22 @@ fn rank(origin: u8, important: bool) -> u8 {
         (2, true) => 4,
         (0, true) => 5,
         _ => 1,
+    }
+}
+
+/// Layer rank inside one origin. Normal: unlayered wins, later layers beat
+/// earlier ones. `!important`: the order is inverted, unlayered is weakest.
+fn layer_key(layer: u32, important: bool) -> u32 {
+    if layer == u32::MAX {
+        if important {
+            0
+        } else {
+            u32::MAX
+        }
+    } else if important {
+        u32::MAX - layer
+    } else {
+        layer
     }
 }
 
@@ -655,6 +693,9 @@ fn initial_style() -> ComputedStyle {
         overflow: Overflow::Visible,
         offsets: Edges::zero(),
         width: None,
+        width_percent: None,
+        margin_percent: Edges::zero(),
+        padding_percent: Edges::zero(),
         height: None,
         min_size: Size { w: 0.0, h: 0.0 },
         max_size: Size {
@@ -705,8 +746,11 @@ fn hash_u64<T: Hash + ?Sized>(value: &T) -> u64 {
 /// Hash only the properties the cascade copies from the parent. Two children
 /// with the same inherited values and the same matched rule set produce a
 /// byte-for-byte identical `ComputedStyle` (assuming no inline declarations).
-fn hash_inherited(style: &ComputedStyle) -> u64 {
+fn hash_inherited(style: &ComputedStyle, custom: &BTreeMap<String, String>) -> u64 {
     let mut h = DefaultHasher::new();
+    // Custom properties inherit too: omitting them would let two elements with
+    // different --tokens reuse one computed style.
+    custom.hash(&mut h);
     (style.color.r, style.color.g, style.color.b, style.color.a).hash(&mut h);
     style.font_size.to_bits().hash(&mut h);
     style.font_weight.hash(&mut h);
@@ -737,7 +781,7 @@ fn hash_inherited(style: &ComputedStyle) -> u64 {
 /// Pure-std LRU: O(1) hits, O(capacity) eviction. `clock` gives each entry a
 /// monotonically increasing stamp; the smallest stamp is least recently used.
 struct SharingCache {
-    entries: HashMap<SharingKey, (u64, ComputedStyle)>,
+    entries: HashMap<SharingKey, (u64, ComputedStyle, BTreeMap<String, String>)>,
     clock: u64,
 }
 
@@ -749,15 +793,20 @@ impl SharingCache {
         }
     }
 
-    fn get(&mut self, key: &SharingKey) -> Option<ComputedStyle> {
+    fn get(&mut self, key: &SharingKey) -> Option<(ComputedStyle, BTreeMap<String, String>)> {
         self.clock += 1;
         let stamp = self.clock;
         let entry = self.entries.get_mut(key)?;
         entry.0 = stamp;
-        Some(entry.1.clone())
+        Some((entry.1.clone(), entry.2.clone()))
     }
 
-    fn insert(&mut self, key: SharingKey, style: &ComputedStyle) {
+    fn insert(
+        &mut self,
+        key: SharingKey,
+        style: &ComputedStyle,
+        custom: &BTreeMap<String, String>,
+    ) {
         self.clock += 1;
         let stamp = self.clock;
         if let Some(entry) = self.entries.get_mut(&key) {
@@ -768,13 +817,14 @@ impl SharingCache {
             let oldest = self
                 .entries
                 .iter()
-                .min_by_key(|(_, (s, _))| *s)
+                .min_by_key(|(_, (s, _, _))| *s)
                 .map(|(key, _)| *key);
             if let Some(oldest) = oldest {
                 self.entries.remove(&oldest);
             }
         }
-        self.entries.insert(key, (stamp, style.clone()));
+        self.entries
+            .insert(key, (stamp, style.clone(), custom.clone()));
     }
 }
 
@@ -795,7 +845,7 @@ fn compound_has_positional(compound: &Compound) -> bool {
 /// guard keeps the cache sound if the key is ever coarsened toward Servo's
 /// class-set-only both-hares trick.
 fn sheet_has_positional_pseudo(ordered: &[OrderedRule<'_>]) -> bool {
-    ordered.iter().any(|(_, _, rule)| {
+    ordered.iter().any(|(_, _, rule, _)| {
         complex(&rule.selector)
             .compounds
             .iter()
@@ -803,15 +853,17 @@ fn sheet_has_positional_pseudo(ordered: &[OrderedRule<'_>]) -> bool {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cascade(
     dom: &Dom,
     id: NodeId,
     rules: &mut CascadeRules<'_>,
     matched_ids: &mut Vec<usize>,
     parent: &ComputedStyle,
+    parent_custom: &BTreeMap<String, String>,
     mut cache: Option<&mut SharingCache>,
     stats: &mut SharingStats,
-) -> ComputedStyle {
+) -> (ComputedStyle, BTreeMap<String, String>) {
     let mut normal: Vec<Match<'_>> = Vec::new();
     let mut important: Vec<Match<'_>> = Vec::new();
     // Inline declarations are per-element and are never shared.
@@ -819,11 +871,12 @@ fn cascade(
     // Phase A already matched every candidate; only rule-order-independent
     // bookkeeping remains here (no re-matching, no context/sibling scans).
     for &candidate in matched_ids.iter() {
-        let (origin, order, rule) = rules.ordered[candidate];
+        let (origin, order, rule, layer) = rules.ordered[candidate];
         let specificity = specificity_ref(&rule.selector);
         if !rules.prepared[candidate].0.is_empty() {
             normal.push((
                 rank(origin, false),
+                layer_key(layer, false),
                 specificity,
                 order,
                 &rules.prepared[candidate].0,
@@ -832,6 +885,7 @@ fn cascade(
         if !rules.prepared[candidate].1.is_empty() {
             important.push((
                 rank(origin, true),
+                layer_key(layer, true),
                 specificity,
                 order,
                 &rules.prepared[candidate].1,
@@ -851,10 +905,22 @@ fn cascade(
             }
         }
         if !inline_normal.is_empty() {
-            normal.push((rank(2, false), (0, 0, 0), usize::MAX / 2, &inline_normal));
+            normal.push((
+                rank(2, false),
+                layer_key(u32::MAX, false),
+                (0, 0, 0),
+                usize::MAX / 2,
+                &inline_normal,
+            ));
         }
         if !inline_important.is_empty() {
-            important.push((rank(2, true), (0, 0, 0), usize::MAX / 2, &inline_important));
+            important.push((
+                rank(2, true),
+                layer_key(u32::MAX, true),
+                (0, 0, 0),
+                usize::MAX / 2,
+                &inline_important,
+            ));
         }
     }
     // Cache lookup. On a hit the rest of this function would produce an
@@ -869,12 +935,12 @@ fn cascade(
         let key = SharingKey {
             tag: hash_u64(&dom.tag(id).unwrap_or("")),
             matched: hash_u64(&*matched_ids),
-            parent: hash_inherited(parent),
+            parent: hash_inherited(parent, parent_custom),
         };
         match cache.as_mut().unwrap().get(&key) {
-            Some(style) => {
+            Some(hit) => {
                 stats.hits += 1;
-                return style;
+                return hit;
             }
             None => {
                 stats.misses += 1;
@@ -885,18 +951,40 @@ fn cascade(
         stats.excluded += 1;
         None
     };
-    // Stable sort: ties keep source order. Larger rank/specificity/order win last.
-    normal.sort_by_key(|m| (m.0, m.1, m.2));
-    important.sort_by_key(|m| (m.0, m.1, m.2));
+    // Stable sort: ties keep source order. Larger rank/layer/specificity/order win last.
+    normal.sort_by_key(|m| (m.0, m.1, m.2, m.3));
+    important.sort_by_key(|m| (m.0, m.1, m.2, m.3));
+
+    // First pass: the winning raw custom-property values. They inherit from the
+    // parent and may reference each other, so resolve them as a set before any
+    // ordinary declaration is substituted.
+    let mut raw_custom = parent_custom.clone();
+    for m in normal.iter().chain(&important) {
+        for decl in m.4 {
+            let property = decl.property.trim();
+            if property.starts_with("--") {
+                raw_custom.insert(property.to_string(), declaration_value(decl).to_string());
+            }
+        }
+    }
+    let resolved_custom = resolve_custom_properties(&raw_custom);
 
     // Last declaration for each property wins after the cascade sort. Edge
     // shorthands are expanded to their four longhands as we walk in cascade
     // order, so a later longhand (or a later shorthand) wins by source order.
+    // `var()` is substituted on the raw value *before* shorthand parsing; an
+    // unresolved reference makes that declaration invalid and drops it.
     let mut winning: HashMap<String, String> = HashMap::new();
     for m in normal.iter().chain(&important) {
-        for decl in m.3 {
-            let property = decl.property.trim().to_ascii_lowercase();
-            let value = declaration_value(decl).to_string();
+        for decl in m.4 {
+            let trimmed = decl.property.trim();
+            if trimmed.starts_with("--") {
+                continue;
+            }
+            let property = trimmed.to_ascii_lowercase();
+            let Some(value) = substitute_vars(declaration_value(decl), &resolved_custom) else {
+                continue;
+            };
             if property == "border" {
                 expand_border_shorthand(&value, &mut winning);
                 continue;
@@ -1099,7 +1187,13 @@ fn cascade(
                 style.offsets.left,
                 parse_optional_length(value, style.font_size)
             ),
-            "width" => set!(style.width, parse_optional_length(value, style.font_size)),
+            "width" => {
+                // A percentage has no parse-time basis: keep the raw number for
+                // layout to resolve against the containing block's content box.
+                let (abs, pct) = parse_length_or_percent(value, style.font_size);
+                style.width = abs;
+                style.width_percent = pct;
+            }
             "height" => set!(style.height, parse_optional_length(value, style.font_size)),
             "min-width" => set!(style.min_size.w, parse_length(value, style.font_size)),
             "min-height" => set!(style.min_size.h, parse_length(value, style.font_size)),
@@ -1110,10 +1204,23 @@ fn cascade(
     }
 
     // Per-side lengths resolve against the element's own (now final) font size.
-    apply_edges(&mut style.margin, &winning, MARGIN_KEYS, style.font_size);
-    apply_edges(&mut style.padding, &winning, PADDING_KEYS, style.font_size);
+    apply_edges(
+        &mut style.margin,
+        Some(&mut style.margin_percent),
+        &winning,
+        MARGIN_KEYS,
+        style.font_size,
+    );
+    apply_edges(
+        &mut style.padding,
+        Some(&mut style.padding_percent),
+        &winning,
+        PADDING_KEYS,
+        style.font_size,
+    );
     apply_edges(
         &mut style.border_widths,
+        None,
         &winning,
         BORDER_WIDTH_KEYS,
         style.font_size,
@@ -1125,10 +1232,13 @@ fn cascade(
         style.border_color = v;
     }
     if let Some(key) = shared_key {
-        cache.as_mut().unwrap().insert(key, &style);
+        cache
+            .as_mut()
+            .unwrap()
+            .insert(key, &style, &resolved_custom);
         stats.inserted += 1;
     }
-    style
+    (style, resolved_custom)
 }
 
 fn parse_f32(value: &str) -> Option<f32> {
@@ -1428,6 +1538,17 @@ fn parse_optional_length(value: &str, font_size: f32) -> Option<Option<f32>> {
     parse_length(value, font_size).map(Some)
 }
 
+/// Split a declaration into an absolute length and a raw percentage. Exactly
+/// one side is `Some` for a valid length/percentage value. Percentages carry no
+/// basis here: layout resolves them against the containing block's content box.
+fn parse_length_or_percent(value: &str, font_size: f32) -> (Option<f32>, Option<f32>) {
+    let value = value.trim();
+    if let Some(n) = value.strip_suffix('%') {
+        return (None, n.trim().parse::<f32>().ok().filter(|n| n.is_finite()));
+    }
+    (parse_length(value, font_size), None)
+}
+
 /// Resolve a length or percentage into a single f32. `pct_scale` is 1.0 for
 /// properties that keep the raw number, or font_size / 100 for line-height.
 fn parse_length_pct(value: &str, font_size: f32, pct_scale: f32) -> Option<f32> {
@@ -1579,21 +1700,37 @@ fn edge_shorthand_parts(value: &str) -> Option<[&str; 4]> {
 
 fn apply_edges(
     target: &mut Edges<f32>,
+    mut percent: Option<&mut Edges<Option<f32>>>,
     winning: &HashMap<String, String>,
     keys: [&str; 4],
     font_size: f32,
 ) {
-    let side = |key: &str, current: f32| {
-        winning
-            .get(key)
-            .and_then(|v| parse_length(v, font_size))
-            .unwrap_or(current)
+    let mut side = |i: usize, current: f32| {
+        let Some(value) = winning.get(keys[i]) else {
+            return current;
+        };
+        let (abs, pct) = parse_length_or_percent(value, font_size);
+        if let Some(p) = pct {
+            if let Some(percent) = percent.as_deref_mut() {
+                match i {
+                    0 => percent.top = Some(p),
+                    1 => percent.right = Some(p),
+                    2 => percent.bottom = Some(p),
+                    _ => percent.left = Some(p),
+                }
+            }
+        }
+        abs.unwrap_or(current)
     };
+    let t = side(0, target.top);
+    let r = side(1, target.right);
+    let b = side(2, target.bottom);
+    let l = side(3, target.left);
     *target = Edges {
-        top: side(keys[0], target.top),
-        right: side(keys[1], target.right),
-        bottom: side(keys[2], target.bottom),
-        left: side(keys[3], target.left),
+        top: t,
+        right: r,
+        bottom: b,
+        left: l,
     };
 }
 
@@ -2094,6 +2231,127 @@ mod tests {
         assert_eq!(map.get(id).unwrap().color, Color::rgb(0, 0, 255));
     }
 
+    // --- @layer + custom properties ---------------------------------------
+
+    #[test]
+    fn unlayered_beats_layered_and_later_layer_wins() {
+        let (_, _, s) = css_style("@layer base { div { color: red } } div { color: blue }");
+        assert_eq!(s.color, Color::rgb(0, 0, 255));
+
+        let (_, _, s) =
+            css_style("@layer a { div { color: red } } @layer b { div { color: blue } }");
+        assert_eq!(s.color, Color::rgb(0, 0, 255));
+    }
+
+    #[test]
+    fn specificity_breaks_ties_within_a_layer_not_across_layers() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let id = element(&mut dom, root, "div", &[("id", "target")]);
+
+        // Within one layer, specificity still beats source order.
+        let sheets = [sheet(
+            "@layer early { div { color: blue } #target { color: red } }",
+        )];
+        let map = compute_styles(&dom, &sheets);
+        assert_eq!(map.get(id).unwrap().color, Color::rgb(255, 0, 0));
+
+        // Across layers, layer order outranks specificity (spec cascade order).
+        let sheets = [sheet(
+            "@layer early { #target { color: red } } @layer late { div { color: blue } }",
+        )];
+        let map = compute_styles(&dom, &sheets);
+        assert_eq!(map.get(id).unwrap().color, Color::rgb(0, 0, 255));
+    }
+
+    #[test]
+    fn important_inverts_layer_order() {
+        let (_, _, s) = css_style(
+            "@layer a { div { color: red !important } } \
+             @layer b { div { color: blue !important } }",
+        );
+        assert_eq!(s.color, Color::rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn layer_and_media_wrappers_compose() {
+        let (_, _, s) = css_style("@layer base { @media screen { div { color: red } } }");
+        assert_eq!(s.color, Color::rgb(255, 0, 0));
+
+        let (_, _, s) = css_style("@media screen { @layer base { div { color: green } } }");
+        assert_eq!(s.color, Color::rgb(0, 128, 0));
+
+        let (_, _, s) =
+            css_style("@layer base { @media print { div { color: red } } } div { color: blue }");
+        assert_eq!(s.color, Color::rgb(0, 0, 255));
+    }
+
+    #[test]
+    fn custom_property_inherits_and_substitutes() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let parent = element(&mut dom, root, "div", &[]);
+        let child = element(&mut dom, parent, "span", &[]);
+        let sheets = [sheet("div { --brand: red } span { color: var(--brand) }")];
+        let map = compute_styles(&dom, &sheets);
+        assert_eq!(map.get(child).unwrap().color, Color::rgb(255, 0, 0));
+
+        let sheets = [sheet("div { --brand: blue } span { color: var(--brand) }")];
+        let map = compute_styles(&dom, &sheets);
+        assert_eq!(map.get(child).unwrap().color, Color::rgb(0, 0, 255));
+    }
+
+    #[test]
+    fn var_fallback_and_guaranteed_invalid_drop() {
+        let (_, _, fallback) = css_style("div { color: var(--missing, green) }");
+        assert_eq!(fallback.color, Color::rgb(0, 128, 0));
+
+        let (_, _, dropped) = css_style("div { color: var(--missing) }");
+        assert_eq!(dropped.color, Color::BLACK);
+    }
+
+    #[test]
+    fn var_works_in_shorthand_values() {
+        let (_, _, s) = css_style("div { --w: 3px; border: var(--w) solid red }");
+        assert_eq!(s.border_widths.top, 3.0);
+        assert_eq!(s.border_color, Color::rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn custom_property_cycle_drops_all_involved() {
+        let (_, _, with_fallback) =
+            css_style("div { --a: var(--b); --b: var(--a); color: var(--a, green) }");
+        assert_eq!(with_fallback.color, Color::rgb(0, 128, 0));
+
+        let (_, _, invalid) = css_style("div { --a: var(--b); --b: var(--a); color: var(--a) }");
+        assert_eq!(invalid.color, Color::BLACK);
+    }
+
+    #[test]
+    fn inherited_custom_tokens_are_part_of_the_sharing_key() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let a = element(&mut dom, root, "div", &[("class", "pa")]);
+        let b = element(&mut dom, root, "div", &[("class", "pb")]);
+        let ca = element(&mut dom, a, "span", &[("class", "child")]);
+        let cb = element(&mut dom, b, "span", &[("class", "child")]);
+        let sheets = [sheet(
+            ".pa { --token: red } .pb { --token: blue } .child { color: var(--token) }",
+        )];
+        let cached = compute_styles(&dom, &sheets);
+        let uncached = compute_styles_uncached(&dom, &sheets);
+        assert_eq!(cached.get(ca).unwrap().color, Color::rgb(255, 0, 0));
+        assert_eq!(cached.get(cb).unwrap().color, Color::rgb(0, 0, 255));
+        assert_eq!(
+            cached.get(ca).unwrap().color,
+            uncached.get(ca).unwrap().color
+        );
+        assert_eq!(
+            cached.get(cb).unwrap().color,
+            uncached.get(cb).unwrap().color
+        );
+    }
+
     #[test]
     fn font_family_parses_and_survives_cascade() {
         let (_, _, stack) = css_style("div { font-family: Verdana, sans-serif }");
@@ -2154,6 +2412,25 @@ mod tests {
         // Unknown unit keeps the existing fallback path (no padding).
         let map = compute_styles(&dom, &[parse_stylesheet_with(vp, "div { padding: 10vi }")]);
         assert_eq!(map.get(id).unwrap().padding.top, 0.0);
+    }
+
+    #[test]
+    fn calc_lengths_reach_the_cascade_output() {
+        let (dom, id) = one_element("div");
+        for (css, expected) in [
+            ("div { padding: calc(25vh - 8px) }", 192.0),
+            ("div { padding: calc(2*(10px+5px)) }", 30.0),
+            ("div { width: calc(100px + 20px) }", 120.0),
+            ("div { padding: calc(1px / 0) }", 0.0),
+        ] {
+            let map = compute_styles(&dom, &[sheet(css)]);
+            let style = map.get(id).unwrap();
+            if css.contains("width") {
+                assert_eq!(style.width, Some(expected), "css {css}");
+            } else {
+                assert_eq!(style.padding.top, expected, "css {css}");
+            }
+        }
     }
 
     #[test]

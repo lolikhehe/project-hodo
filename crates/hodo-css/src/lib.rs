@@ -7,7 +7,7 @@
 //! longest allowed descendant selector completes in well under the 1 s budget
 //! asserted in tests. An invalid selector drops only its own rule.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 
 use cssparser::{Delimiter, ParseError, Parser, ToCss, Token};
@@ -22,6 +22,13 @@ pub const MAX_NOT_DEPTH: u8 = 2;
 /// that table value bounds the global rule index, while this per-sheet parse
 /// cap stays local until the two budgets are reconciled.
 pub const MAX_RULES: usize = 10_000;
+/// Nested-parenthesis cap inside `calc()` expressions.
+const MAX_CALC_DEPTH: u8 = 4;
+/// `em`/`rem` inside `calc()` resolve at parse time, where no element font-size
+/// context exists. TODO: thread the computed font size and use it here.
+const CALC_FALLBACK_FONT_PX: f64 = 16.0;
+/// Rendered device scale: one CSS pixel per device pixel.
+const DEVICE_DPPX: f64 = 1.0;
 
 #[derive(Debug, Clone)]
 pub struct Stylesheet {
@@ -32,7 +39,7 @@ pub struct Stylesheet {
 /// viewport units (`vh`/`vw`/`vmin`/`vmax`) resolve against while parsing.
 /// `parse_stylesheet` uses [`Viewport::default`]; callers with a real window
 /// should pass theirs through [`parse_stylesheet_with`]. Lengths resolve at
-/// parse time into fixed `px` text (see [`resolve_viewport_lengths`]); a resize
+/// parse time into fixed `px` text (see [`resolve_lengths`]); a resize
 /// mid-session does not re-resolve already-parsed declarations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Viewport {
@@ -41,6 +48,9 @@ pub struct Viewport {
     pub media_type: MediaType,
     /// Reserved for a future `scripting` feature; wave-1 queries ignore it.
     pub scripting_enabled: bool,
+    /// Shell integrators thread the chrome dark-theme flag here so
+    /// `prefers-color-scheme` matches the visible theme; default is light.
+    pub dark: bool,
 }
 
 impl Default for Viewport {
@@ -50,6 +60,7 @@ impl Default for Viewport {
             height: 800,
             media_type: MediaType::Screen,
             scripting_enabled: true,
+            dark: false,
         }
     }
 }
@@ -85,6 +96,20 @@ pub struct Declaration {
     /// Value text; a trailing `! important` is retained and interpreted by
     /// [`is_important`] / [`declaration_value`].
     pub value: String,
+}
+
+/// Synthetic declaration property carrying a rule's cascade-layer rank. Kept
+/// in `Declaration` so the public `StyleRule` shape stays stable for the other
+/// crates that build rules by hand; `hodo-style` reads it via [`cascade_layer`]
+/// and skips it when cascading.
+pub const LAYER_MARKER: &str = "\0hodo-layer";
+
+/// Cascade-layer rank of a rule (`None` = unlayered), recorded at parse time.
+pub fn cascade_layer(rule: &StyleRule) -> Option<u32> {
+    rule.declarations
+        .iter()
+        .find(|decl| decl.property == LAYER_MARKER)
+        .and_then(|decl| decl.value.parse().ok())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +238,36 @@ impl WarnOnce {
     }
 }
 
+/// First-seen `@layer` order for one stylesheet parse. Each name gets a stable
+/// rank; rules carry it in a synthetic declaration so the public rule shape
+/// stays unchanged. Ranks restart per sheet, so two sheets declaring the same
+/// layer name tie and fall back to source order this wave.
+#[derive(Default)]
+struct LayerOrder {
+    names: Vec<String>,
+}
+
+impl LayerOrder {
+    fn rank(&mut self, name: &str) -> u32 {
+        if let Some(index) = self.names.iter().position(|n| n == name) {
+            index as u32
+        } else {
+            let index = self.names.len() as u32;
+            self.names.push(name.to_string());
+            index
+        }
+    }
+}
+
+fn layer_names(prelude: &str) -> Vec<String> {
+    prelude
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Parse a stylesheet with the default viewport (1200x800, `screen`,
 /// scripting enabled). Invalid selectors drop only their own rule; at-rules
 /// and malformed declarations recover as before.
@@ -222,12 +277,22 @@ pub fn parse_stylesheet(css: &str) -> Stylesheet {
 
 /// Parse a stylesheet, evaluating `@media` / `@supports` against `viewport`.
 /// Inner rules are kept only for matching conditions; unsupported conditions
-/// are dropped with a single warning per stylesheet.
+/// are dropped with a single warning per stylesheet. `@layer` both establishes
+/// order (statement form) and tags its inner rules (block form).
 pub fn parse_stylesheet_with(viewport: Viewport, css: &str) -> Stylesheet {
     let mut parser = Parser::new(css);
     let mut rules = Vec::new();
     let mut warn = WarnOnce::default();
-    parse_rules(&mut parser, viewport, &mut warn, &mut rules, 0);
+    let mut layers = LayerOrder::default();
+    parse_rules(
+        &mut parser,
+        viewport,
+        &mut warn,
+        &mut rules,
+        0,
+        None,
+        &mut layers,
+    );
     Stylesheet { rules }
 }
 
@@ -237,6 +302,8 @@ fn parse_rules(
     warn: &mut WarnOnce,
     rules: &mut Vec<StyleRule>,
     depth: u8,
+    layer: Option<u32>,
+    layers: &mut LayerOrder,
 ) {
     loop {
         let state = parser.state();
@@ -244,13 +311,21 @@ fn parse_rules(
             Ok(Token::CDO | Token::CDC | Token::Semicolon) => continue,
             Ok(Token::AtKeyword(name)) => {
                 let name = name.to_string();
-                parse_at_rule(parser, &name, viewport, warn, rules, depth);
+                parse_at_rule(parser, &name, viewport, warn, rules, depth, layer, layers);
             }
             Ok(Token::CurlyBracketBlock) => {}
             Ok(_) => {
                 parser.reset(&state);
-                if let Some(parsed) = parse_qualified_rule(parser, viewport) {
-                    rules.extend(parsed);
+                if let Some(parsed) = parse_qualified_rule(parser, viewport, warn) {
+                    rules.extend(parsed.into_iter().map(|mut rule| {
+                        if let Some(rank) = layer {
+                            rule.declarations.push(Declaration {
+                                property: LAYER_MARKER.into(),
+                                value: rank.to_string(),
+                            });
+                        }
+                        rule
+                    }));
                 }
             }
             Err(_) => break,
@@ -262,6 +337,7 @@ fn parse_rules(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_at_rule(
     parser: &mut Parser<'_>,
     name: &str,
@@ -269,6 +345,8 @@ fn parse_at_rule(
     warn: &mut WarnOnce,
     rules: &mut Vec<StyleRule>,
     depth: u8,
+    layer: Option<u32>,
+    layers: &mut LayerOrder,
 ) {
     let prelude = parser
         .parse_until_before(Delimiter::CurlyBracketBlock | Delimiter::Semicolon, |p| {
@@ -276,6 +354,7 @@ fn parse_at_rule(
         })
         .unwrap_or_default();
     let is_block = matches!(parser.next(), Ok(Token::CurlyBracketBlock));
+    let mut inner_layer = layer;
     let applies = match name.to_ascii_lowercase().as_str() {
         "media" => media_applies(&prelude, viewport, warn),
         "supports" => supports_applies(&prelude, warn),
@@ -284,10 +363,21 @@ fn parse_at_rule(
             false
         }
         "layer" => {
-            // Layers are parsed and diagnosed, but their cascade layer is not
-            // modelled yet: inner rules stay dropped this wave.
-            warn.note("@layer ignored (cascade layers unsupported; inner rules dropped)");
-            false
+            let names = layer_names(&prelude);
+            if is_block {
+                // One layer per block this wave; comma lists use the first name.
+                let name = names
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| format!("\0anon:{}", layers.names.len()));
+                inner_layer = Some(layers.rank(&name));
+                true
+            } else {
+                for name in names {
+                    layers.rank(&name);
+                }
+                false
+            }
         }
         // @font-face, @keyframes, @page, @charset etc. keep the old skip path.
         _ => false,
@@ -298,35 +388,38 @@ fn parse_at_rule(
     // Consume the block whether or not it matches, so recovery stays intact.
     let _ = parser.parse_nested_block(|p| {
         if applies && depth < MAX_AT_RULE_DEPTH {
-            parse_rules(p, viewport, warn, rules, depth + 1);
+            parse_rules(p, viewport, warn, rules, depth + 1, inner_layer, layers);
         }
         Ok::<_, ParseError<()>>(())
     });
 }
 
-/// Split a query into whitespace-separated items, keeping each `(...)` as one
-/// item. Nested parentheses are rejected as unsupported (safe default).
+/// Split a query into whitespace-separated items, keeping each balanced
+/// `(...)` (including nested parentheses) as one item.
 fn query_items(query: &str) -> Option<Vec<String>> {
     let mut items = Vec::new();
     let mut current = String::new();
-    let mut in_condition = false;
+    let mut depth = 0u8;
     for ch in query.trim().chars() {
         match ch {
-            '(' if in_condition => return None,
             '(' => {
-                if !current.is_empty() {
+                if depth == 0 && !current.is_empty() {
                     items.push(std::mem::take(&mut current));
                 }
+                depth += 1;
+                if depth > MAX_CALC_DEPTH {
+                    return None;
+                }
                 current.push(ch);
-                in_condition = true;
             }
-            ')' if !in_condition => return None,
             ')' => {
+                depth = depth.checked_sub(1)?;
                 current.push(ch);
-                items.push(std::mem::take(&mut current));
-                in_condition = false;
+                if depth == 0 {
+                    items.push(std::mem::take(&mut current));
+                }
             }
-            ch if ch.is_whitespace() && !in_condition => {
+            ch if ch.is_whitespace() && depth == 0 => {
                 if !current.is_empty() {
                     items.push(std::mem::take(&mut current));
                 }
@@ -334,7 +427,7 @@ fn query_items(query: &str) -> Option<Vec<String>> {
             ch => current.push(ch),
         }
     }
-    if in_condition {
+    if depth != 0 {
         return None;
     }
     if !current.is_empty() {
@@ -343,57 +436,191 @@ fn query_items(query: &str) -> Option<Vec<String>> {
     Some(items)
 }
 
+/// True when `or` starts at byte `i` as a standalone keyword outside parens.
+fn is_or_keyword(query: &str, i: usize) -> bool {
+    let rest = &query[i..];
+    if !rest
+        .get(..2)
+        .is_some_and(|word| word.eq_ignore_ascii_case("or"))
+    {
+        return false;
+    }
+    let word_char = |ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_');
+    query[..i].chars().last().is_none_or(|ch| !word_char(ch))
+        && rest
+            .get(2..)
+            .and_then(|tail| tail.chars().next())
+            .is_none_or(|ch| !word_char(ch))
+}
+
+/// Strip one pair of parentheses wrapping the whole condition.
+fn strip_wrapper(query: &str) -> Option<&str> {
+    let mut depth = 0i32;
+    for (i, ch) in query.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return (i + 1 == query.len()).then(|| &query[1..i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Split a media prelude on top-level commas (OR). Commas inside feature
+/// parentheses or quoted strings are data, not alternatives.
+fn split_media_query(query: &str) -> Option<Vec<&str>> {
+    let mut parts = Vec::new();
+    let mut depth = 0u8;
+    let mut quote = None;
+    let mut start = 0;
+    for (i, ch) in query.char_indices() {
+        match ch {
+            '\'' | '"' if quote.is_none() => quote = Some(ch),
+            q if quote == Some(q) => quote = None,
+            '(' if quote.is_none() => {
+                depth += 1;
+                if depth > MAX_CALC_DEPTH {
+                    return None;
+                }
+            }
+            ')' if quote.is_none() => depth = depth.checked_sub(1)?,
+            ',' if quote.is_none() && depth == 0 => {
+                parts.push(query[start..i].trim());
+                start = i + 1;
+            }
+            'o' | 'O' if quote.is_none() && depth == 0 && is_or_keyword(query, i) => {
+                parts.push(query[start..i].trim());
+                start = i + 2;
+            }
+            _ => {}
+        }
+    }
+    parts.push(query[start..].trim());
+    Some(parts)
+}
+
 fn media_applies(query: &str, viewport: Viewport, warn: &mut WarnOnce) -> bool {
-    let Some(mut items) = query_items(query) else {
+    let Some(alternatives) = split_media_query(query) else {
         warn.note("@media condition unsupported (safe default: rules dropped)");
         return false;
     };
-    if items.is_empty() {
-        warn.note("@media condition unsupported (safe default: rules dropped)");
-        return false;
+    let mut matched = false;
+    let mut saw_unsupported = false;
+    for alternative in alternatives {
+        if alternative.is_empty() {
+            saw_unsupported = true;
+            continue;
+        }
+        match media_condition_matches(alternative, viewport) {
+            Some(true) => matched = true,
+            Some(false) => {}
+            None => saw_unsupported = true,
+        }
     }
-    // Legacy `only` qualifier is a no-op; `not`, comma lists and `or` are
-    // deliberately unsupported and fall through to the non-matching path.
-    if items[0].eq_ignore_ascii_case("only") {
+    if saw_unsupported {
+        warn.note("@media condition unsupported (safe default: rules dropped)");
+    }
+    matched
+}
+
+/// Evaluate one comma-separated media alternative. `not` inverts the whole
+/// alternative; the legacy `only` qualifier is a no-op.
+fn media_condition_matches(query: &str, viewport: Viewport) -> Option<bool> {
+    let mut query = query.trim();
+    for _ in 0..MAX_CALC_DEPTH {
+        match strip_wrapper(query) {
+            Some(inner) if inner.trim_start().starts_with('(') => query = inner.trim(),
+            _ => break,
+        }
+    }
+    let mut items = query_items(query)?;
+    if items.is_empty() {
+        return None;
+    }
+    let invert = items[0].eq_ignore_ascii_case("not");
+    if invert {
         items.remove(0);
     }
+    if items
+        .first()
+        .is_some_and(|item| item.eq_ignore_ascii_case("only"))
+    {
+        items.remove(0);
+    }
+    if items.is_empty() {
+        return None;
+    }
     let mut index = 0;
-    if let Some(first) = items.first() {
-        if !first.starts_with('(') {
-            match first.to_ascii_lowercase().as_str() {
-                "screen" if viewport.media_type != MediaType::Screen => return false,
-                "print" if viewport.media_type != MediaType::Print => return false,
-                "screen" | "print" | "all" => {}
-                _ => {
-                    warn.note("@media condition unsupported (safe default: rules dropped)");
-                    return false;
-                }
-            }
-            index = 1;
-        }
+    let mut matched = true;
+    if !items[0].starts_with('(') {
+        matched = match items[0].to_ascii_lowercase().as_str() {
+            "screen" => viewport.media_type == MediaType::Screen,
+            "print" => viewport.media_type == MediaType::Print,
+            "all" => true,
+            _ => return None,
+        };
+        index = 1;
     }
     while index < items.len() {
         if items[index].eq_ignore_ascii_case("and") {
             index += 1;
             continue;
         }
-        let Some(matched) = feature_matches(&items[index], viewport) else {
-            warn.note("@media condition unsupported (safe default: rules dropped)");
-            return false;
-        };
-        if !matched {
-            return false;
-        }
+        matched &= feature_matches(&items[index], viewport)?;
         index += 1;
     }
-    true
+    Some(if invert { !matched } else { matched })
 }
 
 fn feature_matches(item: &str, viewport: Viewport) -> Option<bool> {
-    let inner = item.strip_prefix('(')?.strip_suffix(')')?;
+    let inner = item.strip_prefix('(')?.strip_suffix(')')?.trim();
+    // MQ4 range syntax: `(width>=48rem)`, `(height<=500px)`, `(width=1px)`.
+    if let Some(split) = inner.find(['<', '>', '=']) {
+        let name = &inner[..split];
+        let tail = &inner[split..];
+        let (op, value) = if let Some(rest) = tail.strip_prefix(">=") {
+            (">=", rest)
+        } else if let Some(rest) = tail.strip_prefix("<=") {
+            ("<=", rest)
+        } else if let Some(rest) = tail.strip_prefix('>') {
+            (">", rest)
+        } else if let Some(rest) = tail.strip_prefix('<') {
+            ("<", rest)
+        } else {
+            ("=", tail.strip_prefix('=')?)
+        };
+        let actual = match name.trim().to_ascii_lowercase().as_str() {
+            "width" => f64::from(viewport.width),
+            "height" => f64::from(viewport.height),
+            _ => return None,
+        };
+        let target = media_length(value, viewport)?;
+        return Some(match op {
+            ">=" => actual >= target,
+            "<=" => actual <= target,
+            ">" => actual > target,
+            "<" => actual < target,
+            "=" => actual == target,
+            _ => return None,
+        });
+    }
+    // Boolean form: `(prefers-reduced-motion)` means "not no-preference".
+    if !inner.contains(':') {
+        return match inner.to_ascii_lowercase().as_str() {
+            "prefers-reduced-motion" | "pointer" => Some(true),
+            "hover" | "forced-colors" => Some(false),
+            _ => None,
+        };
+    }
     let (feature, value) = inner.split_once(':')?;
     let value = value.trim();
-    match feature.trim().to_ascii_lowercase().as_str() {
+    let feature = feature.trim().to_ascii_lowercase();
+    match feature.as_str() {
         "min-width" => Some(px_value(value)? <= f64::from(viewport.width)),
         "max-width" => Some(px_value(value)? >= f64::from(viewport.width)),
         "min-height" => Some(px_value(value)? <= f64::from(viewport.height)),
@@ -401,6 +628,39 @@ fn feature_matches(item: &str, viewport: Viewport) -> Option<bool> {
         "orientation" => match value.to_ascii_lowercase().as_str() {
             "landscape" => Some(viewport.width >= viewport.height),
             "portrait" => Some(viewport.width < viewport.height),
+            _ => None,
+        },
+        // Static render: no hover-capable pointer and no theme tracking beyond
+        // the shell's dark flag.
+        "hover" => match value.to_ascii_lowercase().as_str() {
+            "none" => Some(true),
+            "hover" => Some(false),
+            _ => None,
+        },
+        "prefers-color-scheme" => match value.to_ascii_lowercase().as_str() {
+            "dark" => Some(viewport.dark),
+            "light" => Some(!viewport.dark),
+            _ => None,
+        },
+        "min-resolution" => Some(dppx_value(value)? <= DEVICE_DPPX),
+        "max-resolution" => Some(dppx_value(value)? >= DEVICE_DPPX),
+        "-webkit-min-device-pixel-ratio"
+        | "-moz-min-device-pixel-ratio"
+        | "min-device-pixel-ratio" => Some(dppx_value(value)? <= DEVICE_DPPX),
+        // Static render: no animation preference, no forced colors, fine pointer.
+        "prefers-reduced-motion" => match value.to_ascii_lowercase().as_str() {
+            "no-preference" => Some(true),
+            "reduce" => Some(false),
+            _ => None,
+        },
+        "forced-colors" => match value.to_ascii_lowercase().as_str() {
+            "none" => Some(true),
+            "active" => Some(false),
+            _ => None,
+        },
+        "pointer" => match value.to_ascii_lowercase().as_str() {
+            "fine" => Some(true),
+            "coarse" | "none" => Some(false),
             _ => None,
         },
         _ => None,
@@ -411,11 +671,58 @@ fn px_value(value: &str) -> Option<f64> {
     value.strip_suffix("px")?.trim().parse().ok()
 }
 
+/// Length in a media-range feature. `rem`/`em` use the same parse-time 16px
+/// fallback as `calc()`; the media context has no element font size either.
+fn media_length(value: &str, viewport: Viewport) -> Option<f64> {
+    let mut value = value.trim().to_string();
+    if value.contains("calc(") {
+        value = resolve_calcs(&value, viewport).ok()?;
+    }
+    let value = value.trim();
+    let number = if let Some(n) = value
+        .strip_suffix("rem")
+        .or_else(|| value.strip_suffix("em"))
+    {
+        n.trim().parse::<f64>().ok()? * CALC_FALLBACK_FONT_PX
+    } else if let Some(n) = value.strip_suffix("px") {
+        n.trim().parse::<f64>().ok()?
+    } else {
+        value.parse::<f64>().ok()?
+    };
+    number.is_finite().then_some(number)
+}
+
+/// Device-pixel ratio: bare numbers, `dppx` and `dpi` (96 per dppx) are
+/// accepted so vendor-prefixed aliases share one evaluation path.
+fn dppx_value(value: &str) -> Option<f64> {
+    let value = value.trim();
+    let ratio = if let Some(n) = value.strip_suffix("dppx") {
+        n.trim().parse::<f64>().ok()?
+    } else if let Some(n) = value.strip_suffix("dpi") {
+        n.trim().parse::<f64>().ok()? / 96.0
+    } else {
+        value.parse::<f64>().ok()?
+    };
+    ratio.is_finite().then_some(ratio)
+}
+
 fn supports_applies(condition: &str, warn: &mut WarnOnce) -> bool {
-    // Wave-1 whitelist: one plain `(property: value)` we actually implement.
-    // `not`/`and`/`or`/`selector()` and `position: sticky` stay non-matching.
-    let supported = condition
-        .trim()
+    // Whitelist: one plain `(property: value)` we actually implement,
+    // optionally negated with `not`. `and`/`or`/`selector()` and
+    // `position: sticky` stay non-matching.
+    let trimmed = condition.trim();
+    let negated = trimmed
+        .get(..3)
+        .is_some_and(|p| p.eq_ignore_ascii_case("not"))
+        && trimmed
+            .get(3..)
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace));
+    let (condition, invert) = if negated {
+        (trimmed.get(3..).unwrap_or_default().trim(), true)
+    } else {
+        (trimmed, false)
+    };
+    let known = condition
         .strip_prefix('(')
         .and_then(|text| text.strip_suffix(')'))
         .and_then(|inner| inner.split_once(':'))
@@ -427,6 +734,7 @@ fn supports_applies(condition: &str, warn: &mut WarnOnce) -> bool {
                     || value.eq_ignore_ascii_case("grid")
                     || value.eq_ignore_ascii_case("table"))
         });
+    let supported = known && !invert;
     if !supported {
         warn.note("@supports condition unsupported (safe default: rules dropped)");
     }
@@ -449,7 +757,11 @@ fn skip_rule(parser: &mut Parser<'_>) {
     }
 }
 
-fn parse_qualified_rule(parser: &mut Parser<'_>, viewport: Viewport) -> Option<Vec<StyleRule>> {
+fn parse_qualified_rule(
+    parser: &mut Parser<'_>,
+    viewport: Viewport,
+    warn: &mut WarnOnce,
+) -> Option<Vec<StyleRule>> {
     // Collect the prelude once. Plain compounds use the allocation-light token
     // parser; selectors with blocks/functions are re-parsed from their text so
     // nested blocks can be expanded.
@@ -468,7 +780,7 @@ fn parse_qualified_rule(parser: &mut Parser<'_>, viewport: Viewport) -> Option<V
         return None;
     }
     let declarations = parser
-        .parse_nested_block(|p| Ok::<_, ParseError<()>>(parse_declarations(p, viewport)))
+        .parse_nested_block(|p| Ok::<_, ParseError<()>>(parse_declarations(p, viewport, warn)))
         .unwrap_or_default();
 
     let mut rules = Vec::new();
@@ -628,14 +940,295 @@ fn selector_from_tokens(tokens: &[Token<'_>]) -> Result<Selector, ()> {
     Ok(selector)
 }
 
-/// Resolve viewport-relative lengths in a declaration value to `px` text using
-/// the stylesheet's `Viewport`. Only whole `<number><unit>` words are touched;
-/// quoted text, `calc()` and unknown units are left alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CalcError {
+    /// `%` has no resolution basis in the parse-time length pipeline.
+    Percent,
+    Invalid,
+}
+
+/// Resolve `calc()` expressions and viewport-relative lengths in a declaration
+/// value to `px` text using the stylesheet's `Viewport`. Invalid `calc()` and
+/// `calc()` containing `%` drop the whole declaration (the latter with one
+/// warning per sheet); quoted text is left verbatim.
 ///
 /// NOTE(parse-time): like `px`, a viewport unit becomes a fixed number while
 /// parsing. A window resized mid-session does not re-resolve cached
 /// declarations — revisit by re-parsing with the new `Viewport` when resize
 /// support lands.
+fn resolve_lengths(value: &str, viewport: Viewport, warn: &mut WarnOnce) -> Option<String> {
+    let (head, tail) = match value.split_once('!') {
+        Some((head, tail)) => (head, Some(tail)),
+        None => (value, None),
+    };
+    let head = match resolve_calcs(head, viewport) {
+        Ok(head) => head,
+        Err(CalcError::Percent) => {
+            warn.note("calc() with % unsupported (safe default: declaration dropped)");
+            return None;
+        }
+        Err(CalcError::Invalid) => return None,
+    };
+    let mut out = resolve_viewport_lengths(&head, viewport);
+    if let Some(tail) = tail {
+        out.push('!');
+        out.push_str(tail);
+    }
+    Some(out)
+}
+
+/// Rewrite every `calc(...)` in a value as a single `<number>px`.
+fn resolve_calcs(value: &str, viewport: Viewport) -> Result<String, CalcError> {
+    let lower = value.to_ascii_lowercase();
+    let bytes = value.as_bytes();
+    let mut out = String::with_capacity(value.len());
+    let mut pos = 0;
+    while pos < value.len() {
+        let is_calc = lower[pos..].starts_with("calc(")
+            && !bytes
+                .get(pos.wrapping_sub(1))
+                .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
+        if is_calc {
+            let open = pos + 4;
+            let mut depth = 0u8;
+            let mut close = None;
+            for (i, ch) in lower[open..].char_indices() {
+                match ch {
+                    '(' => {
+                        depth += 1;
+                        if depth > MAX_CALC_DEPTH {
+                            return Err(CalcError::Invalid);
+                        }
+                    }
+                    ')' => {
+                        depth = depth.checked_sub(1).ok_or(CalcError::Invalid)?;
+                        if depth == 0 {
+                            close = Some(open + i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let close = close.ok_or(CalcError::Invalid)?;
+            let number = CalcParser::new(&value[open + 1..close], viewport).parse()?;
+            out.push_str(&format!("{number}px"));
+            pos = close + 1;
+        } else {
+            let ch = value[pos..].chars().next().ok_or(CalcError::Invalid)?;
+            if matches!(ch, '\'' | '"') {
+                let start = pos;
+                let quote = ch;
+                pos += ch.len_utf8();
+                let mut escaped = false;
+                while pos < value.len() {
+                    let ch = value[pos..].chars().next().ok_or(CalcError::Invalid)?;
+                    pos += ch.len_utf8();
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == quote {
+                        break;
+                    }
+                }
+                out.push_str(&value[start..pos]);
+            } else {
+                out.push(ch);
+                pos += ch.len_utf8();
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Recursive-descent evaluator for the inside of one `calc()`:
+/// `expr = term (('+'|'-') term)*`, `term = factor (('*'|'/') factor)*`.
+struct CalcParser<'a> {
+    expr: &'a [u8],
+    pos: usize,
+    depth: u8,
+    viewport: Viewport,
+}
+
+impl<'a> CalcParser<'a> {
+    fn new(expr: &'a str, viewport: Viewport) -> Self {
+        Self {
+            expr: expr.as_bytes(),
+            pos: 0,
+            depth: 0,
+            viewport,
+        }
+    }
+
+    fn parse(mut self) -> Result<f64, CalcError> {
+        let value = self.expr()?;
+        self.ws();
+        if self.pos != self.expr.len() || !value.is_finite() {
+            return Err(CalcError::Invalid);
+        }
+        Ok(value)
+    }
+
+    fn ws(&mut self) {
+        while self.expr.get(self.pos).is_some_and(u8::is_ascii_whitespace) {
+            self.pos += 1;
+        }
+    }
+
+    fn expr(&mut self) -> Result<f64, CalcError> {
+        let mut value = self.term()?;
+        loop {
+            self.ws();
+            match self.expr.get(self.pos) {
+                Some(b'+') => {
+                    self.pos += 1;
+                    value += self.term()?;
+                }
+                Some(b'-') => {
+                    self.pos += 1;
+                    value -= self.term()?;
+                }
+                _ => return Ok(value),
+            }
+        }
+    }
+
+    fn term(&mut self) -> Result<f64, CalcError> {
+        let mut value = self.factor()?;
+        loop {
+            self.ws();
+            match self.expr.get(self.pos) {
+                Some(b'*') => {
+                    self.pos += 1;
+                    value *= self.factor()?;
+                }
+                Some(b'/') => {
+                    self.pos += 1;
+                    let divisor = self.factor()?;
+                    if divisor == 0.0 {
+                        return Err(CalcError::Invalid);
+                    }
+                    value /= divisor;
+                }
+                _ => return Ok(value),
+            }
+        }
+    }
+
+    fn factor(&mut self) -> Result<f64, CalcError> {
+        self.ws();
+        match self.expr.get(self.pos).copied() {
+            Some(b'+') => {
+                self.pos += 1;
+                self.factor()
+            }
+            Some(b'-') => {
+                self.pos += 1;
+                Ok(-self.factor()?)
+            }
+            Some(b'(') => self.parens(),
+            Some(_) if self.expr[self.pos..].starts_with(b"calc(") => {
+                self.pos += 5;
+                self.parens()
+            }
+            Some(_) => self.number(),
+            None => Err(CalcError::Invalid),
+        }
+    }
+
+    fn parens(&mut self) -> Result<f64, CalcError> {
+        self.pos += 1;
+        self.depth += 1;
+        if self.depth > MAX_CALC_DEPTH {
+            return Err(CalcError::Invalid);
+        }
+        let value = self.expr()?;
+        self.ws();
+        if self.expr.get(self.pos) != Some(&b')') {
+            return Err(CalcError::Invalid);
+        }
+        self.pos += 1;
+        self.depth -= 1;
+        Ok(value)
+    }
+
+    fn number(&mut self) -> Result<f64, CalcError> {
+        let start = self.pos;
+        while self
+            .expr
+            .get(self.pos)
+            .is_some_and(|b| b.is_ascii_digit() || *b == b'.')
+        {
+            self.pos += 1;
+        }
+        // Only consume `e`/`E` as an exponent when digits follow; `em` is a
+        // unit, not a malformed exponent.
+        if self
+            .expr
+            .get(self.pos)
+            .is_some_and(|b| matches!(b, b'e' | b'E'))
+        {
+            let mut scan = self.pos + 1;
+            if self
+                .expr
+                .get(scan)
+                .is_some_and(|b| matches!(b, b'+' | b'-'))
+            {
+                scan += 1;
+            }
+            if self.expr.get(scan).is_some_and(u8::is_ascii_digit) {
+                self.pos = scan + 1;
+                while self.expr.get(self.pos).is_some_and(u8::is_ascii_digit) {
+                    self.pos += 1;
+                }
+            }
+        }
+        if self.pos == start {
+            return Err(CalcError::Invalid);
+        }
+        let text =
+            std::str::from_utf8(&self.expr[start..self.pos]).map_err(|_| CalcError::Invalid)?;
+        let number = text.parse::<f64>().map_err(|_| CalcError::Invalid)?;
+        let (vp, vh) = (
+            f64::from(self.viewport.width),
+            f64::from(self.viewport.height),
+        );
+        let rest = &self.expr[self.pos..];
+        let (unit_len, scale) = if rest.starts_with(b"vmin") {
+            (4, vp.min(vh) / 100.0)
+        } else if rest.starts_with(b"vmax") {
+            (4, vp.max(vh) / 100.0)
+        } else if rest.starts_with(b"rem") {
+            (3, CALC_FALLBACK_FONT_PX)
+        } else if rest.starts_with(b"vh") {
+            (2, vh / 100.0)
+        } else if rest.starts_with(b"vw") {
+            (2, vp / 100.0)
+        } else if rest.starts_with(b"px") {
+            (2, 1.0)
+        } else if rest.starts_with(b"em") {
+            (2, CALC_FALLBACK_FONT_PX)
+        } else if rest.starts_with(b"%") {
+            return Err(CalcError::Percent);
+        } else {
+            (0, 1.0)
+        };
+        if rest
+            .first()
+            .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'%')
+            && unit_len == 0
+        {
+            return Err(CalcError::Invalid);
+        }
+        self.pos += unit_len;
+        let value = number * scale;
+        value.is_finite().then_some(value).ok_or(CalcError::Invalid)
+    }
+}
+
+/// Resolve bare viewport units (outside `calc()`) as before. Quoted text and
+/// unknown units are left alone.
 fn resolve_viewport_lengths(value: &str, viewport: Viewport) -> String {
     const UNITS: [&str; 4] = ["vmin", "vmax", "vh", "vw"];
     if !UNITS.iter().any(|unit| value.contains(unit)) {
@@ -677,7 +1270,11 @@ fn resolve_viewport_lengths(value: &str, viewport: Viewport) -> String {
     out
 }
 
-fn parse_declarations(parser: &mut Parser<'_>, viewport: Viewport) -> Vec<Declaration> {
+fn parse_declarations(
+    parser: &mut Parser<'_>,
+    viewport: Viewport,
+    warn: &mut WarnOnce,
+) -> Vec<Declaration> {
     let mut declarations = Vec::new();
 
     loop {
@@ -689,7 +1286,12 @@ fn parse_declarations(parser: &mut Parser<'_>, viewport: Viewport) -> Vec<Declar
                 skip_rule(parser);
             }
             Ok(Token::Ident(property)) => {
-                let property = property.to_lowercase();
+                // Custom property names are case-sensitive; ordinary ones are not.
+                let property = if property.starts_with("--") {
+                    property.to_string()
+                } else {
+                    property.to_lowercase()
+                };
                 if parser.expect_colon().is_err() {
                     skip_to_semicolon(parser);
                     continue;
@@ -699,10 +1301,10 @@ fn parse_declarations(parser: &mut Parser<'_>, viewport: Viewport) -> Vec<Declar
                         Ok::<_, ParseError<()>>(serialize_value(p))
                     })
                     .unwrap_or_default();
-                declarations.push(Declaration {
-                    property,
-                    value: resolve_viewport_lengths(&value, viewport),
-                });
+                let Some(value) = resolve_lengths(&value, viewport, warn) else {
+                    continue;
+                };
+                declarations.push(Declaration { property, value });
             }
             Ok(_) => skip_to_semicolon(parser),
             Err(_) => break,
@@ -715,7 +1317,7 @@ fn parse_declarations(parser: &mut Parser<'_>, viewport: Viewport) -> Vec<Declar
 /// Parse an element's `style="..."` attribute as a declaration list.
 pub fn parse_style_attribute(css: &str) -> Vec<Declaration> {
     let mut parser = Parser::new(css);
-    parse_declarations(&mut parser, Viewport::default())
+    parse_declarations(&mut parser, Viewport::default(), &mut WarnOnce::default())
 }
 
 /// Value text of a declaration with a trailing `! important` removed.
@@ -734,6 +1336,115 @@ fn split_important(value: &str) -> (&str, bool) {
         Some((head, tail)) if tail.trim().eq_ignore_ascii_case("important") => (head.trim(), true),
         _ => (trimmed, false),
     }
+}
+
+// ---- custom properties -------------------------------------------------
+//
+// Values are stored as raw text (the parser already applies the existing
+// parse-time `vh`/`vw` resolution to them). Resizing mid-session therefore
+// does not re-resolve lengths held in custom properties — same limitation as
+// ordinary declarations, documented on `resolve_viewport_lengths`.
+
+/// Resolve every custom property against the raw set, dropping any whose
+/// `var()` references are cyclic or unresolved (the spec's
+/// guaranteed-invalid value). Values may reference each other in any order.
+pub fn resolve_custom_properties(raw: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for name in raw.keys() {
+        if let Some(value) = raw
+            .get(name)
+            .and_then(|text| resolve_text(text, raw, &mut vec![name.clone()]))
+        {
+            out.insert(name.clone(), value);
+        }
+    }
+    out
+}
+
+/// Substitute `var(--name)` / `var(--name, fallback)` in a declaration value.
+/// Returns `None` when a reference has no value and no fallback — the whole
+/// declaration is then invalid and must be dropped by the caller.
+pub fn substitute_vars(value: &str, resolved: &BTreeMap<String, String>) -> Option<String> {
+    resolve_text(value, resolved, &mut Vec::new())
+}
+
+fn is_name_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
+}
+
+fn find_var_end(text: &str, start: usize) -> Option<usize> {
+    let mut depth = 1usize;
+    for (offset, byte) in text.as_bytes()[start..].iter().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(start + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+// shortcut: fallback commas inside quotes are treated as separators; upgrade
+// when a full CSS value parser is available.
+fn split_fallback(inner: &str) -> (&str, Option<&str>) {
+    let mut depth = 0usize;
+    for (i, byte) in inner.as_bytes().iter().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => return (&inner[..i], Some(&inner[i + 1..])),
+            _ => {}
+        }
+    }
+    (inner, None)
+}
+
+fn resolve_text(
+    text: &str,
+    raw: &BTreeMap<String, String>,
+    stack: &mut Vec<String>,
+) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if text[i..].starts_with("var(") && (i == 0 || !is_name_char(bytes[i - 1])) {
+            let start = i + 4;
+            let end = find_var_end(text, start)?;
+            let (name, fallback) = split_fallback(&text[start..end]);
+            let name = name.trim();
+            if !name.starts_with("--") {
+                return None;
+            }
+            let replacement = match raw.get(name) {
+                Some(value) => {
+                    if stack.iter().any(|seen| seen == name) {
+                        return None;
+                    }
+                    stack.push(name.to_string());
+                    let resolved = resolve_text(value, raw, stack);
+                    stack.pop();
+                    resolved?
+                }
+                None => {
+                    let value = fallback?;
+                    resolve_text(value.trim(), raw, stack)?
+                }
+            };
+            out.push_str(&replacement);
+            i = end + 1;
+        } else {
+            let ch = text[i..].chars().next()?;
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    Some(out)
 }
 
 fn skip_to_semicolon(parser: &mut Parser<'_>) {
@@ -2031,10 +2742,10 @@ mod tests {
     }
 
     #[test]
-    fn property_names_are_lowercased_and_unknown_kept() {
+    fn property_names_are_lowercased_except_custom_ones() {
         let decls = declarations("a { COLOR: red; --Brand-Color: #abc; -webkit-transform: none }");
         assert_eq!(decls[0].property, "color");
-        assert_eq!(decls[1].property, "--brand-color");
+        assert_eq!(decls[1].property, "--Brand-Color");
         assert_eq!(decls[2].property, "-webkit-transform");
     }
 
@@ -2636,7 +3347,59 @@ mod tests {
             .iter()
             .map(|d| d.value.as_str())
             .collect();
-        assert_eq!(values, ["\"25vh\"", "calc(25vh - 1px)", "2em", "50%"]);
+        assert_eq!(values, ["\"25vh\"", "199px", "2em", "50%"]);
+    }
+
+    #[test]
+    fn calc_resolves_lengths_and_nested_parens() {
+        let vp = Viewport {
+            width: 1200,
+            height: 800,
+            ..Viewport::default()
+        };
+        let css = "div { width: calc(2*(10px+5px)); height: calc(100px / 4); \
+                   padding: calc( 10px + 5px ); margin: calc(10vw + 5vh); \
+                   top: calc(2em + 1rem); left: calc(-1px + 3px); \
+                   right: calc(1px + 2px) calc(3px * 2) }";
+        let sheet = parse_stylesheet_with(vp, css);
+        let values: Vec<&str> = sheet.rules[0]
+            .declarations
+            .iter()
+            .map(declaration_value)
+            .collect();
+        assert_eq!(
+            values,
+            ["30px", "25px", "15px", "160px", "48px", "2px", "3px 6px"]
+        );
+    }
+
+    #[test]
+    fn calc_invalid_and_percent_drop_only_the_declaration() {
+        for value in [
+            "calc(10px / 0)",
+            "calc(10px +)",
+            "calc(((((1px))))))",
+            "calc(100% - 32px)",
+            "calc(1px + 10deg)",
+        ] {
+            let css = format!("div {{ width: {value}; height: 5px }} p {{ color: blue }}");
+            let sheet = parse_stylesheet(&css);
+            assert_eq!(sheet.rules.len(), 2, "value {value}");
+            assert_eq!(sheet.rules[0].declarations.len(), 1, "value {value}");
+            assert_eq!(sheet.rules[0].declarations[0].property, "height");
+            assert_eq!(sheet.rules[1].declarations[0].value, "blue");
+        }
+    }
+
+    #[test]
+    fn calc_in_importance_and_string_stays_intact() {
+        let sheet = parse_stylesheet(
+            "div { width: calc(10px + 5px) !important; font-family: 'calc(1px + 2px)' }",
+        );
+        let decls = &sheet.rules[0].declarations;
+        assert_eq!(declaration_value(&decls[0]), "15px");
+        assert!(is_important(&decls[0]));
+        assert_eq!(decls[1].value, "\"calc(1px + 2px)\"");
     }
 
     // --- wave-1 at-rules -------------------------------------------------
@@ -2685,16 +3448,62 @@ mod tests {
     fn media_unsupported_features_are_non_matching() {
         for query in [
             "(hover: hover)",
-            "(prefers-color-scheme: dark)",
-            "((min-width: 100px))",
             "screen and (pointer: coarse)",
-            "(min-width: 1000px), print",
+            "(min-resolution: 2dppx)",
+            "(-webkit-min-device-pixel-ratio: 2)",
+            "not (hover: none)",
             "",
         ] {
             let css = format!("@media {query} {{ .a {{ color: red }} }} p {{ color: blue }}");
             let sheet = parse_stylesheet(&css);
             assert_eq!(sheet.rules.len(), 1, "query {query}");
             assert_eq!(sheet.rules[0].declarations[0].value, "blue");
+        }
+    }
+
+    #[test]
+    fn media_broadened_features_match() {
+        let dark = Viewport {
+            dark: true,
+            ..Viewport::default()
+        };
+        for (query, viewport) in [
+            ("(hover: none)", Viewport::default()),
+            ("(prefers-color-scheme: light)", Viewport::default()),
+            ("(prefers-color-scheme: dark)", dark),
+            ("(min-resolution: 1dppx)", Viewport::default()),
+            ("(min-resolution: 96dpi)", Viewport::default()),
+            ("(max-resolution: 1dppx)", Viewport::default()),
+            ("(-webkit-min-device-pixel-ratio: 1)", Viewport::default()),
+            ("not (hover: hover)", Viewport::default()),
+            ("not print", Viewport::default()),
+            ("(min-width: 1000px), print", Viewport::default()),
+            ("print, (min-width: 1000px)", Viewport::default()),
+            ("only screen and (hover: none)", Viewport::default()),
+            ("(width>=1200px)", Viewport::default()),
+            ("(width<=1200px)", Viewport::default()),
+            ("(height=800px)", Viewport::default()),
+            ("(width>=75rem)", Viewport::default()),
+            ("((min-width: 100px))", Viewport::default()),
+            (
+                "(min-width: 100px) or (max-width: 10px)",
+                Viewport::default(),
+            ),
+            (
+                "((width>=802px) and (width<=1279.99px)) or (width>=1284px)",
+                Viewport::default(),
+            ),
+            ("(width>=calc(48rem + 100px))", Viewport::default()),
+            (
+                "(prefers-reduced-motion: no-preference)",
+                Viewport::default(),
+            ),
+            ("(forced-colors: none)", Viewport::default()),
+            ("(pointer: fine)", Viewport::default()),
+        ] {
+            let css = format!("@media {query} {{ .a {{ color: red }} }}");
+            let sheet = parse_stylesheet_with(viewport, &css);
+            assert_eq!(sheet.rules.len(), 1, "query {query}");
         }
     }
 
@@ -2727,7 +3536,7 @@ mod tests {
     }
 
     #[test]
-    fn layer_blocks_are_dropped_with_recovery() {
+    fn layer_blocks_are_parsed_with_recovery() {
         let sheet = parse_stylesheet(
             "@layer base { a { color: red } } @layer utilities { p { color: blue } } \
              q { color: green }",
@@ -2737,7 +3546,67 @@ mod tests {
             .iter()
             .map(|r| r.declarations[0].value.as_str())
             .collect();
-        assert_eq!(values, ["green"]);
+        assert_eq!(values, ["red", "blue", "green"]);
+        let layers: Vec<Option<u32>> = sheet.rules.iter().map(cascade_layer).collect();
+        assert_eq!(layers, [Some(0), Some(1), None]);
+    }
+
+    #[test]
+    fn layer_statement_establishes_order_before_block_use() {
+        let sheet = parse_stylesheet(
+            "@layer reset, theme; @layer theme { .b { color: blue } } \
+             @layer reset { .a { color: red } }",
+        );
+        let layers: Vec<Option<u32>> = sheet.rules.iter().map(cascade_layer).collect();
+        assert_eq!(layers, [Some(1), Some(0)]);
+    }
+
+    #[test]
+    fn layer_and_media_compose_in_both_nestings() {
+        let sheet = parse_stylesheet(
+            "@layer base { @media screen { .a { color: red } } \
+             @media print { .b { color: blue } } } \
+             @media screen { @layer util { .c { color: green } } }",
+        );
+        let rules: Vec<(&str, Option<u32>)> = sheet
+            .rules
+            .iter()
+            .map(|r| (r.declarations[0].value.as_str(), cascade_layer(r)))
+            .collect();
+        assert_eq!(rules, [("red", Some(0)), ("green", Some(1))]);
+    }
+
+    #[test]
+    fn custom_properties_are_case_sensitive_raw_declarations() {
+        let decls = parse_stylesheet("p { --Brand: 12px; --brand: Hi; COLOR: red }").rules[0]
+            .declarations
+            .clone();
+        assert_eq!(decls[0].property, "--Brand");
+        assert_eq!(decls[0].value, "12px");
+        assert_eq!(decls[1].property, "--brand");
+        assert_eq!(decls[2].property, "color");
+    }
+
+    #[test]
+    fn var_substitution_fallback_and_cycles() {
+        let mut raw = BTreeMap::new();
+        raw.insert("--a".into(), "var(--b)".into());
+        raw.insert("--b".into(), "var(--a)".into());
+        raw.insert("--width".into(), "4px".into());
+        let resolved = resolve_custom_properties(&raw);
+        assert_eq!(resolved.get("--width").map(String::as_str), Some("4px"));
+        assert!(!resolved.contains_key("--a"));
+        assert!(!resolved.contains_key("--b"));
+
+        assert_eq!(
+            substitute_vars("var(--width) solid", &resolved).as_deref(),
+            Some("4px solid")
+        );
+        assert_eq!(
+            substitute_vars("var(--missing, 2px)", &resolved).as_deref(),
+            Some("2px")
+        );
+        assert_eq!(substitute_vars("var(--missing)", &resolved), None);
     }
 
     #[test]
