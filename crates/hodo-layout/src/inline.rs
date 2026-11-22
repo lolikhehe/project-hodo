@@ -1,5 +1,7 @@
 //! Inline formatting context: atoms, line boxes and their painted fragments.
 
+use std::rc::Rc;
+
 use super::*;
 use crate::block::layout_children;
 use hodo_style::{LineHeight, TextAlign, VerticalAlign, WhiteSpace};
@@ -23,8 +25,9 @@ pub(crate) struct Atom {
     /// Advance width contributed to the line.
     pub(crate) w: f32,
     /// Inline boxes containing this atom, outermost first (indices into
-    /// `Flow::boxes`). Empty for ordinary text.
-    pub(crate) boxes: Vec<usize>,
+    /// `Flow::boxes`). Empty for ordinary text. Shared: every word of one text
+    /// node sits in the same boxes, so cloning an atom must not clone them.
+    pub(crate) boxes: Rc<[usize]>,
     pub(crate) spacer: bool,
     /// Owning element of this atom's glyphs: the text node's parent element
     /// for text atoms, the painted element for inset spacers.
@@ -64,9 +67,16 @@ pub(crate) struct Flow {
     pub(crate) left: f32,
     pub(crate) right: f32,
     pub(crate) y: f32,
+    /// Content-box origin of the containing block, in page coordinates.
+    /// Absolute children offset `top`/`left` from here, not from the current
+    /// flow cursor (which already sits below earlier siblings).
+    pub(crate) abs_origin: (f32, f32),
     pub(crate) line: Vec<Atom>,
     /// Parallel to `line`: formatting properties used at flush time.
     meta: Vec<AtomMeta>,
+    /// Memo for `has_content`: number of glyph-bearing atoms on this line.
+    /// Kept in lock-step with `line` by `push_atom_meta`/`flush_line`.
+    content: usize,
     pub(crate) line_w: f32,
     pub(crate) pending_space: Option<f32>,
     /// One bullet is emitted on this flow's first text line (list item).
@@ -101,8 +111,10 @@ impl Flow {
             left,
             right,
             y,
+            abs_origin: (0.0, 0.0),
             line: Vec::new(),
             meta: Vec::new(),
+            content: 0,
             line_w: 0.0,
             pending_space: None,
             bullet: false,
@@ -168,7 +180,7 @@ fn resolve_line_height(lh: LineHeight, fs: f32) -> f32 {
 /// True when the current line has at least one glyph-bearing atom. Spacer-only
 /// lines are not a wrap boundary and never produce a Text item.
 pub(crate) fn has_content(flow: &Flow) -> bool {
-    flow.line.iter().any(|a| !a.spacer)
+    flow.content > 0
 }
 
 /// Push an atom with default metrics. `block` uses this for inline-box inset
@@ -186,6 +198,9 @@ pub(crate) fn push_atom(flow: &mut Flow, atom: Atom) {
 }
 
 fn push_atom_meta(flow: &mut Flow, atom: Atom, meta: AtomMeta) {
+    if !atom.spacer {
+        flow.content += 1;
+    }
     flow.meta.push(meta);
     flow.line.push(atom);
 }
@@ -204,7 +219,7 @@ pub(crate) fn right_inset(b: &InlineBox) -> f32 {
 pub(crate) fn emit_fragments(flow: &mut Flow, list: &mut DisplayList, h: f32) {
     let mut extents: Vec<(usize, f32, f32)> = Vec::new();
     for atom in &flow.line {
-        for &bi in &atom.boxes {
+        for &bi in atom.boxes.iter() {
             if let Some(e) = extents.iter_mut().find(|e| e.0 == bi) {
                 e.1 = e.1.min(atom.x);
                 e.2 = e.2.max(atom.x + atom.w);
@@ -377,6 +392,7 @@ pub(crate) fn flush_line(flow: &mut Flow, list: &mut DisplayList) {
     flow.y += line_h;
     flow.line.clear();
     flow.meta.clear();
+    flow.content = 0;
     flow.line_w = 0.0;
     flow.pending_space = None;
     // shortcut: first-line indent is applied to this flow's first formatted
@@ -397,11 +413,17 @@ pub(crate) fn char_boundary(s: &str, n: usize) -> usize {
 /// content width unless `white-space` disables it. Words longer than a whole
 /// line are hard-broken. Each chunk scan is bounded by the chars actually
 /// emitted on that line, so total work is linear in the text length.
-fn place_word(flow: &mut Flow, list: &mut DisplayList, atom: Atom, meta: AtomMeta) {
+fn place_word(
+    flow: &mut Flow,
+    list: &mut DisplayList,
+    template: &Atom,
+    word: &str,
+    meta: AtomMeta,
+) {
     let cw = finite_or(meta.char_w, 0.0);
-    let total = atom.text.chars().count();
+    let total = word.chars().count();
     let mut remaining = total;
-    let mut word = atom.text.as_str();
+    let mut word = word;
     let mut guard = 0usize;
     while remaining > 0 {
         guard += 1;
@@ -468,17 +490,17 @@ fn place_word(flow: &mut Flow, list: &mut DisplayList, atom: Atom, meta: AtomMet
                 flow,
                 Atom {
                     text: chunk.to_string(),
-                    font_size: atom.font_size,
-                    color: atom.color,
-                    weight: atom.weight,
-                    href: atom.href.clone(),
-                    underline: atom.underline,
-                    line_through: atom.line_through,
+                    font_size: template.font_size,
+                    color: template.color,
+                    weight: template.weight,
+                    href: template.href.clone(),
+                    underline: template.underline,
+                    line_through: template.line_through,
                     x: line_left + flow.line_w,
                     w: chunk_w,
-                    boxes: atom.boxes.clone(),
+                    boxes: template.boxes.clone(),
                     spacer: false,
-                    owner: atom.owner,
+                    owner: template.owner,
                 },
                 meta,
             );
@@ -495,17 +517,17 @@ fn place_word(flow: &mut Flow, list: &mut DisplayList, atom: Atom, meta: AtomMet
                     flow,
                     Atom {
                         text: " ".to_string(),
-                        font_size: atom.font_size,
-                        color: atom.color,
-                        weight: atom.weight,
-                        href: atom.href.clone(),
-                        underline: atom.underline,
-                        line_through: atom.line_through,
+                        font_size: template.font_size,
+                        color: template.color,
+                        weight: template.weight,
+                        href: template.href.clone(),
+                        underline: template.underline,
+                        line_through: template.line_through,
                         x: line_left + flow.line_w,
                         w: sw,
-                        boxes: atom.boxes.clone(),
+                        boxes: template.boxes.clone(),
                         spacer: false,
-                        owner: atom.owner,
+                        owner: template.owner,
                     },
                     meta,
                 );
@@ -517,17 +539,17 @@ fn place_word(flow: &mut Flow, list: &mut DisplayList, atom: Atom, meta: AtomMet
             flow,
             Atom {
                 text: word.to_string(),
-                font_size: atom.font_size,
-                color: atom.color,
-                weight: atom.weight,
-                href: atom.href,
-                underline: atom.underline,
-                line_through: atom.line_through,
+                font_size: template.font_size,
+                color: template.color,
+                weight: template.weight,
+                href: template.href.clone(),
+                underline: template.underline,
+                line_through: template.line_through,
                 x: line_left + flow.line_w,
                 w: word_w,
-                boxes: atom.boxes.clone(),
+                boxes: template.boxes.clone(),
                 spacer: false,
-                owner: atom.owner,
+                owner: template.owner,
             },
             meta,
         );
@@ -559,9 +581,7 @@ fn emit_collapsed(
         if !first && has_content(flow) {
             flow.pending_space = Some(space_w);
         }
-        let mut atom = template.clone();
-        atom.text = word.to_string();
-        place_word(flow, list, atom, meta);
+        place_word(flow, list, template, word, meta);
         first = false;
     }
 }
@@ -584,18 +604,14 @@ fn emit_preserved(
         if space_run.is_some_and(|s| s != is_space) {
             let run = &seg[start..i];
             flow.pending_space = None;
-            let mut atom = template.clone();
-            atom.text = run.to_string();
-            place_word(flow, list, atom, meta);
+            place_word(flow, list, template, run, meta);
             start = i;
         }
         space_run = Some(is_space);
     }
     if space_run.is_some() {
         flow.pending_space = None;
-        let mut atom = template.clone();
-        atom.text = seg[start..].to_string();
-        place_word(flow, list, atom, meta);
+        place_word(flow, list, template, &seg[start..], meta);
     }
 }
 
@@ -668,7 +684,7 @@ pub(crate) fn feed_text(
         line_through: style.line_through,
         x: 0.0,
         w: 0.0,
-        boxes: boxes.to_vec(),
+        boxes: Rc::from(boxes),
         spacer: false,
         owner,
     };
@@ -807,6 +823,7 @@ pub(crate) fn inline_block_atom(
     // Own block context: lay children out in the narrowed slot, no parent
     // line fragmentation.
     let mut sub = Flow::new(inner_left, inner_right, top);
+    sub.abs_origin = (inner_left, top);
     sub.strut_fs = style.font_size;
     sub.strut_line_h = resolve_line_height(style.line_height, style.font_size);
     sub.wrap = !matches!(style.white_space, WhiteSpace::Pre | WhiteSpace::NoWrap);
@@ -937,6 +954,35 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn content_memo_tracks_spacers_and_flushes() {
+        let make = |text: &str, spacer: bool| Atom {
+            text: text.to_string(),
+            font_size: 16.0,
+            color: Color::BLACK,
+            weight: 400,
+            href: None,
+            underline: false,
+            line_through: false,
+            x: 0.0,
+            w: 1.0,
+            boxes: Rc::from(&[][..]),
+            spacer,
+            owner: NodeId(0),
+        };
+        let mut flow = Flow::new(0.0, 100.0, 0.0);
+        let mut list = DisplayList::default();
+        assert!(!has_content(&flow));
+        push_atom(&mut flow, make("", true));
+        assert!(!has_content(&flow), "inset spacer is not line content");
+        push_atom(&mut flow, make("x", false));
+        assert!(has_content(&flow));
+        push_atom(&mut flow, make("", true));
+        assert!(has_content(&flow), "trailing spacer must not hide content");
+        flush_line(&mut flow, &mut list);
+        assert!(!has_content(&flow), "flush must reset the memo");
     }
 
     #[test]

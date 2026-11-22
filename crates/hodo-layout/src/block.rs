@@ -1,5 +1,7 @@
 //! Block flow: the recursive child walk, anonymous inline runs and block boxes.
 
+use std::rc::Rc;
+
 use super::*;
 
 /// Lay out `dom` into a flat display list for a viewport of `size`.
@@ -96,7 +98,9 @@ pub(crate) fn layout_inline_run(
         flow.bullet = false;
     }
     // An anonymous inline run is a fresh Flow: carry the parent's float state
-    // over so its line boxes wrap around the same floats.
+    // and absolute containing-block origin over so its line boxes wrap around
+    // the same floats and its absolute children keep the same static origin.
+    sub.abs_origin = flow.abs_origin;
     sub.float_l = flow.float_l;
     sub.float_r = flow.float_r;
     sub.float_bottoms = flow.float_bottoms;
@@ -211,7 +215,7 @@ fn layout_inline_element(
                     line_through: false,
                     x: crate::inline::float_bounds(flow).0 + flow.line_w,
                     w: left,
-                    boxes: boxes.clone(),
+                    boxes: Rc::from(boxes.as_slice()),
                     spacer: true,
                     owner: child,
                 },
@@ -245,7 +249,7 @@ fn layout_inline_element(
                     line_through: false,
                     x: crate::inline::float_bounds(flow).0 + flow.line_w,
                     w: right,
-                    boxes,
+                    boxes: Rc::from(boxes.as_slice()),
                     spacer: true,
                     owner: child,
                 },
@@ -399,9 +403,12 @@ fn layout_child_inner(
                 (0.0, 0.0)
             };
             // shortcut: wave 1 containing block is the parent's content box;
-            // right/bottom offsets are ignored for both absolute and fixed.
-            // Upgrade when an ancestor padding box becomes the containing block.
+            // right/bottom offsets are still ignored for absolute and fixed.
+            // `top` is measured from that box's origin, not the current cursor:
+            // without it, an absolute banner label lands on the next sibling's
+            // line and paints over it (EFF's red featured banner).
             let left = st.offsets.left.unwrap_or(0.0);
+            let top = st.offsets.top.unwrap_or(0.0);
             // Inline-level atomics take a slot in the line box, so they start
             // at the float-free edge (and after any atoms already on the line)
             // instead of the bare content edge.
@@ -418,13 +425,17 @@ fn layout_child_inner(
                     // Right floats hug the content edge minus their margins.
                     flow.right - float_w - fm.left - fm.right
                 } else if absolute {
-                    flow.left + left
+                    flow.abs_origin.0 + left
                 } else if inline_atomic {
                     float_band.0 + flow.line_w
                 } else {
                     flow.left
                 },
-                y: clear_y,
+                y: if absolute {
+                    flow.abs_origin.1 + top
+                } else {
+                    clear_y
+                },
                 width: if absolute {
                     (flow.right - flow.left - left).max(0.0)
                 } else if inline_atomic {
@@ -567,7 +578,7 @@ fn layout_child_inner(
                             line_through: false,
                             x: float_band.0 + flow.line_w,
                             w: fm.left + box_w + fm.right,
-                            boxes: Vec::new(),
+                            boxes: Rc::from(&[][..]),
                             spacer: true,
                             owner: child,
                         },
@@ -596,6 +607,7 @@ fn layout_child_inner(
                 // An inline absolute box paints into a scratch flow so it
                 // cannot advance the parent's line box.
                 let mut sub = Flow::new(avail.x, avail.x + avail.width, avail.y);
+                sub.abs_origin = (avail.x, avail.y);
                 let start = ctx.list.items.len();
                 layout_inline_element(ctx, &mut sub, fallback, child, link, st);
                 flush_line(&mut sub, ctx.list);
@@ -733,6 +745,7 @@ fn layout_block_inner(
     };
 
     let mut flow = Flow::new(inner_left, inner_right, top);
+    flow.abs_origin = (inner_left, top);
     flow.float_l = inherited.float_l;
     flow.float_r = inherited.float_r;
     flow.float_bottoms = inherited.float_bottoms;
@@ -748,6 +761,19 @@ fn layout_block_inner(
 
     // Cyclic clamp: width is resolved before children lay out, height after.
     let mut content_h = (flow.y - top).max(0.0);
+    if clip_enabled {
+        // A vertical-align shift can paint a line box below the flow cursor;
+        // the clip box must still contain it (HN's overflow:hidden story cells).
+        for item in &ctx.list.items[children_start..] {
+            let bottom = match item {
+                DisplayItem::Rect { rect, .. }
+                | DisplayItem::Text { rect, .. }
+                | DisplayItem::Image { rect, .. }
+                | DisplayItem::Control { rect, .. } => rect.y + rect.h,
+            };
+            content_h = content_h.max(bottom - top);
+        }
+    }
     content_h = content_h
         .max(style.height.unwrap_or(0.0).max(0.0))
         .max(style.min_size.h.max(0.0));
@@ -804,6 +830,24 @@ mod tests {
             tag: None,
             id: Some(v.to_string()),
             classes: Vec::new(),
+            universal: false,
+        }
+    }
+
+    fn tag_sel(v: &str) -> Selector {
+        Selector {
+            tag: Some(v.to_string()),
+            id: None,
+            classes: Vec::new(),
+            universal: false,
+        }
+    }
+
+    fn class_sel(v: &str) -> Selector {
+        Selector {
+            tag: None,
+            id: None,
+            classes: vec![v.to_string()],
             universal: false,
         }
     }
@@ -951,6 +995,69 @@ mod tests {
             (red[0].x - 40.0).abs() < 0.01,
             "background starts at the absolute x"
         );
+    }
+
+    #[test]
+    fn first_block_top_margin_is_visible() {
+        // y=0 clipping repro: a leading h1 with margin-top must start at y=50.
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let h1 = elem(&mut dom, root, "h1", &[]);
+        text_node(&mut dom, h1, "Example Domain");
+        let p = elem(&mut dom, root, "p", &[]);
+        text_node(&mut dom, p, "Body copy");
+        let styles = styled(&dom, vec![rule(tag_sel("h1"), &[("margin-top", "50px")])]);
+        let list = layout(&dom, &styles, viewport(800.0));
+        let ts = texts(&list);
+        assert_eq!(ts.len(), 2, "both blocks paint: {ts:?}");
+        assert_eq!(ts[0].0, "Example Domain");
+        assert!(
+            (ts[0].1.y - 50.0).abs() < 0.01 && ts[0].1.y >= 0.0,
+            "leading h1 must sit at y=50, fully below the viewport edge: {:?}",
+            ts[0].1
+        );
+        assert!(ts[1].1.y > ts[0].1.y, "body copy follows the heading");
+    }
+
+    #[test]
+    fn absolute_banner_label_does_not_paint_over_next_sibling() {
+        // EFF shape: a background banner, an absolutely positioned label at
+        // top:0, and a regular paragraph after it. Each text paints once and
+        // the label stays at the banner's top instead of the paragraph's line.
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let banner = elem(&mut dom, root, "div", &[("class", "row")]);
+        let thumb = elem(&mut dom, banner, "div", &[("class", "thumb")]);
+        let _ = thumb;
+        let label = elem(&mut dom, banner, "span", &[("class", "label")]);
+        text_node(&mut dom, label, "FEATURED UPDATE");
+        let headline = elem(&mut dom, banner, "p", &[]);
+        text_node(&mut dom, headline, "Tech Companies Are Trying to Shift...");
+        let styles = styled(
+            &dom,
+            vec![
+                rule(
+                    class_sel("row"),
+                    &[("position", "relative"), ("background", "#eb1414")],
+                ),
+                rule(class_sel("thumb"), &[("height", "60px")]),
+                rule(
+                    class_sel("label"),
+                    &[("position", "absolute"), ("top", "0"), ("left", "0")],
+                ),
+            ],
+        );
+        let list = layout(&dom, &styles, viewport(800.0));
+        let ts = texts(&list);
+        assert_eq!(ts.len(), 2, "each banner text paints exactly once: {ts:?}");
+        assert_eq!(ts[0].0, "FEATURED UPDATE");
+        assert_eq!(ts[1].0, "Tech Companies Are Trying to Shift...");
+        assert!(
+            (ts[0].1.y).abs() < 0.01 && ts[1].1.y > 50.0,
+            "absolute label must stay at the banner top, not the following line: {ts:?}"
+        );
+        let red = colored_rects(&list, Color::rgb(0xeb, 0x14, 0x14));
+        assert_eq!(red.len(), 1, "banner background paints once");
     }
 
     #[test]
@@ -1119,10 +1226,9 @@ mod tests {
         let list = layout(&dom, &styles, viewport(800.0));
         let t = texts(&list);
         assert_eq!(t.len(), 1);
-        // shortcut: absolute `top` is ignored in wave 1 (only `left` shifts
-        // the static-position box), so only the relative top offset applies.
+        // The absolute parent honours its `top:10px`; the relative child adds 3.
         assert!(
-            (t[0].1.x - 57.0).abs() < 0.01 && (t[0].1.y - 3.0).abs() < 0.01,
+            (t[0].1.x - 57.0).abs() < 0.01 && (t[0].1.y - 13.0).abs() < 0.01,
             "relative offsets inside an absolute parent compose: {:?}",
             t[0]
         );

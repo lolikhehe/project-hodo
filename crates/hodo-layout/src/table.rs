@@ -86,6 +86,31 @@ fn parse_positive(s: &str) -> Option<f32> {
     s.parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0)
 }
 
+/// HTML `width` attributes accept pixels or percentages (HN's `85%` table).
+fn parse_width(s: &str, basis: f32) -> Option<f32> {
+    let s = s.trim();
+    if let Some(pct) = s.strip_suffix('%') {
+        return pct
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(|v| v * basis / 100.0);
+    }
+    parse_positive(s)
+}
+
+/// Right edge of an item that contributes intrinsic content width. Background
+/// rects are excluded: they span their whole (possibly wrong) provisional cell.
+fn content_right(item: &DisplayItem) -> Option<f32> {
+    match item {
+        DisplayItem::Text { rect, .. }
+        | DisplayItem::Image { rect, .. }
+        | DisplayItem::Control { rect, .. } => Some(rect.x + rect.w),
+        DisplayItem::Rect { .. } => None,
+    }
+}
+
 fn parse_span(s: Option<&str>, max: usize) -> usize {
     s.and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(1)
@@ -97,6 +122,8 @@ struct TableBuilder<'a> {
     cells: &'a mut Vec<Cell>,
     deferred: &'a mut Vec<NodeId>,
     fallback_valign: VerticalAlign,
+    /// Basis for percentage `width` attributes on cells.
+    avail_width: f32,
     slots: usize,
 }
 
@@ -129,6 +156,7 @@ fn push_cell(
         cells,
         deferred,
         fallback_valign,
+        avail_width,
         slots,
     } = &mut *b;
     if cells.len() >= MAX_CELLS {
@@ -147,7 +175,7 @@ fn push_cell(
         .unwrap_or(1);
     let width = id
         .and_then(|n| ctx.dom.attr(n, "width"))
-        .and_then(parse_positive)
+        .and_then(|v| parse_width(v, *avail_width))
         .or_else(|| {
             id.and_then(|n| ctx.styles.get(n))
                 .and_then(|s| s.width)
@@ -271,6 +299,64 @@ fn span_extent(positions: &[f32], sizes: &[f32], start: usize, span: usize) -> f
     positions[end - 1] + sizes[end - 1] - positions[start]
 }
 
+/// Track positions and widths passed to the measuring passes.
+struct Tracks<'a> {
+    x: &'a [f32],
+    w: &'a [f32],
+}
+
+/// Lay out caption and cells into a scratch list. Returns caption height,
+/// per-cell heights and the intrinsic (glyph) width each cell painted.
+fn measure_pass(
+    ctx: &mut Ctx<'_>,
+    style: &ComputedStyle,
+    caption: Option<NodeId>,
+    caption_avail: &Avail,
+    cells: &[Cell],
+    tracks: Tracks<'_>,
+    link: Option<String>,
+) -> (f32, Vec<f32>, Vec<f32>) {
+    let mut scratch = DisplayList::default();
+    std::mem::swap(&mut *ctx.list, &mut scratch);
+    let caption_h = caption
+        .map(|c| {
+            let s = ctx.styles.get(c).cloned().unwrap_or_else(fallback_style);
+            layout_block(
+                ctx,
+                &s,
+                c,
+                Avail {
+                    x: caption_avail.x,
+                    y: caption_avail.y,
+                    width: caption_avail.width,
+                },
+                link.clone(),
+            )
+        })
+        .unwrap_or(0.0);
+    let mut heights = Vec::with_capacity(cells.len());
+    let mut natural = vec![0.0_f32; cells.len()];
+    for (i, cell) in cells.iter().enumerate() {
+        let w = span_extent(tracks.x, tracks.w, cell.col, cell.colspan);
+        let av = Avail {
+            x: tracks.x[cell.col],
+            y: 0.0,
+            width: w,
+        };
+        let start = ctx.list.items.len();
+        let cell_x = av.x;
+        let h = layout_cell(ctx, cell, style, av, link.clone());
+        natural[i] = ctx.list.items[start..]
+            .iter()
+            .filter_map(content_right)
+            .map(|right| (right - cell_x).max(0.0))
+            .fold(0.0_f32, f32::max);
+        heights.push(h);
+    }
+    std::mem::swap(&mut *ctx.list, &mut scratch);
+    (caption_h, heights, natural)
+}
+
 pub(crate) fn layout_table(
     ctx: &mut Ctx<'_>,
     style: &ComputedStyle,
@@ -288,6 +374,7 @@ pub(crate) fn layout_table(
         cells: &mut cells,
         deferred: &mut deferred,
         fallback_valign: style.vertical_align,
+        avail_width: avail.width,
         slots: 0,
     };
 
@@ -345,7 +432,7 @@ pub(crate) fn layout_table(
     let nominal_w = ctx
         .dom
         .attr(id, "width")
-        .and_then(parse_positive)
+        .and_then(|v| parse_width(v, avail.width))
         .or_else(|| style.width.filter(|w| w.is_finite() && *w > 0.0))
         .unwrap_or(avail.width);
     let box_w = nominal_w
@@ -400,42 +487,87 @@ pub(crate) fn layout_table(
         cursor += *w + h_space;
     }
 
-    // Measure pass: heights are all that survive; positions are recomputed in
-    // the emit pass. Scratch swapping keeps nested tables inside the same pass.
-    let mut scratch = DisplayList::default();
-    std::mem::swap(&mut *ctx.list, &mut scratch);
-    let caption_h = caption
-        .map(|c| {
-            let s = ctx.styles.get(c).cloned().unwrap_or_else(fallback_style);
-            layout_block(
-                ctx,
-                &s,
-                c,
-                Avail {
-                    x: content_x,
-                    y: 0.0,
-                    width: content_w,
-                },
-                link.clone(),
-            )
-        })
-        .unwrap_or(0.0);
-    let mut heights = Vec::with_capacity(cells.len());
-    for cell in &cells {
-        let w = span_extent(&col_x, &col_w, cell.col, cell.colspan);
-        heights.push(layout_cell(
-            ctx,
-            cell,
-            style,
-            Avail {
-                x: col_x[cell.col],
-                y: 0.0,
-                width: w,
-            },
-            link.clone(),
-        ));
+    // First scratch pass measures intrinsic content widths. Author widths win;
+    // unfixed columns start from what they actually painted, then share the
+    // leftover proportionally. Without this, three equal tracks leave HN's
+    // rank at x=0 and its story in a far-right column with a 700px void.
+    let caption_avail = Avail {
+        x: content_x,
+        y: 0.0,
+        width: content_w,
+    };
+    let (caption_h, _, natural) = measure_pass(
+        ctx,
+        style,
+        caption,
+        &caption_avail,
+        &cells,
+        Tracks {
+            x: &col_x,
+            w: &col_w,
+        },
+        link.clone(),
+    );
+    let mut pref = vec![0.0_f32; cols];
+    for (i, cell) in cells.iter().enumerate() {
+        if cell.colspan == 1 && cell.col < cols {
+            pref[cell.col] = pref[cell.col].max(natural[i]);
+        }
     }
-    std::mem::swap(&mut *ctx.list, &mut scratch);
+    let usable = (content_w - spacing_w).max(0.0);
+    for c in 0..cols {
+        if !fixed[c] {
+            col_w[c] = pref[c].min(usable);
+        }
+    }
+    let flex_sum: f32 = (0..cols).filter(|&c| !fixed[c]).map(|c| col_w[c]).sum();
+    let fixed_sum: f32 = (0..cols).filter(|&c| fixed[c]).map(|c| col_w[c]).sum();
+    let flexible = cols - fixed.iter().filter(|&&f| f).count();
+    if flexible > 0 {
+        if flex_sum > 0.0 {
+            let scale = (usable - fixed_sum).max(0.0) / flex_sum;
+            for c in 0..cols {
+                if !fixed[c] {
+                    col_w[c] *= scale;
+                }
+            }
+        } else {
+            let equal = (usable - fixed_sum).max(0.0) / flexible as f32;
+            for c in 0..cols {
+                if !fixed[c] {
+                    col_w[c] = equal;
+                }
+            }
+        }
+    }
+    let total = col_w.iter().sum::<f32>() + spacing_w;
+    if total > content_w && total > 0.0 {
+        let scale = (content_w - spacing_w).max(0.0) / col_w.iter().sum::<f32>().max(f32::EPSILON);
+        for w in &mut col_w {
+            *w *= scale;
+        }
+    }
+    let mut col_x = vec![0.0_f32; cols];
+    let mut cursor = content_x;
+    for (c, w) in col_w.iter().enumerate() {
+        col_x[c] = cursor;
+        cursor += *w + h_space;
+    }
+
+    // Second scratch pass: heights at the final track widths (wrapping changes
+    // them), so rows cannot be too short for the text emitted in the paint pass.
+    let (_, heights, _) = measure_pass(
+        ctx,
+        style,
+        caption,
+        &caption_avail,
+        &cells,
+        Tracks {
+            x: &col_x,
+            w: &col_w,
+        },
+        link.clone(),
+    );
 
     // A spanning cell contributes its height to every row it covers (evenly),
     // so rows underneath a rowspan still get a sensible height.
@@ -697,6 +829,58 @@ mod tests {
         assert!((bg[0].x).abs() < 0.01 && (bg[1].x - 102.0).abs() < 0.01);
         assert!(bg[2].y > bg[0].y, "second row must sit below the first");
         assert!((bg[0].w - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn hn_style_three_column_row_has_no_void() {
+        // HN's item rows have no width attributes: rank, vote arrow and story.
+        // The story column must take the leftover space instead of an equal
+        // three-way split that parks it 700px from the rank.
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let table = elem(&mut dom, root, "table", &[("width", "1000")]);
+        let tr = elem(&mut dom, table, "tr", &[]);
+        let rank = elem(&mut dom, tr, "td", &[("class", "title")]);
+        text(&mut dom, rank, "1.");
+        let vote = elem(&mut dom, tr, "td", &[("class", "votelinks")]);
+        text(&mut dom, vote, "^");
+        let story = elem(&mut dom, tr, "td", &[("class", "title")]);
+        text(
+            &mut dom,
+            story,
+            "Pill to treat pancreatic cancer hailed as biggest breakthrough in decades",
+        );
+        let styles = compute_styles(&dom, &[]);
+        let list = layout_table_dom(&dom, &styles, 1000.0);
+        let trs = text_rects(&list);
+        let rank_rect = trs.iter().find(|r| r.x < 50.0).expect("rank column");
+        let story_rect = trs.iter().find(|r| r.w > 100.0).expect("story column");
+        assert!(
+            story_rect.x - (rank_rect.x + rank_rect.w) < 200.0,
+            "no empty middle column between rank and story: {trs:?}"
+        );
+        assert!(
+            trs.iter().all(|r| r.x >= 0.0 && r.x + r.w <= 1001.0),
+            "all columns stay inside the viewport: {trs:?}"
+        );
+    }
+
+    #[test]
+    fn percentage_table_width_is_honored() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let table = elem(&mut dom, root, "table", &[("width", "50%")]);
+        let tr = elem(&mut dom, table, "tr", &[]);
+        let td = elem(&mut dom, tr, "td", &[("width", "20")]);
+        text(&mut dom, td, "x");
+        let styles = styled(&dom, vec![rule("table", &[("background", "#0000ff")])]);
+        let list = layout_table_dom(&dom, &styles, 800.0);
+        let bg = rects(&list, Color::rgb(0, 0, 255));
+        assert_eq!(bg.len(), 1);
+        assert!(
+            (bg[0].w - 400.0).abs() < 0.01,
+            "width=50% of an 800px viewport: {bg:?}"
+        );
     }
 
     #[test]
