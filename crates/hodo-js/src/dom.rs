@@ -39,6 +39,10 @@ pub(crate) struct PageState {
     /// What `window.location.href` reports; threaded in by the host.
     pub(crate) url: String,
     handles: RefCell<Vec<u32>>,
+    /// One stable JS handle per live `NodeId`. Repeated wraps of the same node
+    /// (querySelector, children, parentNode, ...) therefore share an identity,
+    /// which is what custom-element instances key their upgrade registry on.
+    keys: RefCell<HashMap<NodeId, u32>>,
 }
 
 impl PageState {
@@ -48,6 +52,7 @@ impl PageState {
             listeners: RefCell::new(Vec::new()),
             url,
             handles: RefCell::new(Vec::new()),
+            keys: RefCell::new(HashMap::new()),
         }
     }
 }
@@ -79,6 +84,12 @@ fn page_of(state: &RuntimeState) -> Result<&PageState, String> {
 
 fn alloc_handle(state: &RuntimeState, node: NodeId) -> Result<u32, String> {
     let page = page_of(state)?;
+    {
+        let keys = page.keys.borrow();
+        if let Some(handle) = keys.get(&node) {
+            return Ok(*handle);
+        }
+    }
     let handle = NEXT_DOM_HANDLE.fetch_add(1, Ordering::Relaxed).max(1);
     DOM_HANDLES.with(|table| {
         table
@@ -86,6 +97,7 @@ fn alloc_handle(state: &RuntimeState, node: NodeId) -> Result<u32, String> {
             .insert(handle, (Rc::clone(&page.dom), node));
     });
     page.handles.borrow_mut().push(handle);
+    page.keys.borrow_mut().insert(node, handle);
     Ok(handle)
 }
 
@@ -458,6 +470,31 @@ fn op_dom_find_tag(id: u64) -> NativeFunction {
     })
 }
 
+/// Page-only: every descendant with `tag` as opaque handles, in document
+/// order. Backs the custom-elements upgrade walk on `define`.
+fn op_dom_find_all_tag(id: u64) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |_this, args, ctx| {
+        let state = with_state(id, Rc::clone).map_err(js_error)?;
+        let (dom, node) =
+            resolve_for(&state, handle_arg(args, 0).map_err(js_error)?).map_err(js_error)?;
+        let tag = string_arg(args, 1, ctx).map_err(js_error)?;
+        let mut found = Vec::new();
+        {
+            let dom = dom.borrow();
+            preorder(&dom, node, |id| {
+                if dom.tag(id).is_some_and(|t| t.eq_ignore_ascii_case(&tag)) {
+                    found.push(id);
+                }
+            });
+        }
+        let mut handles = Vec::new();
+        for node in found {
+            handles.push(alloc_handle(&state, node).map_err(js_error)?);
+        }
+        JsValue::from_json(&json!(handles), ctx).map_err(|err| js_error(err.to_string()))
+    })
+}
+
 fn op_dom_get_attribute(id: u64) -> NativeFunction {
     NativeFunction::from_copy_closure(move |_this, args, ctx| {
         let state = with_state(id, Rc::clone).map_err(js_error)?;
@@ -642,6 +679,12 @@ pub(crate) fn register_natives(context: &mut boa_engine::Context, id: u64) {
     register(context, "__hodo_dom_children", 1, op_dom_children(id));
     register(context, "__hodo_dom_parent", 1, op_dom_parent(id));
     register(context, "__hodo_dom_find_tag", 2, op_dom_find_tag(id));
+    register(
+        context,
+        "__hodo_dom_find_all_tag",
+        2,
+        op_dom_find_all_tag(id),
+    );
     register(
         context,
         "__hodo_dom_get_attribute",
@@ -1350,5 +1393,167 @@ mod tests {
             raw.eval("document.querySelector('img').src").unwrap(),
             "pic.png"
         );
+    }
+    /// Fixture with a `<body>` holding two `<x-card>` elements already in the
+    /// document, so `define` exercises the upgrade walk.
+    fn custom_dom() -> (Rc<RefCell<Dom>>, NodeId, NodeId) {
+        let mut dom = Dom::new();
+        let body = dom.create(NodeKind::Element {
+            tag: "body".into(),
+            attrs: Vec::new(),
+        });
+        let first = dom.create(NodeKind::Element {
+            tag: "x-card".into(),
+            attrs: Vec::new(),
+        });
+        let second = dom.create(NodeKind::Element {
+            tag: "x-card".into(),
+            attrs: Vec::new(),
+        });
+        dom.append(dom.root(), body);
+        dom.append(body, first);
+        dom.append(body, second);
+        (Rc::new(RefCell::new(dom)), body, first)
+    }
+
+    #[test]
+    fn custom_elements_define_and_get_round_trip() {
+        let (dom, _, _) = custom_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var C = class XCard extends HTMLElement {}; \
+                 customElements.define('x-card', C); \
+                 typeof customElements.define + '|' + typeof customElements.get + '|' + \
+                 typeof customElements.whenDefined + '|' + \
+                 (customElements.get('x-card') === C) + '|' + \
+                 (customElements.get('x-nope') === null);",
+            )
+            .unwrap();
+        assert_eq!(probe, "function|function|function|true|true");
+    }
+
+    #[test]
+    fn custom_elements_duplicate_define_throws() {
+        let (dom, _, _) = custom_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var C = class XCard extends HTMLElement {}; \
+                 customElements.define('x-card', C); \
+                 var out = 'no-throw'; \
+                 try { customElements.define('x-card', C); } catch (e) { out = e.name; } \
+                 out;",
+            )
+            .unwrap();
+        assert_eq!(probe, "Error");
+    }
+
+    #[test]
+    fn custom_elements_name_must_contain_a_hyphen() {
+        let (dom, _, _) = custom_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var out = []; \
+                 ['noHyphen', 'x-', '-x', 'ok-el'].forEach(function (n) { \
+                   try { customElements.define(n, class extends HTMLElement {}); out.push('ok'); } \
+                   catch (e) { out.push(e.name); } \
+                 }); \
+                 out.join(',');",
+            )
+            .unwrap();
+        assert_eq!(probe, "SyntaxError,SyntaxError,SyntaxError,ok");
+    }
+
+    #[test]
+    fn custom_elements_upgrade_existing_tags_with_working_methods() {
+        let (dom, _, first) = custom_dom();
+        let mut runtime = ExtScriptRuntime::new_page(Rc::clone(&dom));
+        let probe = runtime
+            .eval(
+                "var all = []; \
+                 var C = class XCard extends HTMLElement { \
+                   constructor() { super(); all.push(this); } \
+                   setLabel(v) { this.textContent = v; } \
+                 }; \
+                 customElements.define('x-card', C); \
+                 all[0].setLabel('hello'); \
+                 JSON.stringify([all.length, all[0] instanceof C, \
+                   document.body.children.length, \
+                   document.body.children[0] === all[0], \
+                   document.body.children[1] === all[1], \
+                   document.body.children[0].textContent]);",
+            )
+            .unwrap();
+        assert_eq!(probe, r#"[2,true,2,true,true,"hello"]"#);
+        runtime.tick();
+        let dom = dom.borrow();
+        let children = dom.children(first);
+        assert_eq!(children.len(), 1);
+        assert_eq!(dom.text(children[0]), Some("hello"));
+    }
+
+    #[test]
+    fn custom_elements_create_element_constructs_the_class() {
+        let (dom, _, _) = custom_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var C = class XItem extends HTMLElement {}; \
+                 customElements.define('x-item', C); \
+                 var el = document.createElement('x-item'); \
+                 var plain = document.createElement('div'); \
+                 JSON.stringify([el instanceof C, el instanceof HTMLElement, \
+                   el.tagName, plain instanceof C]);",
+            )
+            .unwrap();
+        assert_eq!(probe, r#"[true,true,"X-ITEM",false]"#);
+    }
+
+    #[test]
+    fn custom_elements_connected_callback_on_upgrade_and_append() {
+        let (dom, _, _) = custom_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        let probe = runtime
+            .eval(
+                "var seen = []; \
+                 var C = class XThing extends HTMLElement { \
+                   connectedCallback() { seen.push(this.tagName); } \
+                 }; \
+                 customElements.define('x-card', C); \
+                 var upgraded = seen.length; \
+                 var el = document.createElement('x-card'); \
+                 var afterCreate = seen.length; \
+                 document.body.appendChild(el); \
+                 document.body.appendChild(el); \
+                 JSON.stringify([upgraded, afterCreate, seen]);",
+            )
+            .unwrap();
+        // Two in-DOM <x-card> tags upgrade and connect; createElement alone
+        // does not connect; a repeated append must not fire twice.
+        assert_eq!(probe, r#"[2,2,["X-CARD","X-CARD","X-CARD"]]"#);
+    }
+
+    #[test]
+    fn custom_elements_when_defined_resolves_on_define() {
+        let (dom, _, _) = custom_dom();
+        let mut runtime = ExtScriptRuntime::new_page(dom);
+        runtime
+            .eval(
+                "var a = false, b = false; \
+                 customElements.whenDefined('x-later').then(function (ctor) { \
+                   a = ctor === customElements.get('x-later'); \
+                 }); \
+                 customElements.define('x-later', class CL extends HTMLElement {}); \
+                 customElements.whenDefined('x-later').then(function (ctor) { \
+                   b = ctor === customElements.get('x-later'); \
+                 });",
+            )
+            .unwrap();
+        // eval drains microtasks, but the stringify above would run first; read
+        // the settled flags on a second eval so both handlers have executed.
+        let probe = runtime.eval("JSON.stringify([a, b])").unwrap();
+        assert_eq!(probe, "[true,true]");
     }
 }

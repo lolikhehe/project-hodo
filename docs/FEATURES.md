@@ -1,5 +1,14 @@
 # hodo — feature status catalog (100 features)
 
+> **WAVE 4 LANDED:** the wave-4 tree was gated (fmt + clippy `-D warnings` +
+> 837 workspace tests green; bigdoc perf PASS inside every 1.10× pin, no re-pin)
+> and committed. Landed: `window.customElements` wave 1 (define/get/whenDefined,
+> upgrade walk on stable per-`NodeId` handles, derived constructors, createElement
+> construction, deduped `connectedCallback`) and a geometric cross-side float
+> collision drop with a 0.01px epsilon and 4-hop cap (`crates/hodo-layout/src/block.rs`).
+> Every status flip below was verified by reading current code (`file:line`
+> evidence), not `git log`; re-check before using this as a release gate.
+
 > **WAVE 3 LANDED:** the wave-3 tree was integrated, gated (fmt + clippy
 > `-D warnings` + 826 workspace tests green) and committed. Landed: script-type
 > filtering (JSON/importmap/non-JS blocks no longer executed), `scripting_enabled`
@@ -33,6 +42,7 @@ This is an **honest catalog**, not a roadmap pitch. The goal is to beat Firefox 
 | --- | --- | --- | --- | --- |
 | 1 | JS у веб-сторінках (page JS, boa + DOM bindings) | P0 | ✅ shipped | Wave 2: inline + `<script src>` in document order, `DOMContentLoaded`, click/key events and a native-DOM fingerprint that re-pipes styles/layout on mutation (`crates/hodo-shell/src/app.rs:875-903,942-1001,807-873`; `crates/hodo-shell/src/tabs.rs:514-548`). Final-URL base threading after redirects (`app.rs:607-669`); fixture `examples/js-site/`. Limits: no modules or full timer/event loop beyond the drained runtime budget; headless screenshots drop the realm. |
 | 2 | Повний DOM API (events, MutationObserver, IntersectionObserver, forms) | P0 | 🟡 partial | Arena DOM with `u32` generation handles, tags/attrs/text only (`hodo-dom::NodeKind`, `Dom::validate`). Wave 3: page-DOM substrate — Node/Element/HTMLElement/Document constructors with real prototype chains + `instanceof` (illegal to call directly) (`crates/hodo-js/src/dom.rs:1063-1175`), per-access `children`/`attributes`/`parentNode`/`parentElement`/`head`/`body` natives (`dom.rs:969-1029`), `querySelector(All)` with the full attribute-selector grammar reusing the hodo-css matcher (`dom.rs:160,1240-1301`), and `src`/`href` getters+setters resolved against the page URL (`dom.rs:1317-1350`). Still open: MutationObserver/IntersectionObserver, forms, event dispatch beyond click/key → X1 js-dom + X2 page-JS. |
+| 2a | Custom elements (`window.customElements`: define/get/whenDefined, upgrade, `connectedCallback`) | P0 | 🟡 partial — wave 1 | Sub-feature of #2. Stable one-per-`NodeId` handles let derived constructors own their element instance (`crates/hodo-js/src/dom.rs:84-100`, `prelude.rs:627-755`); `define` upgrades existing tags via `__hodo_dom_find_all_tag` and resolves `whenDefined` waiters, `createElement` constructs registered classes, `connectedCallback` deduped at upgrade/append (`prelude.rs:871-932`). 81 hodo-js tests green. Wave-1 limits: no `attributeChangedCallback`/`observedAttributes`, `disconnectedCallback`, shadow DOM, or dynamic-script-triggered upgrades (`archive.org` still stalls pre-define). |
 | 3 | fetch/XHR/WebSocket/EventSource + CORS/CSP | P0 | 🟡 partial | Extension `fetch` via `ApiCall::Fetch` → `hodo-net::load_with`; CSP validator `ext-host::validate_csp` shipped; no page-side XHR/WS/EventSource/CORS → X1 net-privacy + X2 page-JS. |
 | 4 | Cookie jar (SameSite/Secure/HttpOnly/partitioning) | P0 | ✅ shipped | `hodo-cookie::CookieJar` (8 tests, `crates/hodo-cookie/src/lib.rs:410-566`): `store`/`cookie_header` with SameSite/Secure/Partitioned and caller-supplied partition key (`lib.rs:60-218`); double-keyed attach in `crates/hodo-net/src/privacy.rs:369-393`. `HttpOnly` parsed but not enforced — no script context (`cookie lib.rs:10`). |
 | 5 | localStorage/sessionStorage/IndexedDB per-origin | P0 | 🟡 partial | Extension `storage.local/session/sync` with quota (`ext-api::ApiRegistry::quota_check`, `STORAGE_QUOTA_BYTES`) shipped; no page storage → X1 js-dom. |

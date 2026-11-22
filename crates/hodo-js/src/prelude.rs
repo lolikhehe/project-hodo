@@ -627,21 +627,38 @@ function __hodoDomAttributes(node) {
   };
   return out;
 }
-function __hodoDomWrap(node, extra, accessors, proto) {
-  if (node === null || node === undefined) return null;
-  var api = {
-    __hodoNode: node,
-    appendChild: function (child) { __hodo_dom_append_child(node, child.__hodoNode); return child; },
-    removeChild: function (child) { __hodo_dom_remove_child(node, child.__hodoNode); return child; },
-    getAttribute: function (name) { return __hodo_dom_get_attribute(node, String(name)); },
-    setAttribute: function (name, value) { __hodo_dom_set_attribute(node, String(name), String(value)); },
-    addEventListener: function (kind, fn) { __hodo_dom_add_listener(node, String(kind), fn); },
-    classList: {
-      add: function (c) { __hodo_dom_class_list(node, 'add', String(c)); },
-      remove: function (c) { __hodo_dom_class_list(node, 'remove', String(c)); },
-      toggle: function (c) { return __hodo_dom_class_list(node, 'toggle', String(c)); },
-      contains: function (c) { return __hodo_dom_class_list(node, 'contains', String(c)); }
-    }
+// Custom-element wave-1 state. The prelude is eval'd fresh per page context,
+// so all of this is naturally per-runtime. Keys are the stable DOM handles
+// handed out by alloc_handle (one per live NodeId).
+var __hodoUpgraded = {};
+var __hodoCustomElements = {};
+var __hodoWhenDefined = {};
+var __hodoPendingNode = null;
+function __hodoConnect(inst) {
+  if (!inst || inst.__hodoConnected) return;
+  inst.__hodoConnected = true;
+  if (typeof inst.connectedCallback === 'function') {
+    try { inst.connectedCallback(); } catch (e) { __hodoReportError(e); }
+  }
+}
+// Install the handle-backed DOM surface onto an object. Shared by plain
+// wrappers and by custom-element instances constructed through HTMLElement().
+function __hodoDomProps(api, node) {
+  api.__hodoNode = node;
+  api.appendChild = function (child) {
+    __hodo_dom_append_child(node, child.__hodoNode);
+    __hodoConnect(child);
+    return child;
+  };
+  api.removeChild = function (child) { __hodo_dom_remove_child(node, child.__hodoNode); return child; };
+  api.getAttribute = function (name) { return __hodo_dom_get_attribute(node, String(name)); };
+  api.setAttribute = function (name, value) { __hodo_dom_set_attribute(node, String(name), String(value)); };
+  api.addEventListener = function (kind, fn) { __hodo_dom_add_listener(node, String(kind), fn); };
+  api.classList = {
+    add: function (c) { __hodo_dom_class_list(node, 'add', String(c)); },
+    remove: function (c) { __hodo_dom_class_list(node, 'remove', String(c)); },
+    toggle: function (c) { return __hodo_dom_class_list(node, 'toggle', String(c)); },
+    contains: function (c) { return __hodo_dom_class_list(node, 'contains', String(c)); }
   };
   Object.defineProperty(api, 'textContent', {
     get: function () { return __hodo_dom_text(node); },
@@ -663,16 +680,6 @@ function __hodoDomWrap(node, extra, accessors, proto) {
     set: function (v) { __hodo_dom_set_attribute(node, 'href', String(v)); },
     enumerable: true
   });
-  if (extra) {
-    var keys = Object.keys(extra);
-    for (var i = 0; i < keys.length; i++) api[keys[i]] = extra[keys[i]];
-  }
-  if (accessors) {
-    var names = Object.keys(accessors);
-    for (var j = 0; j < names.length; j++) {
-      Object.defineProperty(api, names[j], accessors[names[j]]);
-    }
-  }
   var tag = __hodo_dom_tag(node);
   var isDoc = tag === null || tag === undefined;
   api.nodeType = isDoc ? 9 : 1;
@@ -708,8 +715,49 @@ function __hodoDomWrap(node, extra, accessors, proto) {
       return __hodoDomWrap(handle, null, null, HTMLElement.prototype);
     }
   });
+}
+function __hodoDomWrap(node, extra, accessors, proto) {
+  if (node === null || node === undefined) return null;
+  var upgraded = __hodoUpgraded[node];
+  if (upgraded !== undefined) return upgraded;
+  var api = {};
+  __hodoDomProps(api, node);
+  if (extra) {
+    var keys = Object.keys(extra);
+    for (var i = 0; i < keys.length; i++) api[keys[i]] = extra[keys[i]];
+  }
+  if (accessors) {
+    var names = Object.keys(accessors);
+    for (var j = 0; j < names.length; j++) {
+      Object.defineProperty(api, names[j], accessors[names[j]]);
+    }
+  }
   if (proto) Object.setPrototypeOf(api, proto);
   return Object.freeze(api);
+}
+// Construct the registered class for a node, attaching its handle during the
+// base HTMLElement constructor so the constructor body can already use the
+// DOM surface. Falls back to a plain wrapper if the ctor cannot be built.
+function __hodoMakeInstance(node, ctor) {
+  var existing = __hodoUpgraded[node];
+  if (existing !== undefined) return existing;
+  __hodoPendingNode = node;
+  var inst;
+  try {
+    inst = new ctor();
+  } catch (e) {
+    __hodoPendingNode = null;
+    __hodoReportError(e);
+    return __hodoDomWrap(node, null, null, HTMLElement.prototype);
+  }
+  __hodoPendingNode = null;
+  if (__hodoUpgraded[node] === undefined) {
+    // ctor did not route through HTMLElement() (plain function / no super()):
+    // install the handle here so its methods still reach the DOM.
+    __hodoDomProps(inst, node);
+    __hodoUpgraded[node] = inst;
+  }
+  return inst;
 }
 
 // Minimal DOM class surface. Constructors are illegal to invoke directly
@@ -724,6 +772,13 @@ function Element() {
 }
 function HTMLElement() {
   if (this.constructor === HTMLElement) throw new TypeError('Illegal constructor: HTMLElement');
+  // Custom-element upgrade hook: a derived class calling super() receives the
+  // handle staged by __hodoMakeInstance before its constructor body runs.
+  if (__hodoPendingNode !== null && __hodoUpgraded[__hodoPendingNode] === undefined) {
+    __hodoDomProps(this, __hodoPendingNode);
+    __hodoUpgraded[__hodoPendingNode] = this;
+    __hodoPendingNode = null;
+  }
 }
 function Document() {
   if (this.constructor === Document) throw new TypeError('Illegal constructor: Document');
@@ -765,7 +820,11 @@ var document = __hodoDomWrap(__hodoRoot, {
     return out;
   },
   createElement: function (tag) {
-    return __hodoDomWrap(__hodo_dom_create_element(String(tag)), null, null, HTMLElement.prototype);
+    var raw = String(tag);
+    var node = __hodo_dom_create_element(raw);
+    var ctor = __hodoCustomElements[raw.toLowerCase()];
+    if (ctor !== undefined) return __hodoMakeInstance(node, ctor);
+    return __hodoDomWrap(node, null, null, HTMLElement.prototype);
   }
 }, {
   // Kept in RuntimeState so the shell integrator can mirror it into the tab
@@ -812,6 +871,62 @@ window.setTimeout = setTimeout;
 window.setInterval = setInterval;
 window.clearTimeout = clearTimeout;
 window.clearInterval = clearInterval;
+// Minimal CustomElementRegistry. Honest wave-1 surface: define/get/whenDefined,
+// upgrade of existing tags, construction on createElement, and connectedCallback
+// at upgrade/append. attributeChangedCallback, disconnectedCallback, observedAttributes
+// and shadow DOM are intentionally absent (no fake versions of them are exposed).
+function __hodoIsCustomName(name) {
+  if (name.length < 2) return false;
+  if (name[0] < 'a' || name[0] > 'z') return false;
+  var dash = name.indexOf('-');
+  if (dash <= 0 || dash >= name.length - 1) return false;
+  for (var i = 0; i < name.length; i++) {
+    var c = name[i];
+    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+          c === '-' || c === '_')) return false;
+  }
+  return true;
+}
+window.customElements = {
+  define: function (name, ctor) {
+    var n = String(name).toLowerCase();
+    if (typeof ctor !== 'function') {
+      throw new TypeError('customElements.define: constructor must be a function');
+    }
+    if (!__hodoIsCustomName(n)) {
+      throw new SyntaxError('customElements.define: invalid custom element name');
+    }
+    if (__hodoCustomElements[n] !== undefined) {
+      throw new Error('customElements.define: name is already defined');
+    }
+    __hodoCustomElements[n] = ctor;
+    // Upgrade elements already in the document: one instance per matching tag.
+    var handles = __hodo_dom_find_all_tag(__hodoRoot, n);
+    for (var i = 0; i < handles.length; i++) {
+      __hodoConnect(__hodoMakeInstance(handles[i], ctor));
+    }
+    // Resolve any whenDefined waiters with the constructor, spec-style.
+    var waiters = __hodoWhenDefined[n];
+    if (waiters) {
+      for (var j = 0; j < waiters.length; j++) waiters[j](ctor);
+      delete __hodoWhenDefined[n];
+    }
+  },
+  get: function (name) {
+    var ctor = __hodoCustomElements[String(name).toLowerCase()];
+    return ctor === undefined ? null : ctor;
+  },
+  whenDefined: function (name) {
+    var n = String(name).toLowerCase();
+    if (__hodoCustomElements[n] !== undefined) {
+      return Promise.resolve(__hodoCustomElements[n]);
+    }
+    return new Promise(function (resolve) {
+      if (!__hodoWhenDefined[n]) __hodoWhenDefined[n] = [];
+      __hodoWhenDefined[n].push(resolve);
+    });
+  }
+};
 // Explicit throwing getters instead of a Proxy: a script can catch these and
 // sees exactly which global is missing. No fake objects are handed out.
 function __hodoUnsupportedGlobal(name) {
